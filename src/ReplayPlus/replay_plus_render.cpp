@@ -24,7 +24,7 @@ namespace {
 using Microsoft::WRL::ComPtr;
 constexpr DXGI_FORMAT linear_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr unsigned most_mips = 10;
-constexpr unsigned constant_count = 20 * 4;
+constexpr unsigned constant_count = 22 * 4; // P0..P21 (replay_plus.hlsl)
 // The pass's constants go in a small upload buffer, a slot a frame in turn (a frame on the GPU still reads
 // its own): too many now for root constants (64 values for the whole root signature).
 constexpr unsigned constant_slot_bytes = 512, constant_slots = 16;
@@ -37,6 +37,17 @@ constexpr unsigned slot_copy = 0, slot_chain = 1, slot_depth = 2, slot_hood = 3,
 constexpr unsigned target_scene = most_mips, target_count = most_mips + 1;
 
 using link::now_ms;
+
+// The white of the game's picture under its UI (lens::measure_white): every white_every frames, a few rows of
+// the screen and of the picture Replay Plus put in for that frame, read back three frames on.
+constexpr std::array<float, 3> white_strips{0.32f, 0.47f, 0.62f}; // shares of the height, clear of the editor's bars
+constexpr std::uint32_t white_rows = 4, white_every = 20;
+struct WhiteCopy {
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, white_strips.size()> screen{}, picture{};
+    std::array<double, white_strips.size()> from{}, to{}; // the screen's rows among the picture's copied ones
+    int transfer{};
+    float white_nits{};
+};
 
 struct Graphics {
     // record (the presenting thread) and finish_export (the encoder's) share what is here.
@@ -80,6 +91,22 @@ struct Graphics {
     std::string shot_path, shot_after_ui_path;
     bool shot_pending{};
     DXGI_FORMAT shot_format{DXGI_FORMAT_UNKNOWN};
+    // The white of the game's picture under its UI: its rows' readback, the white in use (kept from one visit
+    // to the editor to the next, measured again from nothing when the screen's output or the picture's format
+    // changes), and the details the console asked for.
+    ComPtr<ID3D12Resource> white_readback;
+    std::uint64_t white_capacity{}, white_copied_at{}, white_next{};
+    bool white_waiting{}, white_detail{};
+    std::string white_dump; // `replayplus white dump`: where the next measurement's blocks go
+    WhiteCopy white_copy;
+    lens::WhiteTrack white_track;
+    int white_transfer{-1};
+    DXGI_FORMAT white_picture_format{DXGI_FORMAT_UNKNOWN};
+    float white_noted{}, white_noted_measured{};
+    bool white_noted_curve{};
+    bool scale_off{}; // SDR: the display mapping's scale measured clearly off 1, and used
+    std::uint64_t white_said_ms{};
+    float white_said{};
     bool failed{};
     std::uint64_t frames{};
     std::string problem;
@@ -668,6 +695,144 @@ void read_focus(const Target& t, const link::Picture& picture) {
     g.focus_written[slot] = true;
     ++g.focus_frame;
 }
+
+// The white of the game's picture under its UI. This frame's rows: the screen's (PRESENT, as the game left it:
+// the pass went under its UI) and those of the picture Replay Plus put in for it (`output`, COPY_SOURCE between
+// frames, not drawn again yet this frame).
+bool copy_white(const Target& t, const depth::Scene& scene, const D3D12_RESOURCE_DESC& screen) {
+    auto& g = graphics();
+    const auto picture = scene.output->GetDesc();
+    if (!lens::white_format(static_cast<std::uint32_t>(screen.Format)) || !lens::white_format(static_cast<std::uint32_t>(picture.Format))) return false;
+    const auto screen_w = static_cast<std::uint32_t>(screen.Width), picture_w = static_cast<std::uint32_t>(picture.Width);
+    if (screen_w < 256 || screen.Height < 64 || picture_w < 64 || picture.Height < 64) return false;
+    WhiteCopy rows;
+    rows.transfer = t.transfer;
+    rows.white_nits = t.white_nits;
+    std::uint64_t offset = 0;
+    const auto place = [&offset](D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, DXGI_FORMAT format, std::uint32_t width, std::uint32_t count) {
+        footprint.Offset = offset;
+        footprint.Footprint.Format = format;
+        footprint.Footprint.Width = width;
+        footprint.Footprint.Height = count;
+        footprint.Footprint.Depth = 1;
+        footprint.Footprint.RowPitch = (width * lens::white_texel_bytes(static_cast<std::uint32_t>(format)) + 255u) & ~255u;
+        offset = (offset + std::uint64_t{footprint.Footprint.RowPitch} * count + 511u) & ~std::uint64_t{511u};
+    };
+    const double down = static_cast<double>(picture.Height) / static_cast<double>(screen.Height);
+    std::array<std::uint32_t, white_strips.size()> screen_top{}, picture_top{};
+    for (std::size_t i = 0; i < white_strips.size(); ++i) {
+        screen_top[i] = std::min(screen.Height - white_rows, static_cast<std::uint32_t>(white_strips[i] * static_cast<float>(screen.Height)));
+        const double first = static_cast<double>(screen_top[i]) * down, last = static_cast<double>(screen_top[i] + white_rows) * down;
+        picture_top[i] = static_cast<std::uint32_t>(std::floor(first));
+        const auto end = std::min(picture.Height, static_cast<std::uint32_t>(std::ceil(last)));
+        if (end <= picture_top[i]) return false;
+        place(rows.screen[i], screen.Format, screen_w, white_rows);
+        place(rows.picture[i], picture.Format, picture_w, end - picture_top[i]);
+        rows.from[i] = first - static_cast<double>(picture_top[i]);
+        rows.to[i] = last - static_cast<double>(picture_top[i]);
+    }
+    if (!g.white_readback || g.white_capacity < offset) {
+        g.white_readback.Reset();
+        g.white_capacity = 0;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bytes{};
+        bytes.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bytes.Width = offset;
+        bytes.Height = 1;
+        bytes.DepthOrArraySize = 1;
+        bytes.MipLevels = 1;
+        bytes.SampleDesc.Count = 1;
+        bytes.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(t.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bytes, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&g.white_readback)))) {
+            g.white_readback.Reset();
+            return false;
+        }
+        g.white_readback->SetName(L"Replay Plus: rows of the screen and of the picture under the UI");
+        g.white_capacity = offset;
+    }
+    const auto copy_rows = [&t, &g](ID3D12Resource* source, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, std::uint32_t top) {
+        D3D12_TEXTURE_COPY_LOCATION into{}, out_of{};
+        into.pResource = g.white_readback.Get();
+        into.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        into.PlacedFootprint = footprint;
+        out_of.pResource = source;
+        out_of.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        out_of.SubresourceIndex = 0;
+        const D3D12_BOX box{0, top, 0, footprint.Footprint.Width, top + footprint.Footprint.Height, 1};
+        t.commands->CopyTextureRegion(&into, 0, 0, 0, &out_of, &box);
+    };
+    transition(t.commands, t.buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (std::size_t i = 0; i < white_strips.size(); ++i) copy_rows(t.buffer, rows.screen[i], screen_top[i]);
+    transition(t.commands, t.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    for (std::size_t i = 0; i < white_strips.size(); ++i) copy_rows(scene.output, rows.picture[i], picture_top[i]);
+    g.white_copy = rows;
+    return true;
+}
+// The rows copied three frames back (the GPU is done with them by then), measured: in SDR the scale the picture
+// goes into the game's display mapping at (lens::measure_scale), in HDR its white (lens::measure_white). What is
+// used moves when the last few measurements agree on another.
+void read_white() {
+    auto& g = graphics();
+    if (!g.white_waiting || g.frames < g.white_copied_at + 3 || !g.white_readback) return;
+    g.white_waiting = false;
+    void* mapped{};
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(g.white_capacity)};
+    if (FAILED(g.white_readback->Map(0, &range, &mapped)) || !mapped) return;
+    const auto* bytes = static_cast<const std::uint8_t*>(mapped);
+    std::array<lens::WhiteStrip, white_strips.size()> strips{};
+    for (std::size_t i = 0; i < strips.size(); ++i) {
+        const auto& shown = g.white_copy.screen[i];
+        const auto& source = g.white_copy.picture[i];
+        strips[i] = {bytes + shown.Offset,          static_cast<std::uint32_t>(shown.Footprint.Format),  shown.Footprint.RowPitch,
+                     shown.Footprint.Width,         shown.Footprint.Height,                             bytes + source.Offset,
+                     static_cast<std::uint32_t>(source.Footprint.Format), source.Footprint.RowPitch,    source.Footprint.Width,
+                     source.Footprint.Height,       g.white_copy.from[i],                               g.white_copy.to[i]};
+    }
+    const bool sdr = g.white_copy.transfer == 0;
+    std::vector<lens::WhitePair> pairs;
+    lens::WhiteMeasure linear;
+    if (!sdr || !g.white_dump.empty())
+        linear = lens::measure_white(strips, g.white_copy.transfer, g.white_copy.white_nits, g.white_dump.empty() ? nullptr : &pairs);
+    lens::ScaleMeasure curve;
+    if (sdr) curve = lens::measure_scale(strips, lens::DisplayMapping{});
+    const D3D12_RANGE none{};
+    g.white_readback->Unmap(0, &none);
+    const bool ok = sdr ? curve.ok : linear.ok;
+    const float value = sdr ? curve.scale : linear.white;
+    if (!g.white_dump.empty()) {
+        try {
+            std::ofstream out(std::filesystem::path(g.white_dump), std::ios::trunc); // (named in plain ASCII, as shots are)
+            out << "picture_r,picture_g,picture_b,screen_r,screen_g,screen_b,even\n";
+            for (const auto& pair : pairs)
+                out << std::format("{:.6g},{:.6g},{:.6g},{:.6g},{:.6g},{:.6g},{}\n", pair[0], pair[1], pair[2], pair[3], pair[4], pair[5], pair[6] > 0.5f ? 1 : 0);
+        } catch (...) {}
+        g.white_dump.clear();
+    }
+    if (g.white_detail) {
+        g.white_detail = false;
+        const auto text = std::format("Replay Plus: the game's picture under its UI ({}): {}{}",
+                                      g.white_copy.transfer == 2 ? "HDR10" : g.white_copy.transfer == 1 ? "scRGB" : "SDR",
+                                      sdr ? curve.detail : linear.detail, ok ? "" : " (not used: too few even blocks, or they disagree)");
+        logging::write(logging::Level::info, logging::Channel::graphics, text);
+        link::note_white_detail(text);
+    }
+    if (ok && g.white_track.add(value)) {
+        const auto now = now_ms();
+        const float moved = g.white_said > 0.0f ? std::abs(g.white_track.white / g.white_said - 1.0f) : 1.0f;
+        if (moved > 0.05f || now - g.white_said_ms > 10000) {
+            g.white_said = g.white_track.white;
+            g.white_said_ms = now;
+            logging::write(logging::Level::info, logging::Channel::graphics,
+                           sdr ? std::format("Replay Plus: under the game's UI its picture goes into its display mapping at {:.3f} (from {} "
+                                             "channels of {} blocks, spread {:.1f}%).",
+                                             g.white_track.white, curve.used, curve.blocks, curve.spread * 100.0f)
+                               : std::format("Replay Plus: under the game's UI its picture's white is {:.3f} (from {} of {} blocks, spread {:.1f}%).",
+                                             g.white_track.white, linear.used, linear.blocks, linear.spread * 100.0f));
+        }
+    }
+}
 // The field of view the game built this picture with, while it is being told (`fresh_ms`); else the one
 // Replay Plus sets (fixed, Auto), else the editor's usual.
 float fov_for(const link::Picture& picture, std::uint64_t fresh_ms) {
@@ -715,7 +880,7 @@ std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& pi
                                          : std::array<float, 3>{1.0f + 0.12f * w, 1.0f + 0.05f * w, 1.0f};
     const float colour_y = 0.2126f * colour[0] + 0.7152f * colour[1] + 0.0722f * colour[2];
     for (auto& v : colour) v /= colour_y;
-    return {
+    std::array<std::uint32_t, constant_count> c{
         bits(lens_on ? 2.0f : 0.0f), bits(finish.fit), bits(tg[0]), bits(tg[1]),
         bits(f.view_aspect), bits(win[0]), bits(win[1]), bits(half),
         bits(width), bits(height), bits(static_cast<float>(in.transfer)), bits(in.white),
@@ -741,6 +906,11 @@ std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& pi
         bits(lens::vignette_power(gr.vignette_soft)), bits(std::clamp(gr.vignette_round, 0.0f, 1.0f)),
         bits(gr.camera_gamma), bits(gr.camera_knee), bits(gr.camera_knee_slope), bits(gr.camera_black),
         bits(gr.camera_clip), bits(gr.camera_colour), bits(0.0f), bits(0.0f)};
+    // P21.z, .w: the camera light's facing, smoothed over so many metres of the surface (replay_plus.hlsl
+    // smooth_facing; 0 each triangle's own), and how much it counts.
+    c[86] = bits(std::clamp(link::light_facing_metres().load(std::memory_order_relaxed), 0.0f, 2.0f));
+    c[87] = bits(std::clamp(link::light_facing_weight().load(std::memory_order_relaxed), 0.0f, 1.0f));
+    return c;
 }
 
 
@@ -1079,11 +1249,70 @@ bool record(const Target& t) noexcept {
             t.device->CreateRenderTargetView(scene.output, &target, target_view(target_scene));
             g.scene_serial = scene.serial;
         }
+        // The game's picture under its UI is not 0..1 with 1 as white: the game's last pass shows it through its
+        // display mapping. In SDR that curve (lens::DisplayMapping) is applied to read it and undone to write it back,
+        // at the scale measured from what the screen showed of the picture Replay Plus put in (1 as the game comes);
+        // in HDR the picture is taken as linear light with its white measured. `replayplus white <value>` fixes a
+        // white instead (linear: 1 is how 1.2 drew it).
+        float scene_white = 1.0f; // SDR: the display mapping's scale; HDR, or fixed: the picture's white
+        bool scene_curve = false;
+        if (into_scene) {
+            if (g.white_transfer != t.transfer || g.white_picture_format != scene.format) {
+                // Another output (SDR or HDR) or picture: measured again from nothing.
+                g.white_transfer = t.transfer;
+                g.white_picture_format = scene.format;
+                g.white_track = {};
+                g.scale_off = false;
+                g.white_waiting = false;
+                g.white_said = 0.0f;
+            }
+            read_white();
+            if (link::take_white()) {
+                g.white_detail = true;
+                if (auto dump = link::take_white_dump(); !dump.empty()) g.white_dump = std::move(dump);
+            }
+            // Not while the game's UI covers the whole width along its prompts (a dialog's backdrop over everything).
+            const auto gap = depth::ui_gap();
+            const bool ui_clear = depth::ui_shown() < 0.02f || gap.to - gap.from >= 0.2f;
+            if (!g.white_waiting && scene.swapped && ui_clear && (g.frames >= g.white_next || g.white_detail) && copy_white(t, scene, desc)) {
+                g.white_waiting = true;
+                g.white_copied_at = g.frames;
+                g.white_next = g.frames + white_every;
+            }
+            const float fixed = link::white_fixed().load(std::memory_order_relaxed);
+            scene_curve = t.transfer == 0 && fixed <= 0.0f;
+            scene_white = fixed > 0.0f ? fixed : g.white_track.white > 0.0f ? g.white_track.white : 1.0f;
+            if (scene_curve && fixed <= 0.0f) {
+                // The curve was measured on the game as it comes, and follows its screen within about 1% there; a
+                // measurement follows what the frame shows by a few percent (5% at most seen, 2026-11-18), which
+                // would move the picture's brightness with it. So the scale leaves 1 only when it is clearly
+                // elsewhere (more than 10% off: a setting of the game's changed), and comes back within 4%.
+                const float off = g.white_track.white > 0.0f ? std::abs(std::log2(g.white_track.white)) : 0.0f;
+                g.scale_off = g.scale_off ? off > 0.0566f : off > 0.1375f;
+                scene_white = g.scale_off ? g.white_track.white : 1.0f;
+            }
+            if (scene_white != g.white_noted || scene_curve != g.white_noted_curve || g.white_track.white != g.white_noted_measured) {
+                g.white_noted = scene_white;
+                g.white_noted_curve = scene_curve;
+                g.white_noted_measured = g.white_track.white;
+                link::note_white(scene_white, g.white_track.white, scene_curve);
+            }
+        }
         auto drawn = constants;
         const unsigned source_slot = into_scene ? slot_scene : slot_copy;
-        if (into_scene) {
-            drawn[10] = bits(1.0f); // transfer: linear, as it is
-            drawn[11] = bits(1.0f); // white
+        if (into_scene && scene_curve) {
+            const lens::DisplayMapping mapping;
+            drawn[10] = bits(3.0f); // transfer: the game's display mapping, applied and undone
+            drawn[11] = bits(1.0f);
+            drawn[80] = bits(mapping.t0);
+            drawn[81] = bits(mapping.s1);
+            drawn[82] = bits(mapping.s2);
+            drawn[83] = bits(mapping.x0);
+            drawn[84] = bits(mapping.w);
+            drawn[85] = bits(std::log2(std::max(scene_white, 1e-3f))); // the scale it takes the picture at
+        } else if (into_scene) {
+            drawn[10] = bits(1.0f);        // transfer: linear, as it is
+            drawn[11] = bits(scene_white); // white: the picture's value the screen shows as its white
         } else {
             // Copy the frame, then draw it back through the passes.
             transition(t.commands, t.buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1370,6 +1599,9 @@ void release() noexcept {
     g.hood_ready = false;
     g.shot.Reset();
     g.shot_pending = false;
+    g.white_readback.Reset();
+    g.white_capacity = 0;
+    g.white_waiting = false;
     g.decode.Reset();
     g.down.Reset();
     g.main.Reset();

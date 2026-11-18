@@ -80,6 +80,7 @@ struct Shared {
     DXGI_FORMAT scene_format{DXGI_FORMAT_UNKNOWN};
     std::uint64_t scene_serial{};
     bool scene_ready{};                         // scene_out holds a picture for the next frame
+    bool scene_swapped{};                       // scene_out went in when the picture was last taken
     bool scene_said{};
     // The UI's alpha along the button prompts: three strips, into four readback slots in turn.
     ComPtr<ID3D12Resource> ui_readback;
@@ -272,6 +273,7 @@ void take_scene(Shared& s, ID3D12GraphicsCommandList* list, ID3D12Resource* pict
     transition(list, original, s.scene_in.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyResource(s.scene_in.Get(), picture);
     transition(list, original, s.scene_in.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    s.scene_swapped = s.scene_ready;
     if (s.scene_ready) {
         transition(list, original, picture, all, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyResource(picture, s.scene_out.Get());
@@ -710,6 +712,7 @@ Scene scene() noexcept {
     c.serial = s.scene_serial;
     // begin_frame has moved the epoch on: copied in the one before is this frame's.
     c.fresh = s.scene_in && s.scene_epoch + 1 == s.epoch;
+    c.swapped = c.fresh && s.scene_swapped && s.scene_out;
     return c;
 }
 void scene_drawn(bool drawn) noexcept {

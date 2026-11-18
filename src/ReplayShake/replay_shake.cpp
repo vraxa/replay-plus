@@ -2598,7 +2598,12 @@ void tick(std::uintptr_t base, std::uint32_t client_state) noexcept {
             other_director;
         s.gameplay_held = match == Match::camera && !s.settings.gameplay && !menus;
         Editor next;
-        next.open = match != Match::none && !s.gameplay_held;
+        // And only while a replay is up (the replay activity's lane: the replay editor, its dialogs and its exports).
+        // Other screens that show a camera of the same kind with the game's UI hidden are not the replay editor:
+        // ReSkate's park editor (its props), the hub's skater view just after a map loads.
+        std::uint8_t lane{};
+        const bool replay_up = memory::peek(base + addr::replay_activity::playing, lane) && lane != 0;
+        next.open = match != Match::none && !s.gameplay_held && replay_up;
         s.editor_problem.clear();
         if (s.settings.mapping.root && looking && (next.open || s.probe))
             s.editor_problem = s.reader.read(base, s.settings.mapping, next);

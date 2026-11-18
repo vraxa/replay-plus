@@ -28,7 +28,7 @@ bool hood_on(const Settings& s) { return s.hood != Hood::none; }
 bool camera_on(const Settings& s) { return s.camera; }
 
 constexpr Tab t_lens = Tab::lens, t_frame = Tab::frame, t_grade = Tab::grade, t_focus = Tab::focus, t_light = Tab::light, t_game = Tab::game,
-              t_video = Tab::video;
+              t_video = Tab::video, t_experimental = Tab::experimental;
 bool game_on(const Settings& s) { return s.game_look; }
 constexpr Kind k_number = Kind::number, k_toggle = Kind::toggle, k_choice = Kind::choice;
 // The order here is the order on each of the panel's tabs.
@@ -212,9 +212,17 @@ const Field all_fields[]{
      no_choices, no_choices, +[](const Settings& s) { return s.game_barrel_stretch; }, +[](Settings& s, float v) { s.game_barrel_stretch = v; },
      &game_on},
     // FOCUS
-    {"focus.mode", "Depth of field", "Off, one focus for the replay, focus keyed along the replay, or focus on what is in the middle", t_focus,
+    {"focus.mode", "Depth of field", "Off, one focus for the replay, focus keyed along the replay, or Auto: what is in the middle, or your skater", t_focus,
      k_choice, 0, 3, 1, 1, "", focus_names, focus_labels, +[](const Settings& s) { return index_of(s.focus); },
      +[](Settings& s, float v) { s.focus = enum_from<Focus>(v); }, nullptr},
+    {"focus.skater", "Skater autofocus", "Experimental. On: the depth of field follows your skater wherever they are in the picture (it turns FOCUS "
+     "to Auto). Off: Auto focuses on what is in the middle", t_experimental, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
+     +[](const Settings& s) { return s.focus_skater && s.focus == Focus::autofocus ? 1.0f : 0.0f; },
+     +[](Settings& s, float v) {
+         s.focus_skater = v >= 0.5f;
+         if (s.focus_skater) s.focus = Focus::autofocus;
+     },
+     nullptr},
     {"focus.distance", "Focus distance", "How far away is sharp. Keyframed: a change makes (or moves) a key at the playhead", t_focus, k_number, 0.2f,
      200, 0.04f, 1, " m", no_choices, no_choices, +[](const Settings& s) { return s.focus_distance; },
      +[](Settings& s, float v) { s.focus_distance = v; }, +[](const Settings& s) { return s.focus == Focus::fixed || s.focus == Focus::keys; }, true},
@@ -224,12 +232,17 @@ const Field all_fields[]{
     {"focus.depth", "Sharp zone", "How deep the sharp zone around the focus is: small for a shallow look, large for most of the picture sharp",
      t_focus, k_number, 0.02f, 0.6f, 0.01f, 100, "%", no_choices, no_choices, +[](const Settings& s) { return s.focus_depth; },
      +[](Settings& s, float v) { s.focus_depth = v; }, +[](const Settings& s) { return s.focus != Focus::off; }},
-    {"focus.speed", "Follow speed", "Auto: how quickly the focus follows what is in the middle", t_focus, k_number, 0, 1, 0.05f, 100, "%", no_choices,
+    {"focus.speed", "Follow speed", "Auto: how quickly the focus follows (the skater, or what is in the middle)", t_focus, k_number, 0, 1, 0.05f, 100, "%", no_choices,
      no_choices, +[](const Settings& s) { return s.focus_speed; }, +[](Settings& s, float v) { s.focus_speed = v; },
      +[](const Settings& s) { return s.focus == Focus::autofocus; }},
     {"controls.r3", "R3 shortcuts", "Hold R3 in the replay editor: RB this panel, the D-pad focus and shake keys. A tap of R3 is still the game's Photo",
      t_focus, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices, +[](const Settings& s) { return s.pad_shortcuts ? 1.0f : 0.0f; },
      +[](Settings& s, float v) { s.pad_shortcuts = v >= 0.5f; }, nullptr},
+    {"controls.keep_keys", "Keep keys", "Experimental. On: your camera keyframes and the focus and shake keys are kept when you leave the replay "
+     "editor, and come back when you open it again (on the same footage, until the game closes). Off: every visit starts with none", t_experimental,
+     k_toggle, 0, 1, 1, 1, "",
+     no_choices, no_choices, +[](const Settings& s) { return s.keep_keys ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.keep_keys = v >= 0.5f; },
+     nullptr},
     // LIGHT
     {"light.on", "Camera light", "A light on the camera, lighting what it points at", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
      +[](const Settings& s) { return s.light ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light = v >= 0.5f; }, nullptr},
@@ -464,7 +477,7 @@ void read_value(const Field& f, Settings& s, const Json& value) {
 Json values_json(const Settings& s, bool all, bool look = false) {
     Json values = Json::object();
     for (const auto& f : all_fields) {
-        if (look && f.tab == Tab::focus) continue;
+        if (look && (f.tab == Tab::focus || f.tab == Tab::experimental)) continue;
         if (!all && f.get(s) == f.get(defaults)) continue;
         values[f.key] = value_json(f, s);
     }
@@ -548,6 +561,7 @@ Json to_json(const Settings& settings) {
     json["values"] = values_json(settings, true);
     json["panel_bind"] = std::format("0x{:x}", settings.panel_bind);
     json["preset"] = settings.preset;
+    if (!settings.video_folder.empty()) json["video_folder"] = settings.video_folder;
     Json keys = Json::array();
     for (const auto& key : settings.focus_keys) {
         Json item = Json::object();
@@ -581,6 +595,7 @@ Settings settings_from_json(const Json& json) {
             if (std::from_chars(begin, text.data() + text.size(), bind, 16).ec == std::errc{}) s.panel_bind = bind;
         }
         if (json.contains("preset") && json.at("preset").is_string()) s.preset = json.at("preset").string();
+        if (json.contains("video_folder") && json.at("video_folder").is_string()) s.video_folder = json.at("video_folder").string();
         if (json.contains("focus_keys") && json.at("focus_keys").is_array())
             for (const auto& item : json.at("focus_keys")) {
                 if (!item.is_object() || !item.contains("time") || !item.at("time").is_number()) continue;
@@ -692,9 +707,13 @@ Settings apply_preset(const Settings& current, const Preset& preset) {
     next.focus_distance = current.focus_distance;
     next.focus_blur = current.focus_blur;
     next.focus_speed = current.focus_speed;
+    next.focus_depth = current.focus_depth;
+    next.focus_skater = current.focus_skater;
     next.focus_keys = current.focus_keys;
     next.shake_keys = current.shake_keys;
     next.pad_shortcuts = current.pad_shortcuts;
+    next.keep_keys = current.keep_keys;
+    next.video_folder = current.video_folder;
     next.preset = preset.name;
     return clamped(next);
 }
@@ -785,6 +804,7 @@ Reply command(Settings& settings, std::string_view verb, std::span<const std::st
             Settings fresh;
             fresh.enabled = settings.enabled;
             fresh.panel_bind = settings.panel_bind;
+            fresh.video_folder = settings.video_folder; // where videos go is no look
             settings = fresh;
             return {"Every Replay Plus value is back at its default.", !(before == settings)};
         }
@@ -843,8 +863,9 @@ bool wants_picture(const Settings& s) noexcept {
            (s.light && s.light_power > 0);
 }
 bool wants_views(const Settings& s) noexcept {
-    // The field of view is read for the lens's fit and the light's reach, and set when fixed.
-    return s.enabled && (s.fov_mode != FovMode::game || lens_on(s) || s.light);
+    // The field of view is read for the lens's fit and the light's reach, and set when fixed; the camera, for how far
+    // away the skater is (the skater's autofocus).
+    return s.enabled && (s.fov_mode != FovMode::game || lens_on(s) || s.light || (s.focus == Focus::autofocus && s.focus_skater));
 }
 bool wants_game_settings(const Settings& s) noexcept {
     // The lens holds the game's barrel off (it would bend the picture twice).

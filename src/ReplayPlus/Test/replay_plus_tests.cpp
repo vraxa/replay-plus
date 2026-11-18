@@ -3,13 +3,16 @@
 // numbers) and its edge compression, the overlay's picture, the grade, and an exported frame
 // finished on the CPU.
 #include "Extension/ReplayPlus/replay_plus_lens.h"
+#include "Extension/ReplayPlus/replay_plus_link.h"
 #include "Extension/ReplayPlus/replay_plus_settings.h"
 #include "Extension/ReplayShake/replay_shake_model.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <format>
+#include <span>
 #include <set>
 #include <functional>
 #include <iostream>
@@ -1112,12 +1115,200 @@ void colour_tool_tests() {
     check(most <= 0.5f && least >= -0.5f && most - least > 0.6f, "grain spreads over its range at 1 px");
 }
 
+// The skater's autofocus switch, Keep keys and the video folder: what they do to the rest, and that they stay through a
+// save and a preset; and times placed on the timeline through the replay's chunks.
+void keep_tests() {
+    Settings s;
+    check(s.keep_keys && !s.focus_skater && s.video_folder.empty(), "Keep keys starts on, the skater's autofocus off, videos where the game puts them");
+    std::string why;
+    check(assign(*field("focus.skater"), s, "on", why) && s.focus_skater && s.focus == Focus::autofocus, "the skater's autofocus turns Auto on");
+    check(field("focus.skater")->get(s) == 1, "and shows on");
+    check(assign(*field("focus.mode"), s, "fixed", why) && field("focus.skater")->get(s) == 0, "another focus shows it off");
+    check(assign(*field("focus.mode"), s, "auto", why) && field("focus.skater")->get(s) == 1, "back on Auto it is the skater's again");
+    check(wants_views(s), "the skater's autofocus wants the camera");
+    s.keep_keys = false;
+    s.video_folder = "D:\\My Clips\\skate";
+    s.focus_depth = 0.3f;
+    const auto read = settings_from_json(Json::parse(to_json(s).dump()));
+    check(read.video_folder == s.video_folder && !read.keep_keys && read.focus_skater && read.focus == Focus::autofocus,
+          "the video folder, Keep keys and the skater's autofocus are saved");
+    Preset preset;
+    preset.name = "A look";
+    preset.settings.curve = 1;
+    const auto applied = apply_preset(s, preset);
+    check(applied.video_folder == s.video_folder && applied.keep_keys == s.keep_keys && applied.focus_skater && near(applied.focus_depth, 0.3f) &&
+              near(applied.curve, 1),
+          "a preset leaves the video folder, Keep keys and the focus alone");
+    const auto json = preset_json(preset).dump();
+    check(json.find("video_folder") == std::string::npos && json.find("keep_keys") == std::string::npos && json.find("focus.skater") == std::string::npos,
+          "and has none of them in it");
+    Settings reset = s;
+    const std::vector<std::string> all{"all"};
+    (void)command(reset, "reset", all);
+    check(reset.video_folder == s.video_folder && reset.keep_keys, "a full reset keeps where videos go (and Keep keys is back on)");
+
+    // Two stretches of footage (the replay opened again after skating more): the clock jumps between them.
+    const std::vector<link::Chunk> chunks{{33.8, 51.9, 0.0f, 0.4763f}, {139.35, 159.25, 0.4763f, 1.0f}};
+    check(near(link::timeline_share(chunks, 120.0, 38.0, 33.8), 0.0f), "a chunk's first moment is its share's start");
+    check(near(link::timeline_share(chunks, 120.0, 38.0, 42.85), 0.2381f, 1e-3f), "half way through the first chunk");
+    check(near(link::timeline_share(chunks, 120.0, 38.0, 159.25), 1.0f), "the last moment is the end");
+    check(near(link::timeline_share(chunks, 120.0, 38.0, 149.3), 0.7381f, 1e-3f), "half way through the second");
+    check(link::timeline_share(chunks, 120.0, 38.0, 100.0) < 0, "between them, no place");
+    check(near(link::timeline_share({}, 120.0, 38.0, 139.0), 0.5f), "no chunks known: one stretch from the start");
+}
+
+// The white of the game's picture under its UI, found from rows of the screen and of the picture they were made from.
+std::uint16_t half_of(float value) {
+    if (!(value > 0.0f)) return 0;
+    int exponent = 0;
+    const float fraction = std::frexp(value, &exponent); // value = fraction * 2^exponent, fraction in [0.5, 1)
+    int biased = exponent - 1 + 15;
+    auto mantissa = static_cast<std::uint32_t>(std::lround((fraction * 2.0f - 1.0f) * 1024.0f));
+    if (mantissa == 1024) {
+        mantissa = 0;
+        ++biased;
+    }
+    if (biased <= 0) return 0;
+    if (biased >= 31) return 0x7bff;
+    return static_cast<std::uint16_t>((static_cast<std::uint32_t>(biased) << 10) | mantissa);
+}
+float pq_of(float nits) {
+    const float y = std::pow(std::clamp(nits / 10000.0f, 0.0f, 1.0f), 0.1593017578125f);
+    return std::pow((0.8359375f + 18.8515625f * y) / (1.0f + 18.6875f * y), 78.84375f);
+}
+// A screen 1920 across over a picture 2880 across (the game rendering finer), 4 rows of the screen over 6 of the
+// picture, in patches 32 screen pixels wide of one level each: the picture holds `white` times the screen's level
+// in linear light. Between `dark_from` and `dark_to` (screen pixels) a UI box at half alpha darkens the screen.
+struct WhiteCase {
+    std::vector<std::uint8_t> screen, picture;
+    lens::WhiteStrip strip;
+};
+WhiteCase white_case(int transfer, float white, float nits, std::uint32_t dark_from = 0, std::uint32_t dark_to = 0) {
+    WhiteCase made;
+    constexpr std::uint32_t screen_w = 1920, picture_w = 2880, screen_rows = 4, picture_rows = 6;
+    const std::uint32_t screen_format = transfer == 1 ? 10u : 24u, screen_bytes = lens::white_texel_bytes(screen_format);
+    made.screen.assign(std::size_t{screen_w} * screen_rows * screen_bytes, 0);
+    made.picture.assign(std::size_t{picture_w} * picture_rows * 8, 0);
+    const auto level_at = [](std::uint32_t screen_x) { return 0.05f + 0.6f * static_cast<float>((screen_x / 32) % 13) / 12.0f; };
+    for (std::uint32_t y = 0; y < screen_rows; ++y)
+        for (std::uint32_t x = 0; x < screen_w; ++x) {
+            float level = level_at(x);
+            if (x >= dark_from && x < dark_to) level *= 0.5f;
+            auto* texel = made.screen.data() + (std::size_t{y} * screen_w + x) * screen_bytes;
+            if (transfer == 1) {
+                const std::uint16_t h = half_of(level * nits / 80.0f);
+                const std::array<std::uint16_t, 4> halves{h, h, h, half_of(1.0f)};
+                std::memcpy(texel, halves.data(), 8);
+            } else {
+                const float encoded = transfer == 2 ? pq_of(level * nits) : lens::linear_to_srgb(level);
+                const auto q = static_cast<std::uint32_t>(std::lround(std::clamp(encoded, 0.0f, 1.0f) * 1023.0f));
+                const std::uint32_t packed = q | (q << 10) | (q << 20) | (3u << 30);
+                std::memcpy(texel, &packed, 4);
+            }
+        }
+    for (std::uint32_t y = 0; y < picture_rows; ++y)
+        for (std::uint32_t x = 0; x < picture_w; ++x) {
+            const std::uint16_t h = half_of(level_at(x * 2 / 3) * white);
+            const std::array<std::uint16_t, 4> halves{h, h, h, half_of(1.0f)};
+            std::memcpy(made.picture.data() + (std::size_t{y} * picture_w + x) * 8, halves.data(), 8);
+        }
+    made.strip = {made.screen.data(), screen_format, screen_w * screen_bytes, screen_w, screen_rows,
+                  made.picture.data(), 10u, picture_w * 8, picture_w, picture_rows, 0.0, 6.0};
+    return made;
+}
+void white_tests() {
+    std::array<std::uint8_t, 8> texel{};
+    const std::uint32_t eleven_bits = (15u << 6) | ((16u << 6) << 11) | ((14u << 5) << 22);
+    std::memcpy(texel.data(), &eleven_bits, 4);
+    const auto eleven = lens::white_texel(26, texel.data());
+    check(near(eleven[0], 1.0f) && near(eleven[1], 2.0f) && near(eleven[2], 0.5f), "R11G11B10's floats read back");
+    const std::array<std::uint16_t, 4> halves{half_of(1.5f), half_of(0.25f), half_of(3.0f), 0};
+    std::memcpy(texel.data(), halves.data(), 8);
+    const auto half = lens::white_texel(10, texel.data());
+    check(near(half[0], 1.5f) && near(half[1], 0.25f) && near(half[2], 3.0f), "half floats read back");
+    const std::uint32_t ten_bits = 1023u | (512u << 10);
+    std::memcpy(texel.data(), &ten_bits, 4);
+    const auto ten = lens::white_texel(24, texel.data());
+    check(near(ten[0], 1.0f) && near(ten[1], 512.0f / 1023.0f) && near(ten[2], 0.0f), "R10G10B10A2 has red in its low bits");
+
+    const auto sdr = white_case(0, 2.16f, 80.0f);
+    const auto in_sdr = lens::measure_white(std::span(&sdr.strip, 1), 0, 80.0f);
+    check(in_sdr.ok && near(in_sdr.white, 2.16f, 0.02), "SDR: the picture's white is found: " + in_sdr.detail);
+    check(in_sdr.spread < 0.02f && in_sdr.detail.find("by level:") != std::string::npos, "with every level agreeing, and how they go told");
+    const auto boxed = white_case(0, 2.16f, 80.0f, 600, 900);
+    const auto under_box = lens::measure_white(std::span(&boxed.strip, 1), 0, 80.0f);
+    check(under_box.ok && near(under_box.white, 2.16f, 0.02), "a UI box over a sixth of the strip does not move it: " + under_box.detail);
+    const auto scrgb = white_case(1, 2.16f, 203.0f);
+    const auto in_scrgb = lens::measure_white(std::span(&scrgb.strip, 1), 1, 203.0f);
+    check(in_scrgb.ok && near(in_scrgb.white, 2.16f, 0.02), "scRGB: white at the paper white: " + in_scrgb.detail);
+    const auto hdr10 = white_case(2, 1.0f, 203.0f);
+    const auto in_hdr10 = lens::measure_white(std::span(&hdr10.strip, 1), 2, 203.0f);
+    check(in_hdr10.ok && near(in_hdr10.white, 1.0f, 0.03), "HDR10: a picture already at 1 reads 1: " + in_hdr10.detail);
+    auto narrow = sdr.strip;
+    narrow.screen_width = 200;
+    narrow.picture_width = 300;
+    check(!lens::measure_white(std::span(&narrow, 1), 0, 80.0f).ok, "too few blocks measure nothing");
+
+    // The game's display mapping: through the points measured in game (2026-11-18), undone exactly, and rising.
+    const lens::DisplayMapping mapping;
+    const std::array<std::array<float, 2>, 6> measured_points{{{0.0281f, 0.0055f}, {0.2526f, 0.1471f}, {1.18f, 0.4922f}, {2.125f, 0.6502f},
+                                                               {4.831f, 0.8053f}, {14.016f, 0.9250f}}};
+    for (const auto& [p, d] : measured_points)
+        check(std::abs(lens::display_mapped(mapping, p) / d - 1.0f) < (p < 0.1f ? 0.08f : 0.03f),
+              std::format("the display mapping shows {} as {} (measured {})", p, lens::display_mapped(mapping, p), d));
+    float last = 0.0f;
+    for (float p = 0.0005f; p < 30000.0f; p *= 1.3f) {
+        const float d = lens::display_mapped(mapping, p);
+        check(d > last && d < 1.0f, std::format("the display mapping rises below 1 ({} at {})", d, p));
+        last = d;
+        check(std::abs(lens::display_unmapped(mapping, d) / p - 1.0f) < 2e-3f || d > 0.9999f,
+              std::format("and is undone exactly ({} -> {} -> {})", p, d, lens::display_unmapped(mapping, d)));
+    }
+    for (float d = 1e-5f; d < 0.9999f; d = d * 1.5f + 0.001f)
+        check(std::abs(lens::display_mapped(mapping, lens::display_unmapped(mapping, d)) / d - 1.0f) < 2e-3f, std::format("a screen level {} comes back", d));
+    check(lens::display_mapped(mapping, 0.0f) == 0.0f && lens::display_unmapped(mapping, 0.0f) == 0.0f, "black stays black");
+    check(lens::display_unmapped(mapping, 1.0f) > 1000.0f && lens::display_unmapped(mapping, 1.0f) < 65000.0f, "white is a value the picture can hold");
+    lens::DisplayMapping brighter;
+    brighter.scale = 1.3f;
+    check(std::abs(lens::display_mapped(brighter, 1.0f) - lens::display_mapped(mapping, 1.3f)) < 1e-6f, "the scale multiplies the picture going in");
+    // Measured from a screen made through it, at the scale it comes at and at another; and under a box of the game's UI.
+    for (const float scale : {1.0f, 1.3f}) {
+        auto made = white_case(0, 1.0f, 80.0f);
+        lens::DisplayMapping through = mapping;
+        through.scale = scale;
+        for (std::uint32_t y = 0; y < 6; ++y)
+            for (std::uint32_t x = 0; x < 2880; ++x) {
+                const std::uint16_t h = half_of(0.03f * std::pow(400.0f, static_cast<float>((x * 2 / 3 / 32) % 13) / 12.0f));
+                const std::array<std::uint16_t, 4> texel_halves{h, h, h, half_of(1.0f)};
+                std::memcpy(made.picture.data() + (std::size_t{y} * 2880 + x) * 8, texel_halves.data(), 8);
+            }
+        for (std::uint32_t y = 0; y < 4; ++y)
+            for (std::uint32_t x = 0; x < 1920; ++x) {
+                const float p = 0.03f * std::pow(400.0f, static_cast<float>((x / 32) % 13) / 12.0f);
+                float shown = lens::display_mapped(through, p);
+                if (scale > 1.0f && x >= 600 && x < 900) shown *= 0.5f;
+                const auto q = static_cast<std::uint32_t>(std::lround(std::clamp(lens::linear_to_srgb(shown), 0.0f, 1.0f) * 1023.0f));
+                const std::uint32_t packed = q | (q << 10) | (q << 20) | (3u << 30);
+                std::memcpy(made.screen.data() + (std::size_t{y} * 1920 + x) * 4, &packed, 4);
+            }
+        const auto found = lens::measure_scale(std::span(&made.strip, 1), mapping);
+        check(found.ok && near(found.scale, scale, 0.015 * scale), std::format("the scale {} is found: {}", scale, found.detail));
+    }
+
+    lens::WhiteTrack track;
+    check(track.add(2.16f) && near(track.white, 2.16f), "the first measurement is used at once");
+    check(!track.add(2.17f) && near(track.white, 2.16f), "one within 1% leaves it");
+    check(!track.add(4.3f) && near(track.white, 2.16f), "one odd one does not move it");
+    check(!track.add(4.3f) && track.add(4.3f) && near(track.white, 4.3f), "three of five agreeing on another do");
+    check(!track.add(0.0f) && !track.add(std::nanf("")), "nothing measured is ignored");
+}
+
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> suites{
         {"fields", field_tests}, {"commands", command_tests}, {"json", json_tests}, {"presets", preset_tests},
         {"lens", lens_tests}, {"grade", grade_tests}, {"finish", finish_tests}, {"focus", focus_tests},
         {"shake keys", shake_key_tests}, {"view", view_tests}, {"edge compression", compression_tests}, {"overlay", hood_tests},
-        {"colour tools", colour_tool_tests}};
+        {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}};
     try {
         for (const auto& [name, suite] : suites) {
             suite();

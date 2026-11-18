@@ -58,18 +58,21 @@ if you'd rather do it by hand, the zip in the release has a readme that says how
 - light: a light on the camera, good for night clips
 - shake: handheld shake that you can turn on and off along the clip
 - game: the game's own effects like motion blur, bloom, lens flares and fog
-- video: a real 4:3 picture that isn't stretched, and a sharper middle when you're using a fisheye
+- video: a real 4:3 picture that isn't stretched, a sharper middle when you're using a fisheye, and pick where your
+  exported videos go
 - presets: save your look with a name, export it as a file and send it to people. presets people send you go in
   the import folder and just show up
+- experimental: skater autofocus (the focus follows your skater) and keep keys (your keyframes come back when you
+  open the editor again)
 
 ## using it
 
 open a replay, hold R3 and press RB (or hit F10) to open the menu. LB/RB switches tabs, the dpad changes stuff, A
-selects, X resets and B closes it.
+selects, X resets and B closes it. the mouse and keyboard work in it too.
 
 holding R3 in the editor also gives you shortcuts without opening the menu: dpad up/down and the triggers set focus
-keys, dpad left turns the shake on or off, LB adds a shake key and View deletes the keys where you are. tapping R3
-still takes a photo like it normally does.
+keys, dpad left turns the shake on or off, dpad right turns the camera light on or off, LB adds a shake key and View
+deletes the keys where you are. tapping R3 still takes a photo like it normally does.
 
 the [guide](GUIDE.md) has the rest.
 

@@ -1,7 +1,9 @@
 #include "replay_plus_link.h"
+#include <algorithm>
 #include <chrono>
 #include <deque>
 #include <mutex>
+#include <utility>
 
 namespace dingosdk::replay_plus::link {
 std::uint64_t now_ms() noexcept {
@@ -18,7 +20,10 @@ struct Shared {
     std::string shot;
     bool shot_asked{};
     RenderReport report;
-    bool panel_request{}, panel_request_open{};
+    bool panel_request{}, panel_request_open{}, panel_request_keyboard{};
+    bool white_asked{}, white_curve{};
+    float white_used{1.0f}, white_measured{};
+    std::string white_detail, white_dump;
 };
 Shared& shared() {
     static auto* value = new Shared;
@@ -67,6 +72,7 @@ void note_focus_depth(float metres) noexcept {
 }
 float focus_depth() noexcept { return focus_metres.load(std::memory_order_relaxed); }
 std::uint64_t focus_depth_at() noexcept { return focus_when.load(std::memory_order_acquire); }
+
 std::atomic<bool>& panel_keyboard() noexcept { return keyboard_flag; }
 std::atomic<int>& trace_frames() noexcept {
     static std::atomic<int> value{0};
@@ -216,19 +222,40 @@ std::vector<std::string> take() {
 }
 
 std::atomic<bool>& panel_open() noexcept { return open_flag; }
-void ask_panel(bool open) noexcept {
+void ask_panel(bool open, bool from_keyboard) noexcept {
     auto& s = shared();
     std::lock_guard lock(s.mutex);
     s.panel_request = true;
     s.panel_request_open = open;
+    s.panel_request_keyboard = from_keyboard;
 }
-bool take_panel_request(bool& open) noexcept {
+bool take_panel_request(bool& open, bool& from_keyboard) noexcept {
     auto& s = shared();
     std::lock_guard lock(s.mutex);
     if (!s.panel_request) return false;
     s.panel_request = false;
     open = s.panel_request_open;
+    from_keyboard = s.panel_request_keyboard;
     return true;
+}
+float timeline_share(const std::vector<Chunk>& chunks, double timeline_start, double timeline_length, double clock) noexcept {
+    if (chunks.empty()) return timeline_length > 0 ? static_cast<float>((clock - timeline_start) / timeline_length) : -1.0f;
+    // (Within a frame of a chunk's ends counts as in it.)
+    constexpr double slack = 1.0 / 60.0;
+    for (const auto& c : chunks)
+        if (clock >= c.clock_from - slack && clock <= c.clock_to + slack) {
+            const double span = c.clock_to - c.clock_from;
+            const double along = span > 1e-9 ? std::clamp((clock - c.clock_from) / span, 0.0, 1.0) : 0.0;
+            return c.from + static_cast<float>(along) * (c.to - c.from);
+        }
+    return -1.0f;
+}
+std::atomic<bool>& panel_pointer() noexcept {
+    static std::atomic<bool> value{false};
+    return value;
+}
+bool panel_has_pointer() noexcept {
+    return panel_pointer().load(std::memory_order_acquire) && now_ms() - drawn_when.load(std::memory_order_acquire) < 1000;
 }
 void note_panel_drawn() noexcept { drawn_when.store(now_ms(), std::memory_order_release); }
 std::uint64_t panel_drawn_at() noexcept { return drawn_when.load(std::memory_order_acquire); }
@@ -275,6 +302,94 @@ RenderReport render_report() noexcept {
         auto& s = shared();
         std::lock_guard lock(s.mutex);
         return s.report;
+    } catch (...) { return {}; }
+}
+
+void ask_white() noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        s.white_asked = true;
+    } catch (...) {}
+}
+bool take_white() noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        const bool asked = s.white_asked;
+        s.white_asked = false;
+        return asked;
+    } catch (...) { return false; }
+}
+void note_white(float used, float measured, bool curve) noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        s.white_used = used;
+        s.white_measured = measured;
+        s.white_curve = curve;
+    } catch (...) {}
+}
+bool scene_white_curve() noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        return s.white_curve;
+    } catch (...) { return false; }
+}
+void note_white_detail(std::string detail) noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        s.white_detail = std::move(detail);
+    } catch (...) {}
+}
+float scene_white() noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        return s.white_used;
+    } catch (...) { return 1.0f; }
+}
+float scene_white_measured() noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        return s.white_measured;
+    } catch (...) { return 0.0f; }
+}
+std::string white_detail() noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        return s.white_detail;
+    } catch (...) { return {}; }
+}
+std::atomic<float>& white_fixed() noexcept {
+    static std::atomic<float> value{0.0f};
+    return value;
+}
+void ask_white_dump(std::string path) noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        s.white_dump = std::move(path);
+        s.white_asked = true;
+    } catch (...) {}
+}
+std::atomic<float>& light_facing_metres() noexcept {
+    static std::atomic<float> value{light_facing_metres_default};
+    return value;
+}
+std::atomic<float>& light_facing_weight() noexcept {
+    static std::atomic<float> value{light_facing_weight_default};
+    return value;
+}
+std::string take_white_dump() noexcept {
+    try {
+        auto& s = shared();
+        std::lock_guard lock(s.mutex);
+        return std::exchange(s.white_dump, std::string());
     } catch (...) { return {}; }
 }
 } // namespace dingosdk::replay_plus::link

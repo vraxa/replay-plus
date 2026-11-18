@@ -1,8 +1,10 @@
 #include "replay_plus_lens.h"
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <mutex>
 #include <thread>
 
@@ -958,5 +960,292 @@ void finish(const Finish& f, Picture picture, std::vector<std::uint8_t>& scratch
         }
         for (auto& thread : pool) thread.join();
     } catch (...) { /* the frame goes out as the game made it */ }
+}
+
+// ---- The white of the game's picture under its UI ---------------------------------------------
+namespace {
+// R11G11B10's 11- and 10-bit floats, and a half float's magnitude: five bits of exponent, no sign.
+float small_float(std::uint32_t bits, unsigned mantissa_bits) noexcept {
+    const std::uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u), exponent = (bits >> mantissa_bits) & 31u;
+    if (exponent == 0) return static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits) / 16384.0f;
+    if (exponent == 31) return 65504.0f;
+    return std::bit_cast<float>(((exponent + 112u) << 23) | (mantissa << (23u - mantissa_bits)));
+}
+float half_float(std::uint16_t half) noexcept {
+    const float magnitude = small_float(half & 0x7fffu, 10);
+    return (half & 0x8000u) ? -magnitude : magnitude;
+}
+float pq_nits(float encoded) noexcept {
+    const float p = std::pow(std::clamp(encoded, 0.0f, 1.0f), 1.0f / 78.84375f);
+    return 10000.0f * std::pow(std::max(p - 0.8359375f, 0.0f) / (18.8515625f - 18.6875f * p), 1.0f / 0.1593017578125f);
+}
+float luma(const std::array<float, 3>& rgb) noexcept { return 0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2]; }
+float median_of(std::vector<float>& values) {
+    if (values.empty()) return 0.0f;
+    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+    std::nth_element(values.begin(), middle, values.end());
+    return *middle;
+}
+// A block of the screen (16 pixels across a strip's rows) and the picture's texels under it.
+struct WhiteBlock {
+    std::array<float, 3> shown{}, picture{}; // linear light, 1 the screen's white; the picture's values as they are
+    float shown_gamma{};                     // its level through a plain 2.2 gamma (SDR), to compare with sRGB's
+    float low{1e30f}, high{};                // its darkest and brightest pixels' levels
+};
+float level_of(const WhiteBlock& block) noexcept { return luma(block.shown); }
+// Even: no edge or texture across it, so the game's scaling of the picture changes nothing there.
+bool even_block(const WhiteBlock& block) noexcept {
+    const float level = level_of(block);
+    return level > 0.0f && block.high - block.low <= 0.25f * level;
+}
+} // namespace
+
+bool white_format(std::uint32_t format) noexcept {
+    return format == 10 || format == 24 || format == 26 || format == 28 || format == 29 || format == 87 || format == 91;
+}
+std::uint32_t white_texel_bytes(std::uint32_t format) noexcept { return format == 10 ? 8u : 4u; }
+std::array<float, 3> white_texel(std::uint32_t format, const std::uint8_t* texel) noexcept {
+    std::uint32_t packed{};
+    switch (format) {
+    case 10: {
+        std::array<std::uint16_t, 3> halves{};
+        std::memcpy(halves.data(), texel, 6);
+        return {half_float(halves[0]), half_float(halves[1]), half_float(halves[2])};
+    }
+    case 24:
+        std::memcpy(&packed, texel, 4);
+        return {static_cast<float>(packed & 1023u) / 1023.0f, static_cast<float>((packed >> 10) & 1023u) / 1023.0f,
+                static_cast<float>((packed >> 20) & 1023u) / 1023.0f};
+    case 26:
+        std::memcpy(&packed, texel, 4);
+        return {small_float(packed & 0x7ffu, 6), small_float((packed >> 11) & 0x7ffu, 6), small_float(packed >> 22, 5)};
+    case 87:
+    case 91: return {static_cast<float>(texel[2]) / 255.0f, static_cast<float>(texel[1]) / 255.0f, static_cast<float>(texel[0]) / 255.0f};
+    default: return {static_cast<float>(texel[0]) / 255.0f, static_cast<float>(texel[1]) / 255.0f, static_cast<float>(texel[2]) / 255.0f};
+    }
+}
+
+namespace {
+// The strips' blocks: 16 screen pixels across each strip's rows, and the picture's texels under them.
+std::vector<WhiteBlock> white_blocks(std::span<const WhiteStrip> strips, int transfer, float white_nits) {
+    constexpr std::uint32_t side = 16;
+    const float nits = std::max(white_nits, 1.0f);
+    // The screen's value in linear light, 1 its white (SDR: sRGB's curve, or a plain 2.2 gamma to compare).
+    const auto shown_linear = [transfer, nits](float value, bool gamma) {
+        if (transfer == 1) return value * 80.0f / nits;
+        if (transfer == 2) return pq_nits(value) / nits;
+        return gamma ? std::pow(std::max(value, 0.0f), 2.2f) : srgb_to_linear(value);
+    };
+    std::vector<WhiteBlock> blocks;
+    for (const auto& strip : strips) {
+        if (!strip.screen || !strip.picture || !white_format(strip.screen_format) || !white_format(strip.picture_format)) continue;
+        if (strip.screen_width < side * 4 || !strip.screen_rows || !strip.picture_width || !strip.picture_rows) continue;
+        const double across = static_cast<double>(strip.picture_width) / static_cast<double>(strip.screen_width);
+        const auto first_row =
+            static_cast<std::uint32_t>(std::clamp(std::floor(strip.picture_from), 0.0, static_cast<double>(strip.picture_rows - 1)));
+        const auto end_row = static_cast<std::uint32_t>(
+            std::clamp(std::ceil(strip.picture_to), static_cast<double>(first_row + 1), static_cast<double>(strip.picture_rows)));
+        const std::uint32_t screen_bytes = white_texel_bytes(strip.screen_format), picture_bytes = white_texel_bytes(strip.picture_format);
+        const std::uint32_t margin = strip.screen_width / 20;
+        for (std::uint32_t left = margin; left + side + margin <= strip.screen_width; left += side) {
+            WhiteBlock block;
+            for (std::uint32_t row = 0; row < strip.screen_rows; ++row)
+                for (std::uint32_t column = left; column < left + side; ++column) {
+                    const auto stored =
+                        white_texel(strip.screen_format, strip.screen + std::size_t{row} * strip.screen_pitch + std::size_t{column} * screen_bytes);
+                    const std::array<float, 3> light{shown_linear(stored[0], false), shown_linear(stored[1], false), shown_linear(stored[2], false)};
+                    for (std::size_t c = 0; c < 3; ++c) block.shown[c] += light[c];
+                    const float level = luma(light);
+                    block.low = std::min(block.low, level);
+                    block.high = std::max(block.high, level);
+                    block.shown_gamma += luma({shown_linear(stored[0], true), shown_linear(stored[1], true), shown_linear(stored[2], true)});
+                }
+            const float shown_count = static_cast<float>(side * strip.screen_rows);
+            for (auto& value : block.shown) value /= shown_count;
+            block.shown_gamma /= shown_count;
+            const auto from_column = static_cast<std::uint32_t>(static_cast<double>(left) * across);
+            const auto to_column = std::min(strip.picture_width, std::max(from_column + 1, static_cast<std::uint32_t>(static_cast<double>(left + side) * across)));
+            std::size_t picture_count = 0;
+            for (std::uint32_t row = first_row; row < end_row; ++row)
+                for (std::uint32_t column = from_column; column < to_column; ++column) {
+                    const auto stored =
+                        white_texel(strip.picture_format, strip.picture + std::size_t{row} * strip.picture_pitch + std::size_t{column} * picture_bytes);
+                    for (std::size_t c = 0; c < 3; ++c) block.picture[c] += stored[c];
+                    ++picture_count;
+                }
+            for (auto& value : block.picture) value /= static_cast<float>(std::max<std::size_t>(picture_count, 1));
+            blocks.push_back(block);
+        }
+    }
+    return blocks;
+}
+} // namespace
+
+WhiteMeasure measure_white(std::span<const WhiteStrip> strips, int transfer, float white_nits, std::vector<WhitePair>* pairs) {
+    WhiteMeasure m;
+    try {
+        const auto blocks = white_blocks(strips, transfer, white_nits);
+        m.blocks = blocks.size();
+        if (pairs) {
+            pairs->clear();
+            for (const auto& block : blocks)
+                pairs->push_back({block.picture[0], block.picture[1], block.picture[2], block.shown[0], block.shown[1], block.shown[2],
+                                  even_block(block) ? 1.0f : 0.0f});
+        }
+        // The white: the picture's level over the screen's, on even blocks in the screen's middle levels (above its
+        // darks, below where a display mapping may round off towards white).
+        std::vector<float> ratios;
+        for (const auto& block : blocks) {
+            const float level = level_of(block), source = luma(block.picture);
+            if (even_block(block) && level >= 0.04f && level <= 0.7f && source > 0.0f) ratios.push_back(source / level);
+        }
+        m.used = ratios.size();
+        std::string detail = std::format("{} of {} blocks", m.used, m.blocks);
+        if (ratios.size() >= 24) {
+            std::sort(ratios.begin(), ratios.end());
+            const float lower = ratios[ratios.size() / 4], middle = ratios[ratios.size() / 2], upper = ratios[ratios.size() * 3 / 4];
+            m.white = middle;
+            m.spread = middle > 0.0f ? (upper - lower) / middle : 1.0f;
+            m.ok = m.spread <= 0.1f && middle > 0.05f && middle < 100.0f;
+            detail += std::format(": white {:.3f} (middle half {:.3f} to {:.3f})", middle, lower, upper);
+        }
+        // By the screen's level: one ratio all the way up is a plain scale; a ratio rising near the top, a shoulder.
+        constexpr std::array<float, 11> edges{0.005f, 0.02f, 0.05f, 0.1f, 0.2f, 0.35f, 0.5f, 0.7f, 0.85f, 0.95f, 1.01f};
+        const auto profile = [&blocks, &edges](bool gamma) {
+            std::string text;
+            for (std::size_t i = 0; i + 1 < edges.size(); ++i) {
+                std::vector<float> in_bin;
+                for (const auto& block : blocks) {
+                    const float level = gamma ? block.shown_gamma : level_of(block), source = luma(block.picture);
+                    if (even_block(block) && level >= edges[i] && level < edges[i + 1] && source > 0.0f) in_bin.push_back(source / level);
+                }
+                if (!in_bin.empty()) text += std::format(" {:.3f}-{:.2f} {:.3f} ({})", edges[i], edges[i + 1], median_of(in_bin), in_bin.size());
+            }
+            return text;
+        };
+        detail += "; by level:" + profile(false);
+        if (transfer == 0) detail += "; with a 2.2 gamma:" + profile(true);
+        // Each channel on its own (a colour matrix in the game's last pass would show here).
+        std::array<float, 3> channel{};
+        for (std::size_t c = 0; c < 3; ++c) {
+            std::vector<float> in_range;
+            for (const auto& block : blocks)
+                if (even_block(block) && block.shown[c] >= 0.04f && block.shown[c] <= 0.7f && block.picture[c] > 0.0f)
+                    in_range.push_back(block.picture[c] / block.shown[c]);
+            channel[c] = median_of(in_range);
+        }
+        detail += std::format("; red {:.3f}, green {:.3f}, blue {:.3f}", channel[0], channel[1], channel[2]);
+        // Where the screen reaches its white, and the picture's brightest block.
+        float white_from = 0.0f, brightest = 0.0f, brightest_shown = 0.0f;
+        for (const auto& block : blocks) {
+            const float source = luma(block.picture), level = level_of(block);
+            if (level >= 0.985f && (white_from == 0.0f || source < white_from)) white_from = source;
+            if (source > brightest) {
+                brightest = source;
+                brightest_shown = level;
+            }
+        }
+        detail += std::format("; the picture's brightest block {:.3f} shows at {:.3f}", brightest, brightest_shown);
+        if (white_from > 0.0f) detail += std::format(", the screen is white from {:.3f}", white_from);
+        m.detail = std::move(detail);
+    } catch (...) {
+        m = {};
+    }
+    return m;
+}
+
+bool WhiteTrack::add(float measured) noexcept {
+    if (!(measured > 0.0f) || !std::isfinite(measured)) return false;
+    last[count % last.size()] = measured;
+    ++count;
+    const std::size_t n = std::min(count, last.size());
+    auto sorted = last;
+    std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(n));
+    const float middle = sorted[(n - 1) / 2];
+    if (white > 0.0f && std::abs(middle / white - 1.0f) <= 0.01f) return false;
+    white = middle;
+    return true;
+}
+
+// ---- The game's display mapping (SDR) ------------------------------------------------------------
+namespace {
+float mapping_t(const DisplayMapping& m, float x) noexcept {
+    const float w = std::max(m.w, 0.05f);
+    const float z = (x - m.x0) / w;
+    const float soft = std::max(z, 0.0f) + std::log2(1.0f + std::exp2(-std::abs(z)));
+    return m.t0 + m.s1 * x + (m.s2 - m.s1) * w * soft;
+}
+float mapping_slope(const DisplayMapping& m, float x) noexcept {
+    const float w = std::max(m.w, 0.05f);
+    return m.s1 + (m.s2 - m.s1) / (1.0f + std::exp2(-(x - m.x0) / w));
+}
+} // namespace
+
+float display_mapped(const DisplayMapping& mapping, float picture) noexcept {
+    if (!(picture > 0.0f)) return 0.0f;
+    const float t = mapping_t(mapping, std::log2(picture * std::max(mapping.scale, 1e-6f)));
+    return 1.0f / (1.0f + std::exp2(-t));
+}
+float display_unmapped(const DisplayMapping& mapping, float shown) noexcept {
+    if (!(shown > 0.0f)) return 0.0f;
+    const float d = std::min(shown, 0.99995f);
+    const float t = std::log2(d / (1.0f - d));
+    // The curve lies under both its lines (concave, as its slope falls from s1 to s2): Newton from the larger of
+    // their inverses starts below the root and closes in from there.
+    float x = std::max((t - mapping.t0) / mapping.s1, (t - mapping.t0 - (mapping.s1 - mapping.s2) * mapping.x0) / mapping.s2);
+    for (int i = 0; i < 5; ++i) x -= (mapping_t(mapping, x) - t) / mapping_slope(mapping, x);
+    return std::exp2(x) / std::max(mapping.scale, 1e-6f);
+}
+
+ScaleMeasure measure_scale(std::span<const WhiteStrip> strips, const DisplayMapping& mapping) {
+    ScaleMeasure m;
+    try {
+        const auto blocks = white_blocks(strips, 0, 80.0f);
+        m.blocks = blocks.size();
+        DisplayMapping curve = mapping;
+        curve.scale = 1.0f;
+        // Near-grey even blocks (a saturated colour's weakest channel shows a little lighter than the curve says),
+        // each channel the screen shows between its darks and its whites.
+        const auto near_grey = [](const WhiteBlock& block) {
+            const float least = std::min({block.picture[0], block.picture[1], block.picture[2]});
+            const float most = std::max({block.picture[0], block.picture[1], block.picture[2]});
+            return least > 0.0f && most <= 1.25f * least;
+        };
+        std::vector<float> scales;
+        for (const auto& block : blocks) {
+            if (!even_block(block) || !near_grey(block)) continue;
+            for (std::size_t c = 0; c < 3; ++c)
+                if (block.shown[c] >= 0.02f && block.shown[c] <= 0.95f) scales.push_back(display_unmapped(curve, block.shown[c]) / block.picture[c]);
+        }
+        m.used = scales.size();
+        std::string detail = std::format("{} channels of {} blocks", m.used, m.blocks);
+        if (scales.size() >= 20) {
+            std::sort(scales.begin(), scales.end());
+            const float lower = scales[scales.size() / 4], middle = scales[scales.size() / 2], upper = scales[scales.size() * 3 / 4];
+            m.scale = middle;
+            m.spread = middle > 0.0f ? (upper - lower) / middle : 1.0f;
+            m.ok = m.spread <= 0.08f && middle > 0.25f && middle < 4.0f;
+            detail += std::format(": the picture goes into the game's display mapping at {:.3f} (middle half {:.3f} to {:.3f})", middle, lower, upper);
+            // How closely the curve, at that scale, follows the screen at each level (the screen over the curve).
+            curve.scale = middle;
+            constexpr std::array<float, 9> edges{0.005f, 0.02f, 0.05f, 0.1f, 0.2f, 0.4f, 0.7f, 0.9f, 1.01f};
+            detail += "; the screen against it by level:";
+            for (std::size_t i = 0; i + 1 < edges.size(); ++i) {
+                std::vector<float> in_bin;
+                for (const auto& block : blocks) {
+                    if (!even_block(block) || !near_grey(block)) continue;
+                    for (std::size_t c = 0; c < 3; ++c)
+                        if (block.shown[c] >= edges[i] && block.shown[c] < edges[i + 1])
+                            in_bin.push_back(block.shown[c] / std::max(display_mapped(curve, block.picture[c]), 1e-6f));
+                }
+                if (!in_bin.empty())
+                    detail += std::format(" {:.3f}-{:.2f} {:+.1f}% ({})", edges[i], edges[i + 1], (median_of(in_bin) - 1.0f) * 100.0f, in_bin.size());
+            }
+        }
+        m.detail = std::move(detail);
+    } catch (...) {
+        m = {};
+    }
+    return m;
 }
 } // namespace dingosdk::replay_plus::lens

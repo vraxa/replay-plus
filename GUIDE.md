@@ -54,8 +54,13 @@ in the replay editor hold R3 and press RB, or press F10.
 - dpad: up and down picks a row, left and right changes it (hold to go faster)
 - A selects, X resets to default, holding Y hides the menu so you can see the picture, B closes it
 
-on keyboard it's the arrows, Enter, R, Q / E and Backspace. you can still scrub the replay with the triggers
-while the menu's open.
+on keyboard it's the arrows or WASD, Enter or Space, R to reset, Q / E or Tab for tabs, and Backspace or Esc to
+close. Home / End jump to the first / last row, and Shift with left / right does bigger steps. with an xbox pad
+you can still scrub the replay with the triggers while the menu's open.
+
+the mouse works too. open the menu with F10 (or just move the mouse while it's open) and you get a pointer: click
+the tabs and rows, drag the sliders, click either side of a value to step it (hold to keep going), scroll the list
+with the wheel. the button prompts at the bottom are clickable as well.
 
 ## R3 shortcuts
 
@@ -64,7 +69,7 @@ hold R3 in the replay editor and:
 - RB: open the menu
 - dpad up / down: focus further / nearer (puts a focus key where you are)
 - LT / RT: less / more blur
-- dpad right: a focus key here
+- dpad right: camera light on / off
 - dpad left: shake on / off
 - LB: a shake key (turns the shake on or off from that point)
 - View: delete the keys where you are
@@ -81,12 +86,24 @@ timeline. a quick tap of R3 is still the game's photo button.
 - frame: 4:3 or 2.39 bars, and an overlay, either your own png (a lens hood or whatever) or a round edge
 - colour: a camcorder curve, exposure, contrast, saturation, warmth, lift / gamma / gain, split toning, grain
   and vignette
-- focus: depth of field, fixed, keyframed along the replay, or auto. it blurs what's behind the focus too
+- focus: depth of field, fixed, keyframed along the replay, or auto (whatever's in the middle). it blurs what's
+  behind the focus too
 - light: a light on the camera
 - game: the game's own effects held where you put them (motion blur, bloom, lens flares, fog, exposure and so on)
 - video: sharp middle (renders finer so a wide fisheye doesn't go soft in the middle), the editor's picture shape
-  (a real 4:3 that isn't stretched), render resolutions, and a bigger texture pool for big maps
+  (a real 4:3 that isn't stretched), render resolutions, a bigger texture pool for big maps, and where your exported
+  videos go
 - presets: your saved looks
+- experimental: newer stuff that reads the game's own replay, so a game update might break it for a bit. Skater
+  autofocus (auto follows your skater wherever they are in the shot instead of whatever's in the middle) and Keep
+  keys (below)
+
+## keeping your keys
+
+the game wipes your camera keyframes when you leave the replay editor. with Keep keys on (experimental tab, it's on
+by default) they're saved when you leave and put back when you open the editor again, along with your focus and shake
+keys, as long as that bit of footage is still in the replay. turn it off and every visit starts clean. keys don't
+carry over a game restart, since the replay's gone by then.
 
 ## presets
 
@@ -106,12 +123,15 @@ there are two to start from, Fisheye 16-9 and Fisheye 4-3. if you delete them th
 | presets people send you | `%LOCALAPPDATA%\ReSkate\Replay Plus\Import` |
 | presets you export | `%LOCALAPPDATA%\ReSkate\Replay Plus\Export` |
 | overlay pngs | `%LOCALAPPDATA%\ReSkate\Replay Plus\Overlays` |
+| exported videos | the game's own folder (`%LOCALAPPDATA%\ReSkate\Game\Skate\data\Videos`), or wherever you set Videos go to (video tab) |
 | settings | `%LOCALAPPDATA%\ReSkate\profiles\offline\replay_plus.json` |
 
 ## good to know
 
 - everything shows up in exported videos too, not just on screen
 - for sharper exports turn up Export quality in Insert > SETTINGS > REPLAYS
+- with your own video folder set, each export gets moved there a second or two after it's done. the game's own
+  "exported" popup still says your AppData folder, just ignore that
 - the 4:3 picture shape needs the game in borderless fullscreen (that's the default)
 - the R3 shortcuts need an xinput controller, so an xbox pad, or a ps pad through ds4windows or steam input
 - the studio's own updater is off in this dll since it would put back a studio without replay plus. use the

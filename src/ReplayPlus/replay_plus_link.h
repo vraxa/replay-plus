@@ -61,6 +61,18 @@ void publish_hood(std::shared_ptr<const HoodImage> image) noexcept;
 std::shared_ptr<const HoodImage> hood() noexcept; // null while there is none
 
 // ---- The panel: game thread -> render thread ---------------------------------------------------
+// The replay's footage as the game strings it together (its replay's chunks, read 2026-11-18 on build 25414733): each
+// a stretch of the replay's clock and the share of the timeline it fills. A replay opened again after more skating is
+// several, and the clock jumps between them: a time is placed on the timeline through its chunk.
+struct Chunk {
+    double clock_from{}, clock_to{};
+    float from{}, to{};
+    bool operator==(const Chunk&) const = default;
+};
+// The timeline's share (0..1) at a time on the replay's clock: through its chunk when the chunks are known (-1 in none
+// of them), else as one stretch from the timeline's start.
+float timeline_share(const std::vector<Chunk>& chunks, double timeline_start, double timeline_length, double clock) noexcept;
+
 struct ShakeView {
     bool available{}, on{};
     replay_shake::Shake fallback;
@@ -93,6 +105,7 @@ struct View {
     // The replay editor's timeline (the game's): where it starts on the replay's clock, and how long.
     bool timeline_ok{};
     double timeline_start{}, timeline_length{};
+    std::vector<Chunk> chunks; // the replay's footage (none known: one stretch from timeline_start)
     // The shake at the playhead (its keys, or Replay Shake's own switch), and that switch.
     bool shake_here{}, shake_switch{};
     // R3 is held in the replay editor (its shortcuts' guide shows), and what the last shortcut did (and
@@ -100,6 +113,15 @@ struct View {
     bool r3_held{};
     std::string toast;
     std::uint64_t toast_at{};
+    // Where exported videos go (UTF-8), and whether that is a folder of the player's own (else the game's).
+    std::string video_folder;
+    bool video_folder_custom{};
+    // The skater's autofocus works on this game build (it reads where the replay has the skater), and how far away
+    // the skater is now (metres along the camera; 0: not known).
+    bool skater_focus_available{};
+    float skater_distance{};
+    // Keep keys: how many of the game's own camera keyframes are kept from the last visit to the replay editor.
+    std::size_t camera_keys_kept{};
 };
 // The panel is worked from the keyboard (or a pad the game reads itself): the game's input is then
 // paused whole while it is open, rather than only the pad's buttons kept from it.
@@ -169,10 +191,18 @@ std::vector<std::string> take();
 // The panel is open (the render thread draws it and reads the pad; the game thread keeps the game's
 // input from it meanwhile). Asked open by the game thread (the held combo, `replayplus panel`).
 std::atomic<bool>& panel_open() noexcept;
-// The game thread asks the panel to open (or close) itself on the render thread's next frame.
-void ask_panel(bool open) noexcept;
+// The game thread asks the panel to open (or close) itself on the render thread's next frame; from the keyboard
+// (F10), it opens with the mouse pointer and the keyboard's button prompts.
+void ask_panel(bool open, bool from_keyboard = false) noexcept;
 // Render thread: the request, once.
-bool take_panel_request(bool& open) noexcept;
+bool take_panel_request(bool& open, bool& from_keyboard) noexcept;
+// The panel has the mouse pointer: ReSkate's overlay owns it while this is set (Extension/UI/Overlay/overlay.cpp
+// interactive_visible), so the pointer shows and works the panel, and the game gets no mouse or keyboard. Set by
+// the render thread while the panel is open and worked from the keyboard or the mouse.
+std::atomic<bool>& panel_pointer() noexcept;
+// Any thread: the panel has the pointer and was drawn within the last second (a panel no longer drawn, the overlay
+// off, never keeps the pointer from the game).
+bool panel_has_pointer() noexcept;
 bool panel_requested() noexcept;
 // The render thread says when the panel last drew (GetTickCount64), so a panel that stopped being
 // drawn (the overlay off) does not hold the game's input.
@@ -195,4 +225,31 @@ struct RenderReport {
 };
 void report(const RenderReport& report) noexcept;
 RenderReport render_report() noexcept;
+
+// ---- The white of the game's picture under its UI (lens::measure_white) ----------------------
+// The render thread measures it while the pass draws under the game's UI and says what it uses.
+// `replayplus white` asks for the next measurement's details, or fixes the white (`white_fixed`: 0
+// is measured). Any thread.
+void ask_white() noexcept;
+bool take_white() noexcept;
+// `curve`: SDR, the game's display mapping applied and undone, `used` the scale it takes the picture at; else
+// `used` is the picture's white (linear). `measured`: what the measurements say (0: none yet).
+void note_white(float used, float measured, bool curve) noexcept;
+void note_white_detail(std::string detail) noexcept;
+float scene_white() noexcept;          // in use under the UI (1 until the first measurement)
+float scene_white_measured() noexcept; // 0 until the first
+bool scene_white_curve() noexcept;
+std::string white_detail() noexcept; // the last details asked for
+std::atomic<float>& white_fixed() noexcept;
+// `replayplus white dump <name>`: the next measurement's blocks go to a CSV file (research).
+void ask_white_dump(std::string path) noexcept;
+std::string take_white_dump() noexcept;
+// The camera light's facing: smoothed over so many metres of the surface (0: each triangle's own), and how much it
+// counts (1 fully, 0 not at all). `replayplus lightfacing` sets them (to compare and tune). Any thread.
+// The facing is not taken into the light as it comes (replay_plus.hlsl camera_light): smoothed over 25 cm and
+// counting 80% (tried on a close-up of a skater's shorts at night, 2026-11-18) a leg still showed its triangles
+// and the textures went flat. `replayplus lightfacing smooth` brings that back to compare.
+inline constexpr float light_facing_metres_default = 0.25f, light_facing_weight_default = 0.0f;
+std::atomic<float>& light_facing_metres() noexcept;
+std::atomic<float>& light_facing_weight() noexcept;
 } // namespace dingosdk::replay_plus::link

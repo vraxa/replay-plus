@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 // The lens and the picture's finishing, with no game and no GPU: the same maths the shader runs
@@ -210,4 +211,77 @@ bool changes(const Finish& finish) noexcept;
 // Finishes `picture` in place, on up to `threads` threads (the scratch copy is `scratch`, kept by the
 // caller between frames). Never throws.
 void finish(const Finish& finish, Picture picture, std::vector<std::uint8_t>& scratch, unsigned threads) noexcept;
+
+// ---- The white of the game's picture under its UI ---------------------------------------------
+// In the replay editor the pass draws into the game's picture before its UI, and the game's last pass
+// shows that picture through its own display mapping: its white is not 1 (in SDR it was about 2.16 on
+// 2026-11-18, so the camera curve's white showed at 181 of 255 and the picture's bright half went flat
+// and grey, while exports, finished from the game's 8-bit frame, were right). The renderer copies a few
+// rows of the screen and of the picture it put in for that same frame; these read them: the picture's
+// value the screen shows as its white (SDR's 1, HDR's paper white). Formats are DXGI_FORMAT's numbers:
+// R16G16B16A16_FLOAT 10, R10G10B10A2_UNORM 24, R11G11B10_FLOAT 26, R8G8B8A8_UNORM(_SRGB) 28 and 29,
+// B8G8R8A8_UNORM(_SRGB) 87 and 91.
+bool white_format(std::uint32_t format) noexcept;
+std::uint32_t white_texel_bytes(std::uint32_t format) noexcept;
+// One texel's red, green and blue as stored (no transfer undone).
+std::array<float, 3> white_texel(std::uint32_t format, const std::uint8_t* texel) noexcept;
+// One strip: rows of the screen, and the rows of the picture the game's last pass made them from (the
+// picture at its own size, the same shape). `picture_from` / `picture_to`: where the screen's rows fall
+// among the picture's copied rows.
+struct WhiteStrip {
+    const std::uint8_t* screen{};
+    std::uint32_t screen_format{}, screen_pitch{}, screen_width{}, screen_rows{};
+    const std::uint8_t* picture{};
+    std::uint32_t picture_format{}, picture_pitch{}, picture_width{}, picture_rows{};
+    double picture_from{}, picture_to{};
+};
+struct WhiteMeasure {
+    bool ok{};           // enough even blocks, and they agree
+    float white{};       // the picture's value the screen shows as its white
+    float spread{};      // the middle half of the blocks' ratios, as a share of `white`
+    std::size_t blocks{}, used{};
+    std::string detail;  // how the ratio goes with the level and by channel, and where the screen reaches white
+};
+// One block's means: the picture's red, green and blue, the screen's (linear, 1 its white), and whether it is even.
+using WhitePair = std::array<float, 7>;
+// The screen's transfer: 0 SDR (sRGB), 1 scRGB (80-nit units), 2 HDR10 (PQ); `white_nits` its paper white in HDR.
+// `pairs`, when given, gets every block (for `replayplus white dump`).
+WhiteMeasure measure_white(std::span<const WhiteStrip> strips, int transfer, float white_nits, std::vector<WhitePair>* pairs = nullptr);
+// The game's display mapping in SDR: its last pass shows the picture before its UI through a filmic curve, on
+// each channel on its own (a curve on brightness alone missed the screen by 2.5% on saturated colours, per
+// channel by 0.4%). Measured 2026-11-18 with `replayplus white dump` (build 25414733 as it comes: display mapping
+// version 5, SDR peak 200 nits, world brightness 0): in t = log2(d / (1 - d)) over x = log2(p), a line of slope
+// s1 in the toe bending to s2 in the shoulder about x0, w wide,
+//     t(x) = t0 + s1 x + (s2 - s1) w log2(1 + 2^((x - x0) / w)),
+// half of 1722 measurements within 0.6% of it and nine in ten within 1.5%, from p 0.03 to 17 (d 0.005 to 0.94).
+// `scale`: what the picture is multiplied by before the curve (1 as the game comes; measured while drawing, in
+// case a setting of the game's changes it). replay_plus.hlsl's dm_decode / dm_encode are the same maths.
+struct DisplayMapping {
+    float t0{9.50878f}, s1{2.87576f}, s2{0.98509f}, x0{-5.10907f}, w{1.14271f};
+    float scale{1.0f};
+};
+// The screen's linear light (1 its white) the game shows a picture value as, and the picture value it shows a
+// screen's linear light from (d up to 0.99995, the picture's then about 26000).
+float display_mapped(const DisplayMapping& mapping, float picture) noexcept;
+float display_unmapped(const DisplayMapping& mapping, float shown) noexcept;
+// The scale the picture goes into the curve at, from rows as measure_white reads them (an SDR screen): on even,
+// near-grey blocks, each channel's picture value against the one the curve says the screen shows; ok when enough
+// agree. `detail` says how closely the curve follows the screen, by level.
+struct ScaleMeasure {
+    bool ok{};
+    float scale{};
+    float spread{}; // the middle half of the pairs' scales, as a share of `scale`
+    std::size_t blocks{}, used{};
+    std::string detail;
+};
+ScaleMeasure measure_scale(std::span<const WhiteStrip> strips, const DisplayMapping& mapping);
+// The white in use, from measurements in turn: the median of the last few, so one odd measurement (the
+// game's UI over much of the picture for a moment) does not move it.
+struct WhiteTrack {
+    std::array<float, 5> last{};
+    std::size_t count{};
+    float white{}; // 0 until the first
+    // Adds one; true when the white in use moved (by more than 1%).
+    bool add(float measured) noexcept;
+};
 } // namespace dingosdk::replay_plus::lens

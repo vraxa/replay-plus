@@ -49,6 +49,7 @@ struct Scene {
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
     std::uint64_t serial{};    // changes when they are made anew
     bool fresh{};              // copied in the frame just recorded
+    bool swapped{};            // and `output` went in for it: that frame's screen shows `output` through the game's last pass
 };
 Scene scene() noexcept;
 // Present: whether Replay Plus drew `output` this frame (it goes in for the next frame's picture).

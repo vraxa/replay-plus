@@ -16,7 +16,7 @@ cbuffer ReplayPlusPass : register(b0)
 {
     float4 P0; // lens (0 none, 2 the fisheye), fit, tan(half FOV) across, tan(half FOV) up
     float4 P1; // view aspect (the window, half-widths per half-height), window scale x, window scale y, visible half-height (q)
-    float4 P2; // screen width, height, transfer (0 SDR, 1 scRGB, 2 HDR10), white (overlay paper white, in the transfer's units)
+    float4 P2; // screen width, height, transfer (0 SDR, 1 scRGB or linear, 2 HDR10, 3 the game's SDR display mapping), white (paper white, in the transfer's units)
     float4 P3; // the circle overlay's edge (half-heights), its darkness (0 none), the picture overlay's strength (0 none), mips in the linear chain
     float4 P4; // exposure gain, contrast, saturation, faded blacks
     float4 P5; // white balance gains r, g, b, vignette
@@ -34,6 +34,8 @@ cbuffer ReplayPlusPass : register(b0)
     float4 P17; // grain size (pixels), the frame's seed, vignette power, vignette roundness
     float4 P18; // the camera curve: gamma, knee, knee slope, black level
     float4 P19; // the camera curve: white clip, colour level; unused, unused
+    float4 P20; // the game's display mapping (transfer 3): t0, its toe's slope s1, its shoulder's slope s2, the bend x0
+    float4 P21; // the bend's width w, log2 of the scale the picture is taken at; the camera light's facing smoothed over (m, 0 none), how much it counts
 };
 Texture2D source : register(t0); // ps_decode: the frame's copy; ps_down: the mip above
 Texture2D linear_chain : register(t1); // ps_main: the frame in linear light, with its mips
@@ -60,7 +62,12 @@ Interpolated vs_main(uint id : SV_VertexID)
 // The grade (the camcorder curve's undoing of the game's tone curve above all) takes 1 as white. On an
 // HDR display PQ's nits and scRGB's 80-nit units went in as they were, and drawn over the screen (when
 // the game's picture before its UI is not to be had, as while a video is filmed) the picture came out
-// one flat grey: its white written back as 1 nit (2026-11-17). Under the UI and in exports P2.w is 1.
+// one flat grey: its white written back as 1 nit (2026-11-17). In exports P2.w is 1.
+// Under the game's UI the picture is the game's own before its last pass, which shows it through its display
+// mapping, a filmic curve on each channel (replay_plus_lens.h DisplayMapping). Taken as linear light with 1 as
+// white, the camera curve's white showed at 181 of 255 and the picture's bright half went flat and grey
+// (2026-11-18). In SDR (transfer 3) that curve is applied to read the picture and undone to write it back, so
+// the grade sees what an exported frame shows; in HDR (transfer 1) P2.w is the picture's white, measured.
 float3 srgb_to_linear(float3 c)
 {
     c = max(c, 0.0);
@@ -81,12 +88,44 @@ float3 linear_to_pq(float3 nits)
     float3 y = pow(saturate(nits / 10000.0), 0.1593017578125);
     return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
 }
+// The game's display mapping (transfer 3): in t = log2(d / (1 - d)) over x = log2(p), a line of slope s1 in the
+// toe bending to s2 in the shoulder about x0, w wide; replay_plus_lens.cpp has the same (display_mapped).
+float3 dm_t(float3 x)
+{
+    float w = max(P21.x, 0.05);
+    float3 z = (x - P20.w) / w;
+    float3 soft = max(z, 0.0) + log2(1.0 + exp2(-abs(z)));
+    return P20.x + P20.y * x + (P20.z - P20.y) * w * soft;
+}
+float3 dm_slope(float3 x)
+{
+    float w = max(P21.x, 0.05);
+    return P20.y + (P20.z - P20.y) / (1.0 + exp2(-(x - P20.w) / w));
+}
+// The picture's value -> the screen's linear light (1 its white).
+float3 dm_decode(float3 p)
+{
+    float3 t = dm_t(log2(max(p, 1e-12)) + P21.y);
+    return p > 0.0 ? 1.0 / (1.0 + exp2(-t)) : 0.0;
+}
+// The screen's linear light -> the picture's value that shows it. The curve lies under both its lines: Newton
+// from the larger of their inverses starts below the root and, the curve being concave, closes in from there.
+float3 dm_encode(float3 d)
+{
+    float3 shown = clamp(d, 1e-7, 0.99995);
+    float3 t = log2(shown / (1.0 - shown));
+    float3 x = max((t - P20.x) / P20.y, (t - P20.x - (P20.y - P20.z) * P20.w) / P20.z);
+    [unroll] for (int i = 0; i < 5; ++i)
+        x -= (dm_t(x) - t) / dm_slope(x);
+    return d > 0.0 ? exp2(x - P21.y) : 0.0;
+}
 float3 decode(float3 c)
 {
     float transfer = P2.z;
     float white = max(P2.w, 1e-3);
     float3 result = srgb_to_linear(c);
-    if (transfer > 1.5) result = pq_to_linear(c) / white;
+    if (transfer > 2.5) result = dm_decode(c);
+    else if (transfer > 1.5) result = pq_to_linear(c) / white;
     else if (transfer > 0.5) result = c / white;
     return result;
 }
@@ -94,16 +133,19 @@ float3 encode(float3 x)
 {
     float transfer = P2.z;
     float3 result = linear_to_srgb(x);
-    if (transfer > 1.5) result = linear_to_pq(max(x, 0.0) * P2.w);
+    if (transfer > 2.5) result = dm_encode(max(x, 0.0));
+    else if (transfer > 1.5) result = linear_to_pq(max(x, 0.0) * P2.w);
     else if (transfer > 0.5) result = x * P2.w;
     return result;
 }
-// Perceptual 0..1, for the edge-directed interpolation: sRGB and PQ already are; scRGB goes to PQ.
+// Perceptual 0..1, for the edge-directed interpolation: sRGB and PQ already are; scRGB goes to PQ. Under the
+// display mapping the linear light is the screen's, as in SDR.
 float3 to_perceptual(float3 linear_value)
 {
     float transfer = P2.z;
     float3 result = linear_to_srgb(linear_value);
-    if (transfer > 1.5) result = linear_to_pq(max(linear_value, 0.0) * P2.w);
+    if (transfer > 2.5) result = linear_to_srgb(linear_value);
+    else if (transfer > 1.5) result = linear_to_pq(max(linear_value, 0.0) * P2.w);
     else if (transfer > 0.5) result = linear_to_pq(max(linear_value, 0.0) * 80.0 * P2.w);
     return result;
 }
@@ -112,27 +154,35 @@ float3 from_perceptual(float3 p)
     float transfer = P2.z;
     float3 result = srgb_to_linear(p);
     float white = max(P2.w, 1e-3);
-    if (transfer > 1.5) result = pq_to_linear(p) / white;
+    if (transfer > 2.5) result = srgb_to_linear(p);
+    else if (transfer > 1.5) result = pq_to_linear(p) / white;
     else if (transfer > 0.5) result = pq_to_linear(p) / (80.0 * white);
     return result;
 }
-// The hood's sRGB colour as the swap chain shows it (at paper white in HDR).
+// The hood's sRGB colour as the swap chain shows it (at paper white in HDR; through the game's display mapping
+// under its UI).
 float3 overlay_colour(float3 v)
 {
     float transfer = P2.z;
     float3 result = v;
-    if (transfer > 1.5) result = linear_to_pq(srgb_to_linear(v) * P2.w);
+    if (transfer > 2.5) result = dm_encode(srgb_to_linear(v));
+    else if (transfer > 1.5) result = linear_to_pq(srgb_to_linear(v) * P2.w);
     else if (transfer > 0.5) result = srgb_to_linear(v) * P2.w;
     return result;
 }
 
 // ---- the camera light ----------------------------------------------------------------------
 // A light at the camera, pointing where it looks, worked out from the game's depth (reversed: 1 at
-// the near plane, 0 at the far): each pixel's place in front of the camera, its surface's facing from
-// the nearer neighbour either way (so an edge does not smear it), a beam with a soft edge, and the
-// light falling off with the square of the distance, to nothing at its reach. The game's picture is
-// already lit: the light brightens what it shows by its own colour, and lifts the darkest a little
-// with their own hue, as a lamp does to a scene at night.
+// the near plane, 0 at the far): each pixel's place in front of the camera, a beam with a soft edge, and the
+// light falling off with the square of the distance, to nothing at its reach. The game's picture is already
+// lit (its own shading, smooth and with its materials' detail): the light brightens what it shows by its own
+// colour, and lifts the darkest a little with their own hue, as a lamp does to a scene at night.
+//
+// Which way each surface faces is not taken into it (P21.w 0, as it comes): in the game's depth its meshes are
+// flat triangles, and lit by their facing every triangle showed on its own ("at night it really likes to
+// highlight all the triangles on the meshes with the light on", a player, 2026-11-18); smoothed over a patch of
+// the surface (smooth_facing) a thin thing, a leg, still showed them, and the picture went flat. A light on the
+// camera lights mostly what faces it anyway. `replayplus lightfacing` brings the facing back, to compare.
 float3 view_at(float2 uv)
 {
     float d = depth.SampleLevel(point_clamp, uv, 0.0).r;
@@ -141,29 +191,107 @@ float3 view_at(float2 uv)
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     return float3(ndc * P0.zw * z, z);
 }
+// Two rings of eight points about the pixel, P21.z metres out on the surface (and half that): the facing of the
+// patch they span (Newell's method: each fan triangle's normal by its area). Each point counts as fully as it
+// lies near the plane of the pixel's own triangle (fully within about 25 degrees, nothing past 55: not round a
+// corner) and near the pixel (fully within twice the patch's reach, nothing past four times: not on something
+// nearer or further away); and the patch's facing takes over from the triangle's as fully as the points count.
+// All of it eases, nothing switches: a point that came or went at once made the facing jump from one pixel to
+// the next (patches and steps on a shirt, 2026-11-18).
+float3 smooth_facing(float2 uv, float3 p, float3 n0, float3 to_light)
+{
+    // The patch's reach on the screen at the pixel's distance (at most a quarter of the picture's height).
+    float2 reach_uv = P21.z / (2.0 * max(p.z, 0.05) * max(P0.zw, 1e-3));
+    reach_uv *= min(1.0, 0.25 / max(reach_uv.y, 1e-6));
+    float3 sum = 0.0;
+    float weight = 0.0;
+    [unroll] for (int ring = 0; ring < 2; ++ring)
+    {
+        float scale = ring == 0 ? 1.0 : 0.5;
+        float turn = ring == 0 ? 0.0 : 0.39269908;
+        float metres = P21.z * scale;
+        float3 first = 0.0, previous = 0.0;
+        float first_w = 0.0, previous_w = 0.0;
+        [unroll] for (int k = 0; k < 8; ++k)
+        {
+            float a = turn + 0.78539816 * k;
+            float3 v = view_at(uv + float2(cos(a), sin(a)) * reach_uv * scale) - p;
+            float len = max(length(v), 1e-6);
+            float w = saturate((0.82 - abs(dot(v, n0)) / len) / 0.4) * saturate((4.0 * metres - len) / (2.0 * metres));
+            if (k == 0)
+            {
+                first = v;
+                first_w = w;
+            }
+            else
+            {
+                sum += cross(previous, v) * (w * previous_w);
+                weight += w * previous_w;
+            }
+            previous = v;
+            previous_w = w;
+        }
+        sum += cross(previous, first) * (previous_w * first_w);
+        weight += previous_w * first_w;
+    }
+    float3 n = n0;
+    if (dot(sum, sum) > 1e-24)
+    {
+        float3 patch = normalize(sum);
+        if (dot(patch, to_light) < 0.0) patch = -patch;
+        n = normalize(lerp(n0, patch, saturate(weight / 8.0)));
+    }
+    return n;
+}
+// The light's strength at a place in front of the camera: its beam, its reach, the square of the distance.
+float light_at(float3 q)
+{
+    float d = max(length(q), 1e-4);
+    float beam = smoothstep(P7.z, P7.w, q.z / d);
+    float window = saturate(1.0 - pow(d / P7.y, 4.0));
+    return q.z > 0.0 ? P7.x * beam * window * window / max(d * d, 0.25) : 0.0;
+}
 float3 camera_light(float2 uv, float3 c)
 {
     float3 p = view_at(uv);
-    float dist = length(p);
-    float reach = P7.y;
-    if (dist > reach || p.z <= 0.0)
-        return c;
     float2 texel = P9.zw;
     float3 l = view_at(uv - float2(texel.x, 0.0)), r = view_at(uv + float2(texel.x, 0.0));
     float3 u = view_at(uv - float2(0.0, texel.y)), b = view_at(uv + float2(0.0, texel.y));
-    float3 dx = abs(r.z - p.z) < abs(p.z - l.z) ? r - p : p - l;
-    float3 dy = abs(b.z - p.z) < abs(p.z - u.z) ? b - p : p - u;
-    float3 n = normalize(cross(dy, dx));
-    float3 to_light = -p / dist;
-    if (dot(n, to_light) < 0.0) n = -n;
-    float facing = saturate(dot(n, to_light));
-    float beam = smoothstep(P7.z, P7.w, p.z / dist);
-    float window = saturate(1.0 - pow(dist / reach, 4.0));
-    float e = P7.x * beam * window * window * facing / max(dist * dist, 0.25);
+    // Its strength here as a tent over the pixel and its eight neighbours: the game's depth is not antialiased as its
+    // picture is, and taken per pixel the light's edge round anything nearer than what is behind it came out jagged.
+    float3 lu = view_at(uv + float2(-texel.x, -texel.y)), ru = view_at(uv + float2(texel.x, -texel.y));
+    float3 lb = view_at(uv + float2(-texel.x, texel.y)), rb = view_at(uv + float2(texel.x, texel.y));
+    float e = (4.0 * light_at(p) + 2.0 * (light_at(l) + light_at(r) + light_at(u) + light_at(b)) + light_at(lu) + light_at(ru) + light_at(lb) +
+               light_at(rb)) / 16.0;
+    if (e <= 0.0)
+        return c;
+    if (P21.w > 0.0)
+    {
+        // The surface's facing, when asked for (replayplus lightfacing): smoothed over P21.z metres of it, counting P21.w.
+        float dist = max(length(p), 1e-4);
+        float3 dx = abs(r.z - p.z) < abs(p.z - l.z) ? r - p : p - l;
+        float3 dy = abs(b.z - p.z) < abs(p.z - u.z) ? b - p : p - u;
+        float3 n = normalize(cross(dy, dx));
+        float3 to_light = -p / dist;
+        if (dot(n, to_light) < 0.0) n = -n;
+        if (P21.z > 0.0)
+            n = smooth_facing(uv, p, n, to_light);
+        e *= lerp(1.0, saturate(dot(n, to_light)), saturate(P21.w));
+    }
     float y = dot(c, float3(0.2126, 0.7152, 0.0722));
-    float3 hue = c / max(y, 1e-3);
-    hue = min(hue, 2.0);
-    return c * (1.0 + 4.0 * e * P8.rgb) + 0.02 * e * P8.rgb * hue;
+    float3 hue = min(c / max(y, 1e-3), 2.0);
+    // More light on the same surfaces: the picture brightened by it, so its textures keep their contrast. Only what is
+    // very bright already (above 0.5: a lamp, a light dropped in with the object dropper, its glow, a lit sign) takes
+    // less of it, or the light flared other lights ("the camera light also affects lights placed with the object
+    // dropper", 2026-11-18; a cap at 0.25 for everything washed the textures out). And the lift for what is black in
+    // the picture, its own hue at most 0.05, so close up it does not grey the darks.
+    float keep = 1.0 / (1.0 + 4.0 * max(y - 0.5, 0.0));
+    float3 added = c * 4.0 * e * P8.rgb * keep + min(0.02 * e, 0.05) * P8.rgb * hue;
+    // And it rolls off into white as film does instead of clipping: what it adds fills at most the room left below
+    // white, nearing it smoothly. Close up, a calf lit past white clipped in blocks wherever its skin's texture
+    // crossed the clip (2026-11-18).
+    float3 room = max(1.0 - c, 0.0);
+    return c + room * (1.0 - exp(-added / max(room, 1e-4)));
 }
 
 // ---- pass 1: the frame in linear light ------------------------------------------------------

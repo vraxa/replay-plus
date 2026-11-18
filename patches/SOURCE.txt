@@ -4,9 +4,10 @@ How this ReSkate.dll is built (GPL-3.0: the source of what you were given)
 2. git checkout dcbb767f7c8bc9e66be888b82076810c7295a6b6   (Animator Studio 2.1.5 on ReSkate 20261116)
 3. git am --3way replay-shake.patch
 4. git am --3way replay-plus.patch
+   git am --3way replay-plus-1.2.patch
 5. With Visual Studio 2022's C++ build tools (v143):
    cmake --preset vs2022-x64 -DDINGOSDK_VERSION=20261116 -DDINGOSDK_MOD_ID=AnimatorStudio_ReplayPlus
-         "-DDINGOSDK_MOD_NAME=Animator Studio 2.1.5 + Replay Plus" -DDINGOSDK_MOD_VERSION=1.1+studio-2.1.5.reskate-20261116
+         "-DDINGOSDK_MOD_NAME=Animator Studio 2.1.5 + Replay Plus" -DDINGOSDK_MOD_VERSION=1.2+studio-2.1.5.reskate-20261116
          -DDINGOSDK_CRASH_REPORT_URL= -DDINGOSDK_CARGO=OFF
    cmake --build --preset release
    The DLL is build\vs2022-x64\Release\ReSkate.dll.

@@ -4,6 +4,7 @@
 #include "replay_plus_link.h"
 #include "replay_plus_settings.h"
 #include "replay_plus_window.h"
+#include "Extension/ReplayKeyframes/replay_keyframes.h"
 #include "Extension/ReplayShake/game_view_hook.h"
 #include "Extension/ReplayShake/replay_shake.h"
 #include "Extension/ReplayShake/replay_shake_export.h"
@@ -20,8 +21,10 @@
 #include "Engine/Game/Build/20260929/named_settings.h"
 #include "Engine/Game/Build/20260929/replay_activity.h"
 #include "Engine/Game/Build/20260929/replay_export.h"
+#include "Engine/Game/Build/20260929/replay_keyframes.h"
 #include <Windows.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <dxgi1_4.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -97,6 +100,17 @@ bool write_text(const fs::path& file, const std::string& text) {
 }
 std::string number_text(float value) { return std::format("{}", value); }
 
+// One of the game's own camera keyframes (Engine/Game/Build/20260929/replay_keyframes.h: a framing key's node), as
+// Keep keys keeps it between visits to the replay editor: its session, its time on the replay's clock and its value,
+// byte for byte (0x120 bytes of numbers: the camera's transform, where the target was, the editor's settings).
+constexpr std::size_t camera_key_bytes = 0x120;
+struct CameraKey {
+    std::int32_t session{};
+    double time{};
+    std::array<std::uint8_t, camera_key_bytes> value{};
+    bool operator==(const CameraKey&) const = default;
+};
+
 // A setting of the game's held while Replay Plus wants it, then given back.
 struct Held {
     std::string wanted;
@@ -152,6 +166,7 @@ struct State {
         std::uint64_t checked_at{}, changed_at{}, raise_since{};
         double bytes_per_pixel{600}; // what a pixel of the game's render targets takes (learnt from each change)
         bool learning{};
+        bool lowered{};              // lowered for the memory in this visit to the editor: not raised again until the next
         std::uint64_t usage_before{};
         double pixels_before{};
         std::uint32_t screen_width{}, screen_height{}; // the screen it was asked for
@@ -165,6 +180,7 @@ struct State {
     bool combo_down{}, combo_consumed{}, combo_armed{};
     bool timeline_ok{};
     double timeline_start{}, timeline_length{};
+    std::vector<link::Chunk> chunks; // the replay's footage, as the game strings it (replay_chunks)
     bool input_held{};
     bool pad_held{}; // the panel was open on a pad: its buttons were kept from the game
     std::uint64_t release_wait_until{};
@@ -190,6 +206,28 @@ struct State {
     double playhead_shown{-1}; // as the panel was last given it
     std::atomic<bool> views_wanted{};
     std::array<std::atomic<float>, 24> probe_floats{};
+    // The picture's camera as the replay left it (view_built), its world transform (rows right, up, back,
+    // position), and when it was seen (GetTickCount64).
+    std::array<std::atomic<float>, 16> camera{};
+    std::atomic<std::uint64_t> camera_at{};
+    // The game's keyframe functions are the ones known (this game build): Keep keys can put its camera keyframes
+    // back, and the skater's autofocus can read where the replay has the skater.
+    bool keyframes_checked{}, keyframes_ok{};
+    // Keep keys: the game's camera keyframes as last seen in the replay editor (this run of the game), when they were
+    // first seen gone (they count as deleted once gone a while with the editor still open), and this visit's putting
+    // back: done (or nothing to do), and not before when.
+    std::vector<CameraKey> camera_keys;
+    std::uint64_t camera_keys_gone_at{};
+    bool camera_keys_done{};
+    std::uint64_t camera_keys_from{};
+    // The skater's autofocus: how far away the skater is along the camera (metres), and when that was worked out.
+    float skater_depth{};
+    std::uint64_t skater_at{};
+    // Exported videos to the player's folder: an export running (Replay Shake counts its frames), and since when on
+    // the files' clock (the video it writes is newer).
+    bool exporting_seen{};
+    fs::file_time_type export_began{};
+    std::atomic<bool> picking_folder{};
     // Exports.
     std::atomic<bool> export_on{};
     std::vector<std::uint8_t> export_scratch;
@@ -199,6 +237,8 @@ struct State {
 #if defined(REPLAY_PLUS_TEST_INBOX)
     std::uint64_t inbox_at{}, inbox_wait_until{};
     std::vector<std::string> inbox;
+    std::atomic<std::uint64_t> skater_probe_until{};
+    std::uint64_t skater_probe_next{};
 #endif
 };
 State& state() {
@@ -228,6 +268,459 @@ void say(State& s, std::string text) {
     s.reply = std::move(text);
     ++s.reply_serial;
     ++s.revision;
+}
+void say_toast(State& s, std::string text, bool log); // (below; its default comes with its declaration further on)
+
+// ---- The game's camera keyframes, and where the replay has the skater ----------------------------
+// The keyframe manager (replay_keyframes.h manager) keeps the replay editor's sessions (an EASTL map by id), each with
+// its framing keys (a map by time). Every frame it also keeps, for the replay's camera, where the replay has the
+// skater: the body, the upper body and the board, vec4s from +0x90 (read 2026-11-18 on build 25414733: the editor's
+// Target: Body and the keyframes it makes take theirs from there). Not the skater standing where play stopped: the
+// replay draws one of its own.
+namespace kf = game::build::v20260929::replay_keyframes;
+constexpr std::uintptr_t manager_skater_body = 0x90;
+constexpr std::size_t session_framing_keys = 0x60; // a session's node: the anchor of its framing keys' map
+constexpr std::size_t map_size_after_anchor = 0x20;
+// The game's own add of a framing key (Skate.exe 0x6065b0): at a time on the replay's clock (a double; snapped to its frames and
+// kept within the replay), with a camera (0 orbit, 1 free), a target (0 the body) and the editor's numbers, filled in
+// from the replay as it is now; false when the session has a key at that time already. It makes the key's node (0x150
+// bytes, the value at +0x30) and puts it in the map. Then the session's segments are rebuilt (kf::session_rebuild).
+using AddFramingKey = bool (*)(void* manager, int session, double time, int camera, int target, float fov, float tilt, float roll,
+                               float x_offset, float y_offset, float speed);
+using RebuildSession = void (*)(void* manager, int session);
+constexpr game::build::Fingerprint add_framing_key{0x6065b0, {
+    0x48,0x89,0x5c,0x24,0x18,0x48,0x89,0x74,0x24,0x20,0x89,0x54,0x24,0x10,0x57,0x48,
+    0x83,0xec,0x70,0x48,0x8b,0x41,0x20,0x48,0x8b,0xf9,0x48,0x83,0xc1,0x10,0x41,0x8b}};
+// The value's filler it calls (0x6087f0), which takes the target from the manager's +0x90, +0xa0 or +0xb0.
+constexpr game::build::Fingerprint fill_framing_key{0x6087f0, {
+    0xc5,0xfa,0x11,0x5c,0x24,0x20,0x48,0x81,0xec,0x18,0x01,0x00,0x00,0x4c,0x8b,0xd1,
+    0x45,0x8b,0xc8,0x45,0x85,0xc0,0x74,0x2d,0x41,0x83,0xe9,0x01,0x74,0x1d,0x41,0x83}};
+// Where the add puts a key asked for at a time (Skate.exe 0x624d20, which the add calls): snapped to the replay's frames
+// and kept within the part of the replay the editor shows (its trim). Right after the editor opens, that part is
+// still empty: every time lands on its first frame.
+using KeyTime = double (*)(void* manager, double time);
+constexpr game::build::Fingerprint key_time{0x624d20, {
+    0x40,0x53,0x48,0x83,0xec,0x60,0xc5,0xf8,0x28,0xd1,0xc5,0xfb,0x10,0x89,0xd0,0x00,
+    0x00,0x00,0xc5,0xf3,0x59,0x05,0x46,0xdf,0xa4,0x05,0xc5,0xf8,0x29,0x74,0x24,0x50}};
+// In a key's value: the time it keeps of itself (double), its camera (int), field of view and playback speed.
+constexpr std::size_t value_time = 0xf8, value_camera = 0x108, value_fov = 0x104, value_speed = 0x114;
+
+std::uintptr_t peek_pointer(std::uintptr_t address) {
+    std::uintptr_t value{};
+    return memory::peek(address, value) ? value : 0;
+}
+// The next node of an EASTL map (right at +0, left at +8, parent at +16), as the game steps through one.
+std::uintptr_t map_next(std::uintptr_t node) {
+    if (const auto right = peek_pointer(node)) {
+        node = right;
+        for (int guard = 0; guard < 64; ++guard) {
+            const auto left = peek_pointer(node + 8);
+            if (!left) break;
+            node = left;
+        }
+        return node;
+    }
+    auto parent = peek_pointer(node + 16);
+    for (int guard = 0; parent && node == peek_pointer(parent) && guard < 64; ++guard) {
+        node = parent;
+        parent = peek_pointer(parent + 16);
+    }
+    if (peek_pointer(node) != parent) node = parent;
+    return node;
+}
+bool code_matches(std::uintptr_t base, const game::build::Fingerprint& f) noexcept {
+    std::array<unsigned char, 32> bytes{};
+    return memory::peek_bytes(base + f.rva, bytes.data(), bytes.size()) && bytes == f.bytes;
+}
+bool keyframes_known(State& s) {
+    if (!s.keyframes_checked) {
+        s.keyframes_checked = true;
+        // (The rebuild is ReSkate's own keyframe smoothing's to hook, which checked it first: its first bytes are then a jump.)
+        s.keyframes_ok = code_matches(s.base, add_framing_key) && code_matches(s.base, fill_framing_key) && code_matches(s.base, key_time) &&
+                         (replay_keyframes::available() || code_matches(s.base, kf::session_rebuild));
+        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus: {}.",
+                     s.keyframes_ok ? "the game's camera keyframes can be kept between visits to the replay editor, and the skater found for the autofocus"
+                                    : "the game's keyframe functions are not the ones known on this game build: Keep keys keeps only Replay Plus's own "
+                                      "keys, and the skater's autofocus focuses on the middle instead");
+    }
+    return s.keyframes_ok;
+}
+std::uintptr_t keyframe_manager(State& s) { return keyframes_known(s) ? peek_pointer(s.base + kf::manager) : 0; }
+// Every framing key of every session, as the manager has them now. False when it has no session (the editor is not
+// up, or closing) or the walk went wrong.
+bool read_camera_keys(std::uintptr_t manager, std::vector<CameraKey>& out) {
+    out.clear();
+    const auto anchor = manager + kf::manager_sessions;
+    std::uint64_t sessions{};
+    if (!memory::peek(anchor + map_size_after_anchor, sessions) || !sessions || sessions > 64) return false;
+    int n = 0;
+    for (auto node = peek_pointer(anchor + 8); node && node != anchor && n < 64; node = map_next(node), ++n) {
+        CameraKey key;
+        if (!memory::peek(node + 0x20, key.session)) return false;
+        const auto keys = node + session_framing_keys;
+        int k = 0;
+        for (auto at = peek_pointer(keys + 8); at && at != keys && k < 512; at = map_next(at), ++k) {
+            if (!memory::peek(at + kf::framing_key_time, key.time) || !std::isfinite(key.time) ||
+                !memory::peek_bytes(at + kf::framing_key_value, key.value.data(), key.value.size()))
+                return false;
+            out.push_back(key);
+        }
+        if (k >= 512) return false;
+    }
+    return n < 64;
+}
+// The node of a session's framing key nearest a time (within a frame or so), or 0.
+std::uintptr_t camera_key_node(std::uintptr_t manager, std::int32_t session, double time) {
+    const auto anchor = manager + kf::manager_sessions;
+    int n = 0;
+    for (auto node = peek_pointer(anchor + 8); node && node != anchor && n < 64; node = map_next(node), ++n) {
+        std::int32_t id{};
+        if (!memory::peek(node + 0x20, id) || id != session) continue;
+        const auto keys = node + session_framing_keys;
+        std::uintptr_t best{};
+        double gap = 1.0 / 40.0;
+        int k = 0;
+        for (auto at = peek_pointer(keys + 8); at && at != keys && k < 512; at = map_next(at), ++k) {
+            double at_time{};
+            if (memory::peek(at + kf::framing_key_time, at_time) && std::abs(at_time - time) < gap) {
+                gap = std::abs(at_time - time);
+                best = at;
+            }
+        }
+        return best;
+    }
+    return 0;
+}
+// The replay's clock from its first frame to its last: the footage the replay editor has now (the replay activity's
+// client, its replay at +0x568: +0x70 and +0x78, as the game's add of a key keeps a key's time within them).
+bool replay_span(State& s, double& from, double& to) {
+    const auto client = peek_pointer(s.base + addr::replay_activity::client);
+    const auto replay = client ? peek_pointer(client + addr::replay_activity::manager) : 0;
+    return replay && memory::peek(replay + 0x70, from) && memory::peek(replay + 0x78, to) && std::isfinite(from) && std::isfinite(to) && to > from;
+}
+// The replay's chunks (its replay at +0xa0..+0xa8: 0x18 bytes each, the clock from and to as doubles, then the
+// timeline's share from and to as floats), as the game maps the timeline to the clock (Skate.exe 0x610090).
+void read_chunks(State& s) {
+    std::vector<link::Chunk> chunks;
+    const auto client = peek_pointer(s.base + addr::replay_activity::client);
+    const auto replay = client ? peek_pointer(client + addr::replay_activity::manager) : 0;
+    const auto first = replay ? peek_pointer(replay + 0xa0) : 0, last = replay ? peek_pointer(replay + 0xa8) : 0;
+    if (first && last > first && (last - first) % 0x18 == 0 && (last - first) / 0x18 <= 256) {
+        for (auto at = first; at < last; at += 0x18) {
+            link::Chunk c;
+            if (!memory::peek(at, c.clock_from) || !memory::peek(at + 8, c.clock_to) || !memory::peek(at + 0x10, c.from) ||
+                !memory::peek(at + 0x14, c.to) || !std::isfinite(c.clock_from) || !std::isfinite(c.clock_to) || !std::isfinite(c.from) ||
+                !std::isfinite(c.to) || c.clock_to < c.clock_from || c.to < c.from) {
+                chunks.clear();
+                break;
+            }
+            chunks.push_back(c);
+        }
+    }
+    if (chunks != s.chunks) {
+        s.chunks = std::move(chunks);
+        ++s.revision;
+    }
+}
+// Where a time on the replay's clock is on the editor's timeline, in seconds from its start (as the editor shows it).
+double timeline_seconds(const State& s, double clock) {
+    if (!s.timeline_ok) return clock;
+    const float share = link::timeline_share(s.chunks, s.timeline_start, s.timeline_length, clock);
+    return share >= 0 ? share * s.timeline_length : clock - s.timeline_start;
+}
+bool poke_bytes(std::uintptr_t address, const void* source, std::size_t size) noexcept {
+    if (!source || !size || address < 0x10000 || address > memory::highest_user_address - size) return false;
+    __try {
+        std::memcpy(reinterpret_cast<void*>(address), source, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool call_add(std::uintptr_t function, std::uintptr_t manager, std::int32_t session, double time, std::int32_t camera, float fov, float speed) noexcept {
+    __try {
+        (void)reinterpret_cast<AddFramingKey>(function)(reinterpret_cast<void*>(manager), session, time, camera, 0, fov, 0, 0, 0, 0, speed);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool call_key_time(std::uintptr_t function, std::uintptr_t manager, double time, double& out) noexcept {
+    __try {
+        out = reinterpret_cast<KeyTime>(function)(reinterpret_cast<void*>(manager), time);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool call_rebuild(std::uintptr_t function, std::uintptr_t manager, std::int32_t session) noexcept {
+    __try {
+        reinterpret_cast<RebuildSession>(function)(reinterpret_cast<void*>(manager), session);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// Keep keys: the camera keyframes of the last visit put back where they were (game thread, in the replay editor,
+// its sessions still without keys). Each is made by the game's own add (its node, its place in the map), then given
+// its kept value byte for byte: the camera, the target as it was, the editor's settings. Only those on footage the
+// replay still has (its clock keeps a moment's time while that moment is in the replay), within what the editor
+// shows. False while the editor's range is not up yet (try again in a moment).
+bool put_back_camera_keys(State& s, std::uintptr_t manager) {
+    double from{}, to{}, first{}, last{};
+    const auto at = s.base + key_time.rva;
+    if (!replay_span(s, from, to) || !call_key_time(at, manager, -1.0e7, first) || !call_key_time(at, manager, 1.0e7, last) ||
+        !std::isfinite(first) || !std::isfinite(last) || last - first < 0.25)
+        return false;
+    from = std::max(from, first);
+    to = std::min(to, last);
+    const auto add = s.base + add_framing_key.rva, rebuild = s.base + kf::session_rebuild.rva;
+    std::set<std::int32_t> sessions;
+    std::size_t put{}, gone{}, failed{};
+    for (const auto& key : s.camera_keys) {
+        double lands{};
+        if (key.time < from - 1e-3 || key.time > to + 1e-3 || !call_key_time(at, manager, key.time, lands) ||
+            std::abs(lands - key.time) > 1.0 / 40.0) {
+            ++gone;
+            continue;
+        }
+        std::int32_t camera{};
+        float fov{}, speed{};
+        std::memcpy(&camera, key.value.data() + value_camera, sizeof(camera));
+        std::memcpy(&fov, key.value.data() + value_fov, sizeof(fov));
+        std::memcpy(&speed, key.value.data() + value_speed, sizeof(speed));
+        if (camera < 0 || camera > 16) camera = 0;
+        if (!std::isfinite(fov) || fov < 1 || fov > 179) fov = 65;
+        if (!std::isfinite(speed) || speed <= 0 || speed > 100) speed = 1;
+        const auto node = call_add(add, manager, key.session, key.time, camera, fov, speed)
+                              ? camera_key_node(manager, key.session, key.time)
+                              : 0;
+        double node_time{};
+        auto value = key.value;
+        if (!node || !memory::peek(node + kf::framing_key_time, node_time)) {
+            ++failed;
+            continue;
+        }
+        std::memcpy(value.data() + value_time, &node_time, sizeof(node_time));
+        if (!poke_bytes(node + kf::framing_key_value, value.data(), value.size())) {
+            ++failed;
+            continue;
+        }
+        sessions.insert(key.session);
+        ++put;
+    }
+    for (const auto session : sessions) (void)call_rebuild(rebuild, manager, session);
+    logging::log(logging::Level::info, logging::Channel::graphics,
+                 "Replay Plus: Keep keys put back {} camera keyframe(s) of {} ({} on footage no longer in the replay or outside its trim, {} not made); the "
+                 "editor shows {:.3f} to {:.3f}.",
+                 put, s.camera_keys.size(), gone, failed, from, to);
+    if (put)
+        say_toast(s, std::format("Put back {} camera keyframe{} from last time.", put, put == 1 ? "" : "s"), false);
+    else if (gone)
+        say_toast(s, "Last time's camera keyframes were on footage that is no longer in the replay.", false);
+    return true;
+}
+// Keep keys, every tick: in the replay editor, the camera keyframes of the last visit put back once its session is up
+// and still empty, then followed as they change (kept when the editor closes: its sessions go with it).
+void keep_camera_keys(State& s) {
+    if (!s.in_replay || !s.settings.keep_keys) return;
+    const auto manager = keyframe_manager(s);
+    if (!manager) return;
+    const auto now = GetTickCount64();
+    std::vector<CameraKey> keys;
+    const bool up = read_camera_keys(manager, keys);
+    if (!s.camera_keys_done) {
+        // Once the editor has its session and its range (Advanced Edit sets it up: the keys come back as it opens),
+        // into a session with no keys of its own; tried a few times a second meanwhile.
+        if (!up || !s.timeline_ok || now < s.camera_keys_from) return;
+        s.camera_keys_from = now + 250;
+        if (!keys.empty() || s.camera_keys.empty() || put_back_camera_keys(s, manager)) s.camera_keys_done = true;
+        return;
+    }
+    if (!up) return; // closing: what was last seen is kept
+    if (!keys.empty()) {
+        s.camera_keys = std::move(keys);
+        s.camera_keys_gone_at = 0;
+    } else if (!s.camera_keys.empty()) {
+        // All gone with the editor still up (Delete All Keyframes): gone for good once it stays so a while.
+        if (!s.camera_keys_gone_at) s.camera_keys_gone_at = now;
+        else if (now - s.camera_keys_gone_at > 1500) {
+            s.camera_keys.clear();
+            s.camera_keys_gone_at = 0;
+        }
+    }
+}
+// How far in front of the picture's camera the replay has the skater's body (metres along its view); false when not
+// known (an unknown game build, no camera seen lately, a place that makes no sense).
+bool skater_depth(State& s, float& depth) {
+    const auto manager = keyframe_manager(s);
+    std::array<float, 4> body{};
+    if (!manager || !memory::peek(manager + manager_skater_body, body)) return false;
+    const auto seen = s.camera_at.load(std::memory_order_acquire);
+    if (!seen || GetTickCount64() - seen > 1000) return false;
+    std::array<float, 16> c{};
+    for (std::size_t i = 0; i < c.size(); ++i) c[i] = s.camera[i].load(std::memory_order_relaxed);
+    const float dx = body[0] - c[12], dy = body[1] - c[13], dz = body[2] - c[14];
+    const float apart = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (!std::isfinite(apart) || apart > 500 || (body[0] == 0 && body[1] == 0 && body[2] == 0)) return false;
+    depth = -(dx * c[8] + dy * c[9] + dz * c[10]);
+    return std::isfinite(depth) && depth > 0.1f;
+}
+
+// ---- Exported videos to a folder of the player's own -------------------------------------------
+// The game writes its videos (MP4) to its own Videos folder, under the local app data it is given (ReSkate's, else
+// Windows'). Once an export is done and the game has let the file go, it is moved to the folder the player chose (on a
+// thread of its own: to another drive it is a copy).
+std::vector<fs::path> game_video_folders() {
+    std::vector<fs::path> folders;
+    const auto local = local_app_data();
+    if (local.empty()) return folders;
+    folders.push_back(local / L"ReSkate" / L"Game" / L"Skate" / L"data" / L"Videos");
+    folders.push_back(local / L"Skate" / L"data" / L"Videos");
+    return folders;
+}
+fs::path game_video_folder() {
+    std::error_code error;
+    for (const auto& folder : game_video_folders())
+        if (fs::is_directory(folder, error)) return folder;
+    const auto folders = game_video_folders();
+    return folders.empty() ? fs::path() : folders.front();
+}
+fs::path video_folder(const Settings& v) { return v.video_folder.empty() ? game_video_folder() : utf8_path(v.video_folder); }
+// A name in the folder not taken yet: "name.mp4", else "name (2).mp4", ...
+fs::path free_name(const fs::path& folder, const fs::path& name) {
+    std::error_code error;
+    auto target = folder / name;
+    for (int n = 2; fs::exists(target, error) && n < 1000; ++n)
+        target = folder / (name.stem().wstring() + std::format(L" ({})", n) + name.extension().wstring());
+    return target;
+}
+void move_videos(State& s, fs::path to, fs::file_time_type since) {
+    std::thread([&s, to = std::move(to), since] {
+        std::set<fs::path> moved;
+        const auto deadline = GetTickCount64() + 120000;
+        std::error_code error;
+        fs::create_directories(to, error);
+        while (GetTickCount64() < deadline) {
+            bool waiting = false;
+            for (const auto& folder : game_video_folders()) {
+                if (!fs::is_directory(folder, error)) continue;
+                for (const auto& item : fs::directory_iterator(folder, error)) {
+                    if (!item.is_regular_file(error)) continue;
+                    auto extension = item.path().extension().wstring();
+                    std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+                    if (extension != L".mp4" || moved.contains(item.path()) || fs::last_write_time(item.path(), error) < since) continue;
+                    // Still the game's while it cannot be opened alone (it is writing or finishing it).
+                    const HANDLE file = CreateFileW(item.path().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (file == INVALID_HANDLE_VALUE) {
+                        waiting = true;
+                        continue;
+                    }
+                    CloseHandle(file);
+                    const auto target = free_name(to, item.path().filename());
+                    moved.insert(item.path());
+                    const bool ok = MoveFileExW(item.path().c_str(), target.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH) != FALSE;
+                    const auto why = ok ? DWORD{} : GetLastError();
+                    try {
+                        std::lock_guard lock(s.mutex);
+                        if (ok) {
+                            logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus: the video {} went to {}.", path_text(item.path()),
+                                         path_text(target));
+                            say_toast(s, std::format("Video saved to {}.", path_text(to)), false);
+                        } else {
+                            logging::log(logging::Level::warning, logging::Channel::graphics,
+                                         "Replay Plus: the video {} could not be moved to {} (error {}): it stays where the game put it.",
+                                         path_text(item.path()), path_text(target), why);
+                            say_toast(s, std::format("The video could not be moved to {} (error {}): it is in the game's Videos folder.",
+                                                     path_text(to), why), false);
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (!waiting && !moved.empty()) return;
+            Sleep(500);
+        }
+    }).detach();
+}
+// Every tick: an export ending sends its video to the player's folder, when one is set.
+void follow_exports(State& s) {
+    const bool exporting = replay_shake::exporting();
+    if (exporting && !s.exporting_seen) s.export_began = fs::file_time_type::clock::now() - std::chrono::seconds(5);
+    if (!exporting && s.exporting_seen && !s.settings.video_folder.empty()) move_videos(s, utf8_path(s.settings.video_folder), s.export_began);
+    s.exporting_seen = exporting;
+}
+// The Windows folder picker (its own thread, with its own message loop); the folder chosen comes back to the game
+// thread as a console line. The game's window is given the front again after.
+void pick_video_folder(State& s) {
+    if (s.picking_folder.exchange(true)) return;
+    const auto start_in = video_folder(s.settings);
+    std::thread([&s, start_in] {
+        std::string chosen;
+        if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+            {
+                Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+                if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+                    DWORD options{};
+                    (void)dialog->GetOptions(&options);
+                    (void)dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+                    (void)dialog->SetTitle(L"Replay Plus: where your videos go");
+                    (void)dialog->SetOkButtonLabel(L"Use this folder");
+                    Microsoft::WRL::ComPtr<IShellItem> folder;
+                    std::error_code error;
+                    if (!start_in.empty() && fs::is_directory(start_in, error) &&
+                        SUCCEEDED(SHCreateItemFromParsingName(start_in.c_str(), nullptr, IID_PPV_ARGS(&folder))))
+                        (void)dialog->SetFolder(folder.Get());
+                    if (SUCCEEDED(dialog->Show(nullptr))) {
+                        Microsoft::WRL::ComPtr<IShellItem> item;
+                        PWSTR path{};
+                        if (SUCCEEDED(dialog->GetResult(&item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                            chosen = path_text(fs::path(path));
+                            CoTaskMemFree(path);
+                        }
+                    }
+                }
+            }
+            CoUninitialize();
+        }
+        if (const auto window = reinterpret_cast<HWND>(link::game_window())) SetForegroundWindow(window);
+        if (!chosen.empty()) link::post("replayplus videofolder " + chosen);
+        s.picking_folder.store(false);
+    }).detach();
+}
+std::string video_folder_verb(State& s, const std::vector<std::string>& words) {
+    std::string rest;
+    for (std::size_t i = 0; i < words.size(); ++i) rest += (i ? " " : "") + words[i];
+    const auto what = lower(rest);
+    if (what.empty()) {
+        return s.settings.video_folder.empty() ? std::format("Videos stay where the game puts them: {}.", path_text(game_video_folder()))
+                                               : std::format("Videos go to {} once each is exported.", s.settings.video_folder);
+    }
+    if (what == "pick" || what == "choose") {
+        pick_video_folder(s);
+        return "The folder picker is open (over the game).";
+    }
+    if (what == "open") {
+        const auto folder = video_folder(s.settings);
+        std::error_code error;
+        fs::create_directories(folder, error);
+        ShellExecuteW(nullptr, L"explore", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return std::format("{} opens in File Explorer.", path_text(folder));
+    }
+    if (what == "default" || what == "game" || what == "reset") {
+        if (s.settings.video_folder.empty()) return "Videos already stay where the game puts them.";
+        s.settings.video_folder.clear();
+        changed(s);
+        return std::format("Videos stay where the game puts them again: {}.", path_text(game_video_folder()));
+    }
+    auto folder = utf8_path(rest);
+    std::error_code error;
+    if (folder.is_relative()) return "That is not a whole path (it needs a drive, like D:\\Videos).";
+    fs::create_directories(folder, error);
+    if (!fs::is_directory(folder, error)) return std::format("{} is not a folder that can be made or used.", rest);
+    folder = fs::weakly_canonical(folder, error);
+    s.settings.video_folder = path_text(folder);
+    changed(s);
+    return std::format("Videos go to {} from now on (each once it is exported).", s.settings.video_folder);
 }
 
 // ---- Folders, presets and overlays -------------------------------------------------------
@@ -624,6 +1117,7 @@ void keep_memory_guard(State& s) {
             m.changed_at = m.raise_since = 0;
             ++s.revision;
         }
+        m.lowered = false;
         return;
     }
     if (now - m.checked_at < 250) return;
@@ -645,6 +1139,7 @@ void keep_memory_guard(State& s) {
             m.changed_at = now;
             ++s.revision;
         }
+        m.lowered = false;
         return;
     }
     const auto memory = video_memory(m);
@@ -696,10 +1191,14 @@ void keep_memory_guard(State& s) {
     }
     if (down < m.asked) {
         set(down, m.usage, pixels_now, "lowered");
+        m.lowered = true;
         return;
     }
-    if (up > m.asked) {
-        // Higher only once it has done for three seconds: each change has the game remake its targets.
+    if (up > m.asked && !m.lowered) {
+        // Higher only once it has done for three seconds: each change has the game remake its targets. And not
+        // again once lowered in this visit: the budget Windows gives the game moves with what else is on the screen,
+        // and the game was raised and lowered by turns every few seconds, remaking its targets each time, a flash
+        // on the screen (16:9 at 175%, its budget going between 15.1 and 12.6 GB, 2026-11-18).
         if (!m.raise_since) m.raise_since = now;
         if (now - m.raise_since >= 3000) set(up, m.usage, pixels_now, "raised");
         return;
@@ -968,8 +1467,10 @@ std::string native_verb(State& s, const std::vector<std::string>& words) {
 // F10 opens the panel (and closes it) from the keyboard, in the replay editor.
 void switch_shake(State& s); // (R3's shortcuts, below)
 void read_key(State& s) {
-    const bool down = s.level && s.in_replay && overlay::key_down(VK_F10) && !overlay::interface_open();
-    if (down && !s.f10_down) link::ask_panel(!link::panel_open().load(std::memory_order_acquire));
+    // (While the panel has the pointer, ReSkate's overlay counts as open: it is the panel's own.)
+    const bool others = overlay::interface_open() && !link::panel_has_pointer();
+    const bool down = s.level && s.in_replay && overlay::key_down(VK_F10) && !others;
+    if (down && !s.f10_down) link::ask_panel(!link::panel_open().load(std::memory_order_acquire), true);
     s.f10_down = down;
     // F11: the shake on or off for the whole replay (as R3 + D-pad left).
     const bool shake = s.level && s.in_replay && s.settings.enabled && overlay::key_down(VK_F11) && !overlay::interface_open() &&
@@ -1003,9 +1504,17 @@ void read_focus(State& s) {
         s.settings.focus_blur = s.focus_now.blur;
         break;
     case Focus::autofocus: {
-        const float target = link::focus_depth();
+        float target = link::focus_depth();
+        bool known = target > 0.05f && link::now_ms() - link::focus_depth_at() < 1000;
+        // Skater autofocus: how far away the replay has the skater (else, until it does, what is in the middle).
+        if (float depth{}; v.focus_skater && skater_depth(s, depth)) {
+            target = depth;
+            known = true;
+            s.skater_depth = depth;
+            s.skater_at = GetTickCount64();
+        }
         s.focus_now.blur = v.focus_blur;
-        if (target > 0.05f && link::now_ms() - link::focus_depth_at() < 1000) {
+        if (known) {
             // Eased towards it in how near it looks (a focus ring), as fast as Follow speed says.
             const double rate = 0.6 + 14.0 * static_cast<double>(v.focus_speed) * v.focus_speed;
             const double k = 1.0 - std::exp(-dt * rate);
@@ -1060,8 +1569,7 @@ void key_focus(State& s, float distance, float blur, std::string_view what, bool
     s.settings.focus_distance = s.focus_now.distance;
     s.settings.focus_blur = s.focus_now.blur;
     changed(s);
-    say_toast(s, std::format("{} at {:.2f} s: {:.2f} m, blur {:.0f}%.", what, s.playhead - (s.timeline_ok ? s.timeline_start : 0.0),
-                             distance, blur * 100), log);
+    say_toast(s, std::format("{} at {:.2f} s: {:.2f} m, blur {:.0f}%.", what, timeline_seconds(s, s.playhead), distance, blur * 100), log);
 }
 // Replay Shake's own switch: the shake on or off for the whole replay (its keys, if any, then apply).
 void switch_shake(State& s) {
@@ -1086,8 +1594,7 @@ void key_shake(State& s) {
     // The keys switch the shake on and off: Replay Shake itself must be on for them to.
     if (!s.settings.shake_keys.empty() && !shake.on) (void)replay_shake::run_command("on", {});
     changed(s);
-    say_toast(s, std::format("Shake {} from {:.2f} s ({} shake key{}).", on ? "on" : "off",
-                             s.playhead - (s.timeline_ok ? s.timeline_start : 0.0), s.settings.shake_keys.size(),
+    say_toast(s, std::format("Shake {} from {:.2f} s ({} shake key{}).", on ? "on" : "off", timeline_seconds(s, s.playhead), s.settings.shake_keys.size(),
                              s.settings.shake_keys.size() == 1 ? "" : "s"));
 }
 void delete_keys_here(State& s) {
@@ -1143,9 +1650,11 @@ void read_shortcuts(State& s) {
         return;
     }
     if (pressed & pad_right) {
+        // The camera light on or off (it was a focus key here: dpad up / down make those as they move the focus).
         used();
-        const auto here = s.playhead_ok ? focus_at(s.settings, s.playhead) : s.focus_now;
-        key_focus(s, here.distance, here.blur, "Focus key");
+        s.settings.light = !s.settings.light;
+        changed(s);
+        say_toast(s, s.settings.light ? std::format("Camera light on ({:.0f}%).", s.settings.light_power * 100) : std::string("Camera light off."));
     }
     if (pressed & pad_left) {
         used();
@@ -1205,11 +1714,16 @@ void send_gates(State& s) {
 void read_timeline(State& s, const replay_shake::PanelState& shake) {
     if (!s.in_replay) {
         s.timeline_ok = false;
+        if (!s.chunks.empty()) s.chunks.clear();
         return;
     }
+    read_chunks(s);
     if (!shake.timeline || !shake.playhead_ok || shake.timeline_length <= 0) return;
     const double start = shake.playhead - static_cast<double>(shake.timeline_at) * shake.timeline_length;
     if (!s.timeline_ok || std::abs(start - s.timeline_start) > 1e-3 || std::abs(shake.timeline_length - s.timeline_length) > 1e-3) {
+        if (!s.timeline_ok || std::abs(start - s.timeline_start) > 0.05 || std::abs(shake.timeline_length - s.timeline_length) > 0.05)
+            logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus: the replay's timeline is {:.3f} s long, from {:.3f} on its clock.",
+                         shake.timeline_length, start);
         s.timeline_ok = true;
         s.timeline_start = start;
         s.timeline_length = shake.timeline_length;
@@ -1341,12 +1855,18 @@ void publish(State& s) {
     view->advanced_edit = shake.advanced_edit;
     view->timeline_ok = s.timeline_ok;
     view->timeline_start = s.timeline_start;
+    view->chunks = s.chunks;
     view->timeline_length = s.timeline_length;
     view->shake_switch = shake.on;
     view->shake_here = s.playhead_ok ? shake.on && shake_on_at(s.settings, s.playhead, true) : shake.on;
     view->r3_held = s.r3_down;
     view->toast = s.toast;
     view->toast_at = s.toast_at;
+    view->video_folder = path_text(video_folder(s.settings));
+    view->video_folder_custom = !s.settings.video_folder.empty();
+    view->skater_focus_available = s.keyframes_ok;
+    view->skater_distance = s.skater_at && GetTickCount64() - s.skater_at < 1000 ? s.skater_depth : 0.0f;
+    view->camera_keys_kept = s.camera_keys.size();
     view->status = !s.settings.enabled ? "Off." : s.in_replay ? "In the replay editor." : s.level ? "Skating: opens in the replay editor." : "Waiting for a level.";
     link::publish_view(std::move(view));
 }
@@ -1504,6 +2024,8 @@ std::string probe_text(State& s) {
     text += std::format(" Timeline: read {}, length {:.4f} s, trim {:.4f} to {:.4f}, playhead at {:.4f} (clock {} {:.4f}, so it starts at {:.4f}).",
                         ui.timeline, ui.timeline_length, ui.timeline_from, ui.timeline_to, ui.timeline_at, ui.playhead_ok, ui.playhead,
                         ui.playhead - ui.timeline_at * ui.timeline_length);
+    text += std::format(" Chunks ({}):", s.chunks.size());
+    for (const auto& c : s.chunks) text += std::format(" [{:.3f}..{:.3f} at {:.4f}..{:.4f}]", c.clock_from, c.clock_to, c.from, c.to);
     text += " View floats from +0x100:";
     for (std::size_t i = 0; i < s.probe_floats.size(); ++i) text += std::format(" {:.5g}", s.probe_floats[i].load(std::memory_order_relaxed));
     std::uintptr_t renderer{};
@@ -1634,6 +2156,17 @@ bool start(std::uintptr_t base) noexcept {
                              "Replay Plus's settings in {} could not be read ({}); it starts from its defaults.", path_text(s.file), e.what());
             }
         }
+        // Focus and shake keys are on the replay's clock, and the replay goes with the game: those of an earlier run
+        // would land on whatever footage has their times now.
+        if (!s.settings.focus_keys.empty() || !s.settings.shake_keys.empty()) {
+            logging::log(logging::Level::info, logging::Channel::graphics,
+                         "Replay Plus: {} focus key(s) and {} shake key(s) from the last time the game ran are cleared (their footage went with it).",
+                         s.settings.focus_keys.size(), s.settings.shake_keys.size());
+            s.settings.focus_keys.clear();
+            s.settings.shake_keys.clear();
+            s.dirty = true;
+            s.save_at = GetTickCount64() + save_after_ms;
+        }
         set_up_folders(s);
         refresh_lists(s, true);
         s.ready.store(true, std::memory_order_release);
@@ -1648,6 +2181,9 @@ bool start(std::uintptr_t base) noexcept {
     }
 }
 
+#if defined(REPLAY_PLUS_TEST_INBOX)
+void probe_skater(State& s); // (research, below)
+#endif
 void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noexcept {
     auto& s = state();
     if (!s.ready.load(std::memory_order_acquire) || base != s.base) return;
@@ -1683,7 +2219,23 @@ void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noe
             ++s.revision;
             hold_settings(s, true);
             if (!s.in_replay && link::panel_open().load(std::memory_order_acquire)) link::ask_panel(false);
+            // Keep keys: each visit puts back the last one's camera keyframes (once its session is up); without it,
+            // leaving the editor takes Replay Plus's own keys with it, as the game does its keyframes.
+            s.camera_keys_done = false;
+            s.camera_keys_gone_at = 0;
+            s.camera_keys_from = GetTickCount64() + 400;
+            if (s.in_replay) (void)keyframes_known(s);
+            if (!s.in_replay && !s.settings.keep_keys) {
+                s.camera_keys.clear();
+                if (!s.settings.focus_keys.empty() || !s.settings.shake_keys.empty()) {
+                    s.settings.focus_keys.clear();
+                    s.settings.shake_keys.clear();
+                    changed(s);
+                }
+            }
         }
+        keep_camera_keys(s);
+        follow_exports(s);
         keep_fov_auto(s);
         if (!s.texture_pool_checked) {
             s.texture_pool_checked = true;
@@ -1694,6 +2246,9 @@ void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noe
         keep_sharp_scale(s);
         keep_memory_guard(s);
         read_focus(s);
+#if defined(REPLAY_PLUS_TEST_INBOX)
+        probe_skater(s);
+#endif
         // Every tick while the focus moves (keys, autofocus); otherwise a few times a second.
         hold_settings(s, s.settings.focus == Focus::keys || s.settings.focus == Focus::autofocus);
         const auto shake = replay_shake::panel_state();
@@ -1711,6 +2266,77 @@ void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noe
 }
 
 #if defined(REPLAY_PLUS_TEST_INBOX)
+// ---- Research (test builds): where the skater is in a replay, and the game's own camera keyframes ----
+std::string game_keys_text(std::uintptr_t base, bool values) {
+    namespace kf = game::build::v20260929::replay_keyframes;
+    const auto manager = peek_pointer(base + kf::manager);
+    if (!manager) return "No keyframe manager.";
+    const auto anchor = manager + kf::manager_sessions;
+    std::uint64_t sessions{};
+    (void)memory::peek(anchor + 0x20, sessions);
+    std::string text = std::format("Keyframe manager 0x{:x}: {} session(s); at +0x40 0x{:x}.", manager, sessions, peek_pointer(manager + 0x40));
+    text += " Manager +0x80..0x100:";
+    for (std::size_t i = 0x80; i < 0x100; i += 4) {
+        float f{};
+        (void)memory::peek(manager + i, f);
+        text += std::format(" {:.5g}", f);
+    }
+    if (const auto client = peek_pointer(base + addr::replay_activity::client)) {
+        const auto replay = peek_pointer(client + addr::replay_activity::manager);
+        double from{}, to{};
+        (void)memory::peek(replay + 0x70, from);
+        (void)memory::peek(replay + 0x78, to);
+        text += std::format(" Replay 0x{:x}: clock {:.4f} to {:.4f}; chunks 0x{:x}..0x{:x}.", replay, from, to, peek_pointer(replay + 0xa0), peek_pointer(replay + 0xa8));
+    }
+    int n = 0;
+    for (auto node = peek_pointer(anchor + 8); node && node != anchor && n < 32; node = map_next(node), ++n) {
+        std::int32_t id{};
+        (void)memory::peek(node + 0x20, id);
+        const auto keys = node + 0x60;
+        std::uint64_t count{};
+        (void)memory::peek(keys + 0x20, count);
+        text += std::format("\n  session {} (node 0x{:x}): {} framing key(s); node", id, node, count);
+        for (std::size_t i = 0x20; i < 0x160; i += 8) text += std::format(" {:x}", peek_pointer(node + i));
+        int k = 0;
+        for (auto key = peek_pointer(keys + 8); key && key != keys && k < 64; key = map_next(key), ++k) {
+            double time{};
+            (void)memory::peek(key + kf::framing_key_time, time);
+            text += std::format("\n    key at {:.4f} (node 0x{:x}):", time, key);
+            if (values) {
+                for (std::size_t i = 0; i < 0x120; i += 4) {
+                    float f{};
+                    (void)memory::peek(key + kf::framing_key_value + i, f);
+                    text += std::format(" {:.5g}", f);
+                }
+                text += " | hex:";
+                for (std::size_t i = 0; i < 0x120; i += 8) text += std::format(" {:x}", peek_pointer(key + kf::framing_key_value + i));
+            }
+        }
+    }
+    return text;
+}
+void probe_skater(State& s) {
+    const auto now = GetTickCount64();
+    const auto until = s.skater_probe_until.load(std::memory_order_acquire);
+    if (!until) return;
+    if (now > until) {
+        s.skater_probe_until.store(0, std::memory_order_release);
+        logging::log(logging::Level::info, logging::Channel::graphics, "Skater probe: done.");
+        return;
+    }
+    if (now < s.skater_probe_next) return;
+    s.skater_probe_next = now + 250;
+    std::array<float, 16> cam{};
+    for (std::size_t i = 0; i < cam.size(); ++i) cam[i] = s.camera[i].load(std::memory_order_relaxed);
+    std::array<float, 12> m{};
+    const auto manager = keyframe_manager(s);
+    if (manager) (void)memory::peek(manager + manager_skater_body, m);
+    float depth{};
+    const bool known = skater_depth(s, depth);
+    logging::log(logging::Level::info, logging::Channel::graphics,
+                 "Skater probe: playhead {} {:.3f}; camera ({:.3f}, {:.3f}, {:.3f}); body ({:.3f}, {:.3f}, {:.3f}) board ({:.3f}, {:.3f}, {:.3f}); depth {} {:.3f}; focus {:.3f}.",
+                 s.playhead_ok, s.playhead, cam[12], cam[13], cam[14], m[0], m[1], m[2], m[8], m[9], m[10], known, depth, s.focus_now.distance);
+}
 // ---- Research (test builds): the game's window, and pad presses -------------------------------
 HWND game_window() {
     struct Search {
@@ -1809,7 +2435,7 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
         if (name == "help") {
             return "replayplus status | on | off | set <key> <value> | get <key> | step <key> <n> | reset [all|tab|key] | list [tab] | "
                    "panel [open|close] | preset list|load|save|new|rename|export|delete|open | focus list|key|delete|clear | shake list|key|clear | bind <0x..>|default | "
-                   "shot <name> [clean] | probe";
+                   "shot <name> [clean] | probe | white [auto|<value>] | lightfacing [none|smooth|triangles]";
         }
         if (name == "status") {
             const auto report = link::render_report();
@@ -1849,6 +2475,17 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
             link::trace_frames().store(frames);
             return std::format("The game's texture transitions for {} frame(s) go to the log.", frames);
         }
+        if (name == "videofolder" || name == "videos") return video_folder_verb(s, words);
+        if (name == "keys") {
+            std::size_t sessions{};
+            std::vector<CameraKey> now;
+            const auto manager = keyframe_manager(s);
+            if (manager && read_camera_keys(manager, now)) sessions = 1;
+            return std::format("Keep keys {}: {} camera keyframe(s) kept{}; {} focus key(s), {} shake key(s).{}", s.settings.keep_keys ? "on" : "off",
+                               s.camera_keys.size(), sessions ? std::format(" ({} in the editor now)", now.size()) : std::string(),
+                               s.settings.focus_keys.size(), s.settings.shake_keys.size(),
+                               keyframes_known(s) ? "" : " (The game's keyframes are not the ones known on this build: only Replay Plus's keys are kept.)");
+        }
         if (name == "probe") {
             const auto text = probe_text(s);
             logging::write(logging::Level::info, logging::Channel::graphics, text);
@@ -1862,6 +2499,74 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
             }
             return change_named_setting(words[0], lower(words[1]) == "restore" ? std::string() : words[1], lower(words[1]) == "restore");
         }
+        if (name == "lightfacing") {
+            // The camera light's facing: not taken into it (none, as it comes), smoothed over 25 cm counting 80%
+            // (smooth, as tried), each triangle's own (triangles, as 1.1 drew it), or values of one's own.
+            const auto what = words.empty() ? std::string() : lower(words[0]);
+            if (what == "none" || what == "off") {
+                link::light_facing_metres().store(link::light_facing_metres_default);
+                link::light_facing_weight().store(link::light_facing_weight_default);
+            } else if (what == "smooth") {
+                link::light_facing_metres().store(0.25f);
+                link::light_facing_weight().store(0.8f);
+            } else if (what == "triangles") {
+                link::light_facing_metres().store(0.0f);
+                link::light_facing_weight().store(1.0f);
+            } else if (!what.empty()) {
+                const float metres = std::strtof(what.c_str(), nullptr);
+                const float weight = words.size() > 1 ? std::strtof(words[1].c_str(), nullptr) : link::light_facing_weight().load();
+                if (!(metres >= 0.0f && metres <= 2.0f) || !(weight >= 0.0f && weight <= 1.0f))
+                    return "lightfacing [none | smooth | triangles | <metres 0-2> [<how much it counts 0-1>]]";
+                link::light_facing_metres().store(metres);
+                link::light_facing_weight().store(weight);
+            }
+            const float metres = link::light_facing_metres().load(), weight = link::light_facing_weight().load();
+            if (weight <= 0.0f) return "The camera light's facing is not taken into it (as it comes): it lights what is in its beam by its distance alone.";
+            return metres > 0.0f ? std::format("The camera light's facing: smoothed over {:.0f} cm of the surface, counting {:.0f}%.", metres * 100, weight * 100)
+                                 : std::format("The camera light's facing: each triangle's own, counting {:.0f}%.", weight * 100);
+        }
+        if (name == "white") {
+            // The white of the game's picture under its UI (the editor's picture is drawn into it), measured from the
+            // screen; `white <value>` fixes it instead (to compare), `white auto` measures again.
+            const auto what = words.empty() ? std::string() : lower(words[0]);
+            if (what == "dump") {
+                // Research: the next measurement's blocks (the picture's and the screen's means) to a CSV in the shots folder.
+                const auto file = (s.shots / utf8_path(words.size() > 1 ? words[1] : std::string("white"))).replace_extension(L".csv");
+                link::ask_white_dump(path_text(file));
+                return "The next measurement's blocks go to " + path_text(file) + ".";
+            }
+            if (what == "auto") {
+                link::white_fixed().store(0.0f);
+            } else if (!what.empty()) {
+                const float value = std::strtof(what.c_str(), nullptr);
+                if (!(value >= 0.05f && value <= 100.0f)) return "white [auto | <the picture's white, e.g. 2.16>]";
+                link::white_fixed().store(value);
+            }
+            link::ask_white();
+            std::string game;
+            for (const char* setting : {"Render.DisplayMappingEnable", "Render.DisplayMappingVersion", "Render.DisplayMappingSdrPeakLuma",
+                                        "Render.DisplayMappingHdr10PeakLuma", "Render.WorldBrightnessAdjustment", "Render.OverlayBrightnessAdjustment",
+                                        "Render.HdrOverlayPlaneNits"}) {
+                const auto value = named_setting_value(setting);
+                game += std::format(" {}={}", setting, value ? *value : std::string("?"));
+            }
+            const float fixed = link::white_fixed().load();
+            const auto detail = link::white_detail();
+            const float measured = link::scene_white_measured();
+            const auto how = fixed > 0.0f ? std::string("fixed")
+                           : measured > 0.0f ? std::format("measured {:.3f}", measured)
+                                             : std::string("not measured yet");
+            const auto used = link::scene_white_curve()
+                                  ? std::format("Under the game's UI its display mapping is undone, the picture taken at {:.3f} ({}; it stays at 1, "
+                                                "the game as it comes, unless measured more than 10% off)",
+                                                link::scene_white(), how)
+                                  : std::format("Under the game's UI the picture's white is {:.3f} ({})", link::scene_white(), how);
+            const auto text = std::format("{}. The game's display mapping:{}. {}", used, game,
+                                          detail.empty() ? std::string("The next measurement's details go to the log.")
+                                                         : "Last asked for: " + detail + " (the next goes to the log)");
+            logging::write(logging::Level::info, logging::Channel::graphics, text);
+            return text;
+        }
         if (name == "native") return native_verb(s, words);
 #if defined(REPLAY_PLUS_TEST_INBOX)
         if (name == "exportdepth") {
@@ -1870,6 +2575,17 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
                                                       : "Exported frames are lit from the depth of the frame each was drawn in.";
         }
         if (name == "window") return window_verb(words);
+        if (name == "skaterprobe") {
+            const int seconds = words.empty() ? 10 : std::clamp(std::atoi(words[0].c_str()), 1, 120);
+            s.skater_probe_next = 0;
+            s.skater_probe_until.store(GetTickCount64() + static_cast<std::uint64_t>(seconds) * 1000, std::memory_order_release);
+            return std::format("Where the skater is goes to the log every 250 ms for {} s.", seconds);
+        }
+        if (name == "gamekeys") {
+            const auto text = game_keys_text(s.base, !words.empty() && lower(words[0]) == "values");
+            logging::write(logging::Level::info, logging::Channel::graphics, text);
+            return text;
+        }
         if (name == "backdrop") {
             // Research: backdrop show | hide (the black window alone), mark | unmark (the taskbar alone), notaskbar on | off.
             const auto what = words.empty() ? std::string() : lower(words[0]);
@@ -1916,7 +2632,7 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
                 if (s.settings.shake_keys.empty()) return "No shake keys: Replay Shake's own switch holds for the whole replay.";
                 std::string text = std::format("{} shake key(s):", s.settings.shake_keys.size());
                 for (const auto& key : s.settings.shake_keys)
-                    text += std::format("\n  {:.2f} s: {}", key.time - (s.timeline_ok ? s.timeline_start : 0.0), key.on ? "on" : "off");
+                    text += std::format("\n  {:.2f} s: {}", timeline_seconds(s, key.time), key.on ? "on" : "off");
                 return text;
             }
             if (what == "clear") {
@@ -1937,7 +2653,7 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
                 if (s.settings.focus_keys.empty()) return "No focus keys.";
                 std::string text = std::format("{} focus key(s):", s.settings.focus_keys.size());
                 for (const auto& key : s.settings.focus_keys)
-                    text += std::format("\n  {:.2f} s: {:.2f} m, blur {:.0f}%{}", key.time, key.distance, key.blur * 100,
+                    text += std::format("\n  {:.2f} s: {:.2f} m, blur {:.0f}%{}", timeline_seconds(s, key.time), key.distance, key.blur * 100,
                                         s.playhead_ok && std::abs(key.time - s.playhead) <= 1.0 / 30.0 ? " (here)" : "");
                 return text;
             }
@@ -1955,7 +2671,7 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
                 set_focus_key(s.settings, s.playhead, distance, blur);
                 if (s.settings.focus != Focus::keys) s.settings.focus = Focus::keys;
                 changed(s);
-                return std::format("Focus key at {:.2f} s: {:.2f} m ({} key(s)).", s.playhead, std::clamp(distance, 0.2f, 200.0f), s.settings.focus_keys.size());
+                return std::format("Focus key at {:.2f} s: {:.2f} m ({} key(s)).", timeline_seconds(s, s.playhead), std::clamp(distance, 0.2f, 200.0f), s.settings.focus_keys.size());
             }
             if (what == "delete" || what == "remove") {
                 if (!remove_focus_key(s.settings, s.playhead, 0.25)) return "No focus key here.";
@@ -2005,6 +2721,9 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
 
 bool wants_views(bool editor_open) noexcept {
     auto& s = state();
+#if defined(REPLAY_PLUS_TEST_INBOX)
+    if (editor_open && s.ready.load(std::memory_order_acquire) && s.skater_probe_until.load(std::memory_order_acquire) > GetTickCount64()) return true;
+#endif
     return editor_open && s.ready.load(std::memory_order_acquire) && s.views_wanted.load(std::memory_order_acquire);
 }
 
@@ -2024,6 +2743,13 @@ void view_built(std::uintptr_t description, bool replayed) noexcept {
         }
         if (replayed) {
             link::note_fov(fov);
+            // The camera the picture is drawn from (the skater's autofocus measures how far away the skater is along it).
+            std::array<float, 16> camera{};
+            if (memory::peek(description + replay_shake::game_view::description_camera, camera) &&
+                std::all_of(camera.begin(), camera.end(), [](float v) { return std::isfinite(v); })) {
+                for (std::size_t i = 0; i < camera.size(); ++i) s.camera[i].store(camera[i], std::memory_order_relaxed);
+                s.camera_at.store(GetTickCount64(), std::memory_order_release);
+            }
             // Its near and far planes (after the vertical field of view, its two centre offsets and another
             // angle: 0.06 and 11000 on game build 25414733), which the camera light measures the depth by.
             float near_plane{}, far_plane{};

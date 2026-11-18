@@ -191,6 +191,13 @@ struct Settings {
     // R3 is Replay Plus's button in the replay editor: held, RB opens the panel and the D-pad and
     // triggers set focus and shake keys; a tap of it alone is still the game's own (Photo).
     bool pad_shortcuts = true;
+    // Auto focuses on the skater (where the replay has them, wherever they are in the picture), not on what is in
+    // the middle of the picture.
+    bool focus_skater = false;
+    // Keys outlive a visit to the replay editor: the game's own camera keyframes and these focus and shake keys are
+    // kept when it closes and come back when it opens again, on the same footage (while this game runs). Off, each
+    // visit starts with none.
+    bool keep_keys = true;
 
     // LIGHT (a light on the camera)
     bool light = false;
@@ -212,6 +219,9 @@ struct Settings {
     // The game's texture streaming pool (TextureStreaming.PoolSize, made anew as each map loads) raised for the
     // card: the game's own 1.4 GB is a console's, and a big map's textures turn to mush in it.
     bool bigger_textures = true;
+    // Where exported videos go (UTF-8; empty: where the game puts them). Each is moved there once the game has
+    // finished writing it. Not part of presets.
+    std::string video_folder;
 
     // The controller combo that, held, opens the panel in the replay editor (ReSkate's binding form,
     // controller_bindings.h: XInput's button bits); 0: RB + R3.
@@ -230,9 +240,11 @@ inline bool lens_on(const Settings& s) noexcept {
 // ---- The table every value is described in ---------------------------------------------------
 
 enum class Kind : std::uint8_t { number, toggle, choice };
-enum class Tab : std::uint8_t { shake, lens, frame, grade, focus, light, game, video, presets, count };
+// EXPERIMENTAL: what reads the game's own replay (where it has the skater, its camera keyframes) and may need work
+// after a game update.
+enum class Tab : std::uint8_t { shake, lens, frame, grade, focus, light, game, video, presets, experimental, count };
 inline constexpr std::array<std::string_view, static_cast<std::size_t>(Tab::count)> tab_names{
-    "SHAKE", "LENS", "FRAME", "COLOUR", "FOCUS", "LIGHT", "GAME", "VIDEO", "PRESETS"};
+    "SHAKE", "LENS", "FRAME", "COLOUR", "FOCUS", "LIGHT", "GAME", "VIDEO", "PRESETS", "EXPERIMENTAL"};
 
 struct Field {
     std::string_view key;   // as `replayplus set <key> <value>` and the presets take it: "lens.zoom"

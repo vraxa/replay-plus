@@ -3,6 +3,7 @@
 #include "replay_plus_link.h"
 #include "replay_plus_settings.h"
 #include "Extension/ReplayShake/replay_shake_settings.h"
+#include "Extension/UI/Overlay/input_capture.h"
 #include "Extension/UI/Overlay/overlay_internal.h"
 #include "Extension/UI/Overlay/skate_style.h"
 #include "Extension/UI/Overlay/scripted_pad.h"
@@ -21,8 +22,11 @@
 // halftone dots, the brushed title face, button prompts on grey plates). LB / RB change the tab, the
 // D-pad picks a row and changes its value (held, faster), A switches or chooses, X puts a value back,
 // Y hides the panel while held (to see the picture), B closes. The keyboard works it too: the arrow
-// keys, Enter, Backspace, Q / E and R. While it is open the game gets none of the input
-// (replay_plus.cpp hold_input), so nothing reaches the replay editor behind it.
+// keys or WASD, Enter or Space, Backspace or Esc, Q / E or Tab, R, Home / End, + / -, Shift for bigger steps.
+// And the mouse: from the keyboard (F10), or once the mouse moves or clicks, the panel has the pointer
+// (ReSkate's overlay gives it, replay_plus_link.h panel_pointer): what is under it lights up, a click works
+// it, sliders drag, the wheel scrolls. While it is open the game gets none of the input (replay_plus.cpp
+// hold_input), so nothing reaches the replay editor behind it.
 namespace dingosdk::replay_plus::overlay {
 namespace {
 namespace d = dingosdk::overlay::detail;
@@ -36,7 +40,7 @@ constexpr unsigned dpad_up = 0x0001, dpad_down = 0x0002, dpad_left = 0x0004, dpa
                    lb = 0x0100, rb = 0x0200;
 
 // One row of a tab: one of Replay Plus's values, one of Replay Shake's, or an action.
-enum class RowKind { field, shake_on, shake_preset, shake_number, shake_seed, hood_file, action, preset, naming };
+enum class RowKind { field, shake_on, shake_preset, shake_number, shake_seed, hood_file, action, preset, naming, video_folder };
 struct Row {
     RowKind kind{RowKind::field};
     const Field* field{};
@@ -49,6 +53,16 @@ struct Row {
     float fraction{-1};
     int segments{}, segment{};
     bool locked{}; // does not apply now (scribbled out, as the game's own locked rows are); the focus skips it
+};
+
+// What the mouse can work, where the panel drew it last frame (later ones are over earlier ones).
+enum class HitKind { tab, tab_back, tab_next, row, left, right, slider, segment, plate, scroll, prompt };
+struct Hit {
+    HitKind kind{};
+    ImVec2 a{}, b{};
+    int index{};        // the tab, the row, the segment, or the prompt (0 select, 1 reset or delete, 2 back)
+    int row{-1};        // the row a part of a row belongs to
+    float from{}, to{}; // a slider's track (x), or the scroll bar's (y)
 };
 
 struct Panel {
@@ -90,6 +104,23 @@ struct Panel {
     // What A does on a preset's row (left / right choose): 0 load, 1 rename, 2 export, 3 delete; for this one.
     int preset_action{};
     std::string preset_action_for;
+    // The mouse: the panel has the pointer (opened from the keyboard, or the mouse moved or clicked since it opened),
+    // hidden while a pad works it until the mouse moves again; and the keyboard's button prompts shown (the keyboard
+    // or the mouse worked it last).
+    bool pointer{}, pointer_shown{true}, keyboard_style{};
+    POINT cursor_before{LONG_MIN, LONG_MIN};
+    unsigned pad_before{};
+    std::vector<Hit> hits;
+    float row_h{1}, inner_h{1}, content_h{}, track_top{}, track_h{1}, thumb_h{};
+    ImVec2 list_a{}, list_b{};
+    // The rows scroll to keep the focus in view while keys or a pad move it; the wheel or the scroll bar let it go.
+    bool follow_focus{true};
+    // Held on an arrow (it repeats), a slider dragged (by its row's label), or the scroll bar.
+    bool holding{}, sliding{}, scrolling{};
+    HitKind held{HitKind::left};
+    int held_row{-1};
+    double held_next{};
+    std::string slide_label;
 };
 Panel& panel() {
     static auto* value = new Panel;
@@ -103,6 +134,12 @@ std::string shake_number(float v, float shown, int places, std::string_view unit
 }
 
 // The rows of a tab, from what the view and the panel's own changes say now.
+// A time on the replay's clock as the editor's timeline shows it: seconds from its start (through its chunks).
+double on_timeline(const link::View& view, double clock) {
+    if (!view.timeline_ok) return clock;
+    const float share = link::timeline_share(view.chunks, view.timeline_start, view.timeline_length, clock);
+    return share >= 0 ? share * view.timeline_length : clock - view.timeline_start;
+}
 std::vector<Row> rows_for(Panel& p, const link::View& view) {
     std::vector<Row> rows;
     const auto tab = static_cast<Tab>(p.tab);
@@ -255,7 +292,7 @@ std::vector<Row> rows_for(Panel& p, const link::View& view) {
         Row key;
         key.kind = RowKind::action;
         key.key = "focus_key";
-        key.label = view.playhead_ok ? std::format("Key at {:.2f} s", view.playhead) : std::string("Key at the playhead");
+        key.label = view.playhead_ok ? std::format("Key at {:.2f} s", on_timeline(view, view.playhead)) : std::string("Key at the playhead");
         key.value = here ? "UPDATE" : "SET";
         key.hint = view.playhead_ok ? "A focus key here, as the distance and blur above are. The triggers still scrub the replay while this is open"
                                     : "Open a replay to put focus keys on it";
@@ -284,7 +321,7 @@ std::vector<Row> rows_for(Panel& p, const link::View& view) {
             info.kind = RowKind::action;
             info.key = "none";
             const bool at = view.playhead_ok && std::abs(k.time - view.playhead) <= 1.0 / 30.0;
-            info.label = std::format("{:.2f} s{}", k.time, at ? "  (here)" : "");
+            info.label = std::format("{:.2f} s{}", on_timeline(view, k.time), at ? "  (here)" : "");
             info.value = std::format("{:.2f} m, {:.0f}%", k.distance, k.blur * 100);
             info.hint = "A focus key. Scrub to it to change it: between keys the focus turns smoothly from one to the next";
             rows.push_back(info);
@@ -296,7 +333,11 @@ std::vector<Row> rows_for(Panel& p, const link::View& view) {
         now.key = "none";
         now.label = "Focused at";
         now.value = view.focus_distance_now > 0 ? std::format("{:.2f} m", view.focus_distance_now) : std::string("-");
-        now.hint = "How far away the middle of the picture is, as the focus follows it";
+        if (!p.local.focus_skater) now.hint = "How far away the middle of the picture is, as the focus follows it";
+        else if (!view.skater_focus_available)
+            now.hint = "This game build's replay is not the one Replay Plus knows: the focus follows what is in the middle instead";
+        else if (view.skater_distance > 0) now.hint = std::format("Your skater is {:.2f} m away: the focus follows them", view.skater_distance);
+        else now.hint = "Play or scrub the replay: the focus follows your skater as soon as the replay has them";
         rows.push_back(now);
     }
     if (tab == Tab::lens) {
@@ -319,6 +360,29 @@ std::vector<Row> rows_for(Panel& p, const link::View& view) {
         now.hint = "What the game renders at now. Above 100% only as far as the card's video memory allows (a big map leaves less): "
                    "past it Windows moves the game's memory out and the game stutters";
         rows.push_back(now);
+        // Where exported videos go: the game's own folder, or one of the player's (each moved there once exported).
+        Row folder;
+        folder.kind = RowKind::video_folder;
+        folder.key = "video_folder";
+        folder.label = "Videos go to";
+        if (view.video_folder_custom) {
+            const auto cut = view.video_folder.find_last_of("\\/");
+            folder.value = cut == std::string::npos || cut + 1 >= view.video_folder.size() ? view.video_folder : view.video_folder.substr(cut + 1);
+            folder.hint = "Exported videos are moved here once each is done: " + view.video_folder +
+                          ". A (Enter, a click) picks another folder; X (R) gives them back to the game's folder";
+        } else {
+            folder.value = "The game's folder";
+            folder.hint = "Exported videos stay where the game puts them: " + view.video_folder +
+                          ". A (Enter, a click) picks a folder of your own: the Windows folder picker opens over the game";
+        }
+        rows.push_back(folder);
+        Row open;
+        open.kind = RowKind::action;
+        open.key = "open_videos";
+        open.label = "Open video folder";
+        open.value = "OPEN";
+        open.hint = "Where your videos go, in File Explorer (over the game): " + view.video_folder;
+        rows.push_back(open);
     }
     return rows;
 }
@@ -539,6 +603,8 @@ void act(Panel& p, const link::View& view, const Row& row, int steps, bool press
             post("replayplus preset open import");
         } else if (row.key == "open_export") {
             post("replayplus preset open export");
+        } else if (row.key == "open_videos") {
+            post("replayplus videofolder open");
         } else if (row.key == "save_over") {
             post("replayplus preset save " + p.local.preset);
         } else if (row.key == "focus_key") {
@@ -598,6 +664,50 @@ void act(Panel& p, const link::View& view, const Row& row, int steps, bool press
     }
     case RowKind::naming:
         return;
+    case RowKind::video_folder:
+        if (reset) post("replayplus videofolder default");
+        else if (press) post("replayplus videofolder pick");
+        else return;
+        p.changed_at = now - 1; // the view brings the folder
+        return;
+    }
+}
+// A slider set where the mouse holds it (0..1 along it), stepped as the panel's steps go.
+void slide(Panel& p, const link::View& view, const Row& row, float fraction) {
+    fraction = std::clamp(fraction, 0.0f, 1.0f);
+    if (row.locked) return;
+    if (row.kind == RowKind::field && row.field && row.field->kind == Kind::number) {
+        const auto& f = *row.field;
+        float v = f.logarithmic && f.low > 0 ? f.low * std::pow(f.high / f.low, fraction) : f.low + (f.high - f.low) * fraction;
+        if (f.logarithmic) {
+            const float digits = std::pow(10.0f, std::floor(std::log10(std::max(v, 1e-3f))) - 1.0f);
+            v = std::round(v / digits) * digits;
+        } else if (f.step > 0) {
+            v = f.low + std::round((v - f.low) / f.step) * f.step;
+        }
+        v = std::clamp(v, f.low, f.high);
+        if (std::abs(v - f.get(p.local)) < 1e-6f) return;
+        f.set(p.local, v);
+        p.changed_at = seconds_now();
+        post(std::format("replayplus set {} {}", f.key, f.get(p.local)));
+        return;
+    }
+    if (row.kind == RowKind::shake_number && row.step > 0) {
+        const float next = row.low + (row.high - row.low) * fraction;
+        const int steps = static_cast<int>(std::lround((next - row.now) / row.step));
+        if (steps) act(p, view, row, steps, false, false);
+    }
+}
+// One of a row's marks clicked: the switch or the choice set to it.
+void choose(Panel& p, const link::View& view, const Row& row, int segment) {
+    if (row.locked || segment == row.segment) return;
+    if (row.kind == RowKind::field && row.field) {
+        if (row.field->kind == Kind::toggle) act(p, view, row, 0, true, false);
+        else act(p, view, row, segment - row.segment, false, false);
+    } else if (row.kind == RowKind::shake_on) {
+        act(p, view, row, 0, true, false);
+    } else if (row.kind == RowKind::shake_preset) {
+        act(p, view, row, segment - row.segment, false, false);
     }
 }
 
@@ -687,6 +797,7 @@ float prompt(ImDrawList* draw, ImFont* bold, float u, ImVec2 at, std::string_vie
 
 void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, ControllerStyle style, bool keyboard) {
     const Fonts f = fonts();
+    p.hits.clear();
     const auto display = ImGui::GetIO().DisplaySize;
     const float u = std::min(display.x / 3840.0f, display.y / 2160.0f);
     auto* dl = ImGui::GetForegroundDrawList();
@@ -715,10 +826,13 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
     const float lb_w = glyph(nullptr, f.bold, u, {}, keyboard ? "Q" : "LB", style, keyboard);
     glyph(dl, f.bold, u, ImVec2(x0, y + (tab_h - 44 * u) * .5f), keyboard ? "Q" : "LB", style, keyboard);
     glyph(dl, f.bold, u, ImVec2(x1 - lb_w, y + (tab_h - 44 * u) * .5f), keyboard ? "E" : "RB", style, keyboard);
+    p.hits.push_back({HitKind::tab_back, ImVec2(x0, y), ImVec2(x0 + lb_w, y + tab_h)});
+    p.hits.push_back({HitKind::tab_next, ImVec2(x1 - lb_w, y), ImVec2(x1, y + tab_h)});
     const float tabs_left = x0 + lb_w + 14 * u, tabs_right = x1 - lb_w - 14 * u;
     const float each = (tabs_right - tabs_left) / static_cast<float>(tab_names.size());
     for (std::size_t t = 0; t < tab_names.size(); ++t) {
         const ImVec2 ta(tabs_left + each * static_cast<float>(t) + 4 * u, y), tb(tabs_left + each * static_cast<float>(t + 1) - 4 * u, y + tab_h);
+        p.hits.push_back({HitKind::tab, ta, tb, static_cast<int>(t)});
         const bool on = static_cast<int>(t) == p.tab;
         dl->AddRectFilled(ta, tb, on ? theme::paper : IM_COL32(16, 16, 17, 225), 3 * u);
         const std::string name(tab_names[t]);
@@ -737,15 +851,30 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
     auto& scroll = p.scroll[static_cast<std::size_t>(p.tab)];
     const float inner_h = list_h - 16 * u;
     const float focus_top = static_cast<float>(focus) * row_h;
-    if (focus_top - scroll < 0) scroll = focus_top;
-    if (focus_top + row_h - scroll > inner_h) scroll = focus_top + row_h - inner_h;
+    if (p.follow_focus) {
+        if (focus_top - scroll < 0) scroll = focus_top;
+        if (focus_top + row_h - scroll > inner_h) scroll = focus_top + row_h - inner_h;
+    }
     scroll = std::clamp(scroll, 0.0f, std::max(0.0f, static_cast<float>(rows.size()) * row_h - inner_h));
+    p.list_a = ImVec2(x0, list_top);
+    p.list_b = ImVec2(x1, list_bottom);
+    p.row_h = row_h;
+    p.inner_h = inner_h;
+    p.content_h = static_cast<float>(rows.size()) * row_h;
     const float value_mid = x0 + (x1 - x0) * 0.75f, bar_w = std::min(340 * u, (x1 - x0) * 0.32f);
     dl->PushClipRect(ImVec2(x0, list_top), ImVec2(x1, list_bottom), true);
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& row = rows[i];
         const float top = list_top + 8 * u + static_cast<float>(i) * row_h - scroll;
         if (top > list_bottom || top + row_h < list_top) continue;
+        // (Its parts only where the panel shows them.)
+        const float ry0 = std::max(top, list_top), ry1 = std::min(top + row_h, list_bottom);
+        const auto part = [&](HitKind kind, ImVec2 a, ImVec2 b, int index = 0, float from = 0, float to = 0) {
+            a.y = std::max(a.y, ry0);
+            b.y = std::min(b.y, ry1);
+            if (b.y > a.y) p.hits.push_back({kind, a, b, index, static_cast<int>(i), from, to});
+        };
+        part(HitKind::row, ImVec2(x0, top), ImVec2(x1, top + row_h), static_cast<int>(i));
         const bool lit = static_cast<int>(i) == focus;
         const bool info = row.kind == RowKind::action && row.key == "none";
         if (lit) {
@@ -777,6 +906,9 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
             const std::string label = p.confirm == row.key ? std::string("DELETE: A AGAIN") : std::string(what[static_cast<std::size_t>(chosen)]);
             const float pw = std::max(150 * u, width_of(f.bold, 28 * u, label) + 40 * u);
             const ImVec2 pa(x1 - 70 * u - pw, top + row_h * .5f - 26 * u), pb(x1 - 70 * u, top + row_h * .5f + 26 * u);
+            part(HitKind::left, ImVec2(pa.x - 48 * u, pa.y), ImVec2(pa.x - 6 * u, pb.y));
+            part(HitKind::right, ImVec2(pb.x + 6 * u, pa.y), ImVec2(pb.x + 48 * u, pb.y));
+            part(HitKind::plate, pa, pb);
             dl->AddRectFilled(pa, pb, chosen == 3 || p.confirm == row.key ? IM_COL32(214, 92, 72, 255) : IM_COL32(236, 206, 92, 255), 4 * u);
             text_at(dl, f.bold, 28 * u, ImVec2((pa.x + pb.x - width_of(f.bold, 28 * u, label)) * .5f, pa.y + 12 * u), skate_theme::black, label);
             const float cy = top + row_h * .5f, h = 13 * u;
@@ -796,6 +928,7 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
             // An action: a plate with its button, as the game's CONFIRM is.
             const float pw = 150 * u;
             const ImVec2 pa(x1 - 40 * u - pw, top + row_h * .5f - 26 * u), pb(x1 - 40 * u, top + row_h * .5f + 26 * u);
+            if (!row.locked) part(HitKind::plate, pa, pb);
             dl->AddRectFilled(pa, pb, row.locked ? IM_COL32(40, 40, 42, 160) : lit ? IM_COL32(236, 206, 92, 255) : IM_COL32(60, 60, 64, 220), 4 * u);
             const std::string& label = row.value;
             text_at(dl, f.bold, 28 * u, ImVec2((pa.x + pb.x - width_of(f.bold, 28 * u, label)) * .5f, pa.y + 12 * u),
@@ -804,13 +937,26 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
         }
         const float vw = width_of(f.bold, value_size, value);
         text_at(dl, f.bold, value_size, ImVec2(value_mid - vw * .5f, value_y), row.locked ? ink : theme::paper, value);
-        if (lit && !row.locked && !info) {
+        if (lit && !row.locked && !info && row.kind != RowKind::video_folder) {
             const float cy = value_y + value_size * .55f, h = 13 * u;
             const float lx = value_mid - bar_w * .5f - 34 * u, rx = value_mid + bar_w * .5f + 34 * u;
             dl->AddTriangleFilled(ImVec2(lx - 10 * u, cy), ImVec2(lx + 6 * u, cy - h), ImVec2(lx + 6 * u, cy + h), theme::paper);
             dl->AddTriangleFilled(ImVec2(rx + 10 * u, cy), ImVec2(rx - 6 * u, cy - h), ImVec2(rx - 6 * u, cy + h), theme::paper);
         }
         const float bar_y = top + row_h - 30 * u, bx0 = value_mid - bar_w * .5f, bx1 = value_mid + bar_w * .5f;
+        if (!row.locked && !info && row.kind != RowKind::video_folder) {
+            // Either side of the value: a step down or up (held, again and again); its slider, or its marks.
+            part(HitKind::left, ImVec2(bx0 - 70 * u, top), ImVec2(bx0 - 4 * u, top + row_h));
+            part(HitKind::right, ImVec2(bx1 + 4 * u, top), ImVec2(bx1 + 70 * u, top + row_h));
+            if (row.fraction >= 0) part(HitKind::slider, ImVec2(bx0 - 8 * u, bar_y - 26 * u), ImVec2(bx1 + 8 * u, bar_y + 20 * u), 0, bx0, bx1);
+            else if (row.segments > 0) {
+                const float gap = 8 * u, w = (bx1 - bx0 - gap * static_cast<float>(row.segments - 1)) / static_cast<float>(row.segments);
+                for (int k = 0; k < row.segments; ++k) {
+                    const float sx = bx0 + static_cast<float>(k) * (w + gap);
+                    part(HitKind::segment, ImVec2(sx - gap * .5f, bar_y - 26 * u), ImVec2(sx + w + gap * .5f, bar_y + 20 * u), k);
+                }
+            }
+        }
         const ImU32 lit_bar = row.locked ? IM_COL32(90, 110, 140, 160) : theme::blue;
         if (row.fraction >= 0) {
             const float at = bx0 + (bx1 - bx0) * std::clamp(row.fraction, 0.0f, 1.0f);
@@ -831,6 +977,10 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
     if (content > inner_h + 1) {
         const float track_top = list_top + 8 * u, track_h = inner_h;
         const float thumb_h = std::max(60 * u, track_h * inner_h / content), thumb_y = track_top + (track_h - thumb_h) * (scroll / (content - inner_h));
+        p.hits.push_back({HitKind::scroll, ImVec2(x1 + 2 * u, track_top), ImVec2(x1 + 26 * u, track_top + track_h), 0, -1, track_top, track_top + track_h});
+        p.track_top = track_top;
+        p.track_h = track_h;
+        p.thumb_h = thumb_h;
         dl->AddRectFilled(ImVec2(x1 + 10 * u, track_top), ImVec2(x1 + 14 * u, track_top + track_h), IM_COL32(255, 255, 255, 40), 2 * u);
         dl->AddRectFilled(ImVec2(x1 + 8 * u, thumb_y), ImVec2(x1 + 16 * u, thumb_y + thumb_h), IM_COL32(255, 255, 255, 180), 3 * u);
     }
@@ -857,7 +1007,13 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
     for (const auto& [button, what] : controls) total += prompt(nullptr, f.bold, u, {}, button, what, style, keyboard) + 40 * u;
     float x = display.x - 72 * u - total + 40 * u;
     const float fy = display.y - 100 * u;
-    for (const auto& [button, what] : controls) x += prompt(dl, f.bold, u, ImVec2(x, fy), button, what, style, keyboard) + 40 * u;
+    for (const auto& [button, what] : controls) {
+        const float w = prompt(dl, f.bold, u, ImVec2(x, fy), button, what, style, keyboard);
+        // Each prompt is its button for the mouse too.
+        const int does = what == "Select" || what == "Keep" ? 0 : what == "Back" ? 2 : what == "Hold To Hide" ? -1 : 1;
+        if (does >= 0) p.hits.push_back({HitKind::prompt, ImVec2(x - 8 * u, fy - 8 * u), ImVec2(x + w + 8 * u, fy + 52 * u), does});
+        x += w + 40 * u;
+    }
 }
 
 // The way in, as the game shows its own: "R3 + RB  Replay Plus" on a pad (R3 first: RB then stays the
@@ -938,7 +1094,11 @@ void draw_marks(const link::View& view) {
     const float u = std::min(display.x / 2560.0f, display.y / 1440.0f);
     const float x0 = display.x * timeline_from, span = display.x * timeline_span, r = 9 * u;
     auto* dl = ImGui::GetForegroundDrawList();
-    const auto x_of = [&](double time) { return x0 + static_cast<float>((time - view.timeline_start) / view.timeline_length) * span; };
+    // (Through the replay's chunks: a key on footage the replay no longer has is not drawn.)
+    const auto x_of = [&](double time) {
+        const float share = link::timeline_share(view.chunks, view.timeline_start, view.timeline_length, time);
+        return share < 0 ? -1.0e6f : x0 + share * span;
+    };
     const auto diamond = [&](float x, float cy, ImU32 fill, ImU32 edge) {
         const ImVec2 p[4]{ImVec2(x, cy - r), ImVec2(x + r, cy), ImVec2(x, cy + r), ImVec2(x - r, cy)};
         dl->AddConvexPolyFilled(p, 4, fill);
@@ -985,7 +1145,7 @@ void draw_guide(const link::View& view) {
         lines.push_back({"RB", 0, "Replay Plus panel"});
         lines.push_back({"", 1 | 2, std::format("Focus {:.2f} m (further / nearer){}", view.focus_distance_now, keyed ? "" : ": makes it keyed")});
         lines.push_back({"LT", 0, std::format("Blur {:.0f}% (LT less, RT more)", view.focus_blur_now * 100)});
-        lines.push_back({"", 8, "Focus key here"});
+        lines.push_back({"", 8, std::format("Camera light {}", v.light ? "off" : "on")});
         lines.push_back({"", 4, std::format("Shake {} (the whole replay)", view.shake.on ? "off" : "on")});
         lines.push_back({"LB", 0, std::format("Shake key: {} from here", view.shake_here ? "off" : "on")});
         lines.push_back({"VIEW", 0, "Delete the keys here"});
@@ -1029,35 +1189,174 @@ void draw_guide(const link::View& view) {
 unsigned keyboard_buttons() {
     unsigned buttons{};
     const auto key = [](int vk) { return dingosdk::overlay::key_down(vk); };
-    if (key(VK_UP)) buttons |= dpad_up;
-    if (key(VK_DOWN)) buttons |= dpad_down;
-    if (key(VK_LEFT)) buttons |= dpad_left;
-    if (key(VK_RIGHT)) buttons |= dpad_right;
-    if (key(VK_RETURN)) buttons |= pad_a;
+    const bool shift = key(VK_SHIFT);
+    if (key(VK_UP) || key('W')) buttons |= dpad_up;
+    if (key(VK_DOWN) || key('S')) buttons |= dpad_down;
+    if (key(VK_LEFT) || key('A') || key(VK_OEM_MINUS) || key(VK_SUBTRACT)) buttons |= dpad_left;
+    if (key(VK_RIGHT) || key('D') || key(VK_OEM_PLUS) || key(VK_ADD)) buttons |= dpad_right;
+    if (key(VK_RETURN) || key(VK_SPACE)) buttons |= pad_a;
     if (key(VK_BACK) || key(VK_ESCAPE)) buttons |= pad_b;
     if (key('R') || key(VK_DELETE)) buttons |= pad_x;
-    if (key('Q') || key(VK_PRIOR)) buttons |= lb;
-    if (key('E') || key(VK_NEXT)) buttons |= rb;
+    if (key('Q') || key(VK_PRIOR) || (key(VK_TAB) && shift)) buttons |= lb;
+    if (key('E') || key(VK_NEXT) || (key(VK_TAB) && !shift)) buttons |= rb;
     return buttons;
+}
+// The mouse, while the panel has the pointer (last frame's drawing tells what is under it): the row under it lights
+// up as it moves, a click works whatever it is on, a slider or the scroll bar drags, an arrow held repeats, the wheel
+// scrolls the rows. What stands for a button (the prompts at the foot, the tab arrows) comes back as those buttons.
+unsigned mouse_input(Panel& p, const link::View& view, std::vector<Row>& rows) {
+    auto& io = ImGui::GetIO();
+    if (!p.pointer || !link::panel_pointer().load(std::memory_order_acquire)) return 0;
+    const ImVec2 m = io.MousePos;
+    const bool moved = io.MouseDelta.x != 0 || io.MouseDelta.y != 0;
+    if (moved || io.MouseClicked[0]) p.pointer_shown = true;
+    if (!p.pointer_shown) {
+        io.MouseDrawCursor = false;
+        return 0;
+    }
+    if (m.x < -1e30f || m.y < -1e30f) return 0;
+    const double now = seconds_now();
+    auto& focus = p.focus[static_cast<std::size_t>(p.tab)];
+    auto& scroll = p.scroll[static_cast<std::size_t>(p.tab)];
+    const bool shift = dingosdk::overlay::key_down(VK_SHIFT);
+    const auto inside = [&](const Hit& h) { return m.x >= h.a.x && m.x <= h.b.x && m.y >= h.a.y && m.y <= h.b.y; };
+    const Hit* under{};
+    for (const auto& h : p.hits)
+        if (inside(h)) under = &h; // the last drawn: a row's part over its row
+    const auto row_of = [&](const Hit* h) -> const Row* {
+        return h && h->row >= 0 && static_cast<std::size_t>(h->row) < rows.size() ? &rows[static_cast<std::size_t>(h->row)] : nullptr;
+    };
+    unsigned presses{};
+    // Let go: a drag or a held arrow ends.
+    if (!io.MouseDown[0]) p.holding = p.sliding = p.scrolling = false;
+    // Dragging: a slider follows the pointer along it; the scroll bar moves the rows.
+    if (p.sliding && !p.naming) {
+        for (const auto& h : p.hits)
+            if (h.kind == HitKind::slider) {
+                const Row* r = row_of(&h);
+                if (r && r->label == p.slide_label && h.to > h.from) {
+                    slide(p, view, *r, (m.x - h.from) / (h.to - h.from));
+                    rows = rows_for(p, view);
+                    break;
+                }
+            }
+        return 0;
+    }
+    if (p.scrolling) {
+        const float travel = std::max(1.0f, p.track_h - p.thumb_h);
+        scroll = std::clamp((m.y - p.track_top - p.thumb_h * .5f) / travel, 0.0f, 1.0f) * std::max(0.0f, p.content_h - p.inner_h);
+        p.follow_focus = false;
+        return 0;
+    }
+    // An arrow held: again after a moment, then quickly.
+    if (p.holding && under && under->kind == p.held && under->row == p.held_row && now >= p.held_next) {
+        if (const Row* r = row_of(under)) {
+            act(p, view, *r, (p.held == HitKind::left ? -1 : 1) * (shift ? 10 : 1), false, false);
+            rows = rows_for(p, view);
+        }
+        p.held_next = now + 0.07;
+    }
+    // Moving over a row lights it up (as the D-pad would), unless it does not apply now.
+    if (moved && under && under->row >= 0 && !p.naming && static_cast<std::size_t>(under->row) < rows.size() &&
+        !rows[static_cast<std::size_t>(under->row)].locked) {
+        focus = under->row;
+    }
+    // The wheel scrolls the rows.
+    if (io.MouseWheel != 0 && m.x >= p.list_a.x && m.x <= p.list_b.x + 30 && m.y >= p.list_a.y && m.y <= p.list_b.y) {
+        scroll = std::clamp(scroll - io.MouseWheel * p.row_h, 0.0f, std::max(0.0f, p.content_h - p.inner_h));
+        p.follow_focus = false;
+    }
+    if (!io.MouseClicked[0] || !under) return presses;
+    switch (under->kind) {
+    case HitKind::tab:
+        if (!p.naming && under->index != p.tab) {
+            p.tab = under->index;
+            p.follow_focus = true;
+            rows = rows_for(p, view);
+        }
+        break;
+    case HitKind::tab_back: presses |= lb; break;
+    case HitKind::tab_next: presses |= rb; break;
+    case HitKind::prompt: presses |= under->index == 0 ? pad_a : under->index == 2 ? pad_b : pad_x; break;
+    case HitKind::scroll: p.scrolling = true; break;
+    case HitKind::row: {
+        const Row* r = row_of(under);
+        if (!r || r->locked || p.naming) break;
+        focus = under->row;
+        // A switch, a choice or an action works at a click on it; a number waits for its arrows or slider.
+        const bool works = r->kind == RowKind::action || r->kind == RowKind::shake_on || r->kind == RowKind::shake_preset ||
+                           r->kind == RowKind::video_folder || (r->kind == RowKind::field && r->field && r->field->kind != Kind::number);
+        if (works) {
+            act(p, view, *r, 0, true, false);
+            rows = rows_for(p, view);
+        }
+        break;
+    }
+    case HitKind::plate:
+        if (const Row* r = row_of(under); r && !r->locked && !p.naming) {
+            focus = under->row;
+            act(p, view, *r, 0, true, false);
+            rows = rows_for(p, view);
+        }
+        break;
+    case HitKind::left:
+    case HitKind::right:
+        if (const Row* r = row_of(under); r && !r->locked && !p.naming) {
+            focus = under->row;
+            act(p, view, *r, (under->kind == HitKind::left ? -1 : 1) * (shift ? 10 : 1), false, false);
+            rows = rows_for(p, view);
+            p.holding = true;
+            p.held = under->kind;
+            p.held_row = under->row;
+            p.held_next = now + 0.38;
+        }
+        break;
+    case HitKind::slider:
+        if (const Row* r = row_of(under); r && !r->locked && !p.naming && under->to > under->from) {
+            focus = under->row;
+            p.sliding = true;
+            p.slide_label = r->label;
+            slide(p, view, *r, (m.x - under->from) / (under->to - under->from));
+            rows = rows_for(p, view);
+        }
+        break;
+    case HitKind::segment:
+        if (const Row* r = row_of(under); r && !r->locked && !p.naming) {
+            focus = under->row;
+            choose(p, view, *r, under->index);
+            rows = rows_for(p, view);
+        }
+        break;
+    }
+    return presses;
 }
 } // namespace
 
 void draw_panel() noexcept {
     try {
         auto& p = panel();
-        bool asked{};
-        if (link::take_panel_request(asked)) {
+        bool asked{}, from_keyboard{};
+        if (link::take_panel_request(asked, from_keyboard)) {
             if (asked && !p.open) {
                 p.open = true;
                 p.armed = false;
-                p.whole_input = false;
+                p.whole_input = from_keyboard;
                 p.naming = false;
                 p.feedback.clear();
+                // From the keyboard (F10) it opens with the pointer, ready for the mouse.
+                p.pointer = from_keyboard;
+                p.pointer_shown = true;
+                p.keyboard_style = from_keyboard;
+                p.cursor_before = {LONG_MIN, LONG_MIN};
+                p.follow_focus = true;
+                p.holding = p.sliding = p.scrolling = false;
             } else if (!asked) {
                 p.open = false;
             }
         }
         link::panel_open().store(p.open, std::memory_order_release);
+        if (!p.open) p.pointer = false;
+        link::panel_pointer().store(p.open && p.pointer, std::memory_order_release);
         link::note_game_window(reinterpret_cast<std::uintptr_t>(d::state().window.load()));
         draw_marks(*link::view());
         if (!p.open) {
@@ -1089,8 +1388,36 @@ void draw_panel() noexcept {
         read_pad(input);
         // (While a name is typed its letters are the keyboard's: R, Q and E are no buttons then.)
         const unsigned keys = p.naming ? 0 : keyboard_buttons();
-        const unsigned buttons = (input.available ? input.buttons & 0xffff : 0) | keys;
-        const bool keyboard = keys != 0 || !input.available || (p.naming && p.whole_input);
+        const unsigned pad = input.available ? input.buttons & 0xffff : 0;
+        const unsigned buttons = pad | keys;
+        // The mouse, before the panel has the pointer: moved or clicked, the panel takes it (and the game's input whole).
+        if (!p.pointer) {
+            // (The real pointer and buttons: while the game's input is paused ReSkate shows the game a still mouse.)
+            d::OverlayInputAccess real;
+            POINT cursor{};
+            bool take = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+            if (GetCursorPos(&cursor)) {
+                if (p.cursor_before.x != LONG_MIN && (std::abs(cursor.x - p.cursor_before.x) > 12 || std::abs(cursor.y - p.cursor_before.y) > 12))
+                    take = true;
+                p.cursor_before = cursor;
+            }
+            if (take && p.armed) {
+                p.pointer = true;
+                p.pointer_shown = true;
+                p.whole_input = true;
+                p.keyboard_style = true;
+                link::panel_pointer().store(true, std::memory_order_release);
+            }
+        }
+        // Whose prompts the foot shows: the keyboard's while the keyboard or the mouse worked it last, the pad's after a
+        // press of the pad (which also hides the pointer until the mouse moves).
+        if (keys) p.keyboard_style = true;
+        if (pad & ~p.pad_before) {
+            p.keyboard_style = false;
+            p.pointer_shown = false;
+        }
+        p.pad_before = pad;
+        const bool keyboard = !input.available || p.keyboard_style || (p.naming && p.whole_input);
         if (!p.armed) {
             // The combo that opened it must be let go first.
             if (!buttons) p.armed = true;
@@ -1100,14 +1427,17 @@ void draw_panel() noexcept {
         // has only its buttons kept from the game: its triggers and sticks still scrub and frame the replay
         // while the panel is open. Once the keyboard works the panel, or with a pad the game reads itself,
         // the game's input is paused whole (replay_plus.cpp hold_input) until the panel closes.
-        if (keyboard || input.style != ControllerStyle::xbox || p.naming) p.whole_input = true;
+        if (keys || !input.available || input.style != ControllerStyle::xbox || p.naming || p.pointer) p.whole_input = true;
         link::panel_keyboard().store(p.whole_input, std::memory_order_release);
         link::hide_pad_buttons(400);
-        const unsigned pressed = p.armed ? buttons & ~p.previous : 0;
+        unsigned pressed = p.armed ? buttons & ~p.previous : 0;
         p.previous = buttons;
         auto rows = rows_for(p, *view);
         auto& focus = p.focus[static_cast<std::size_t>(p.tab)];
         focus = std::clamp(focus, 0, std::max(0, static_cast<int>(rows.size()) - 1));
+        // The mouse works the panel too (and its clicks on the prompts and the tab arrows are those buttons).
+        if (p.armed) pressed |= mouse_input(p, *view, rows);
+        if (pressed & (dpad_up | dpad_down | lb | rb)) p.follow_focus = true;
         // The D-pad, held: again after a moment, then quickly (left / right go faster still after a while).
         const unsigned dirs = buttons & (dpad_up | dpad_down | dpad_left | dpad_right);
         int vertical = 0, horizontal = 0;
@@ -1124,6 +1454,8 @@ void draw_panel() noexcept {
             const int speed = fast ? 5 : 1;
             horizontal = (dirs & dpad_left) ? -speed : (dirs & dpad_right) ? speed : 0;
         }
+        // Shift with the keyboard's arrows: ten steps at a time.
+        if (horizontal && (keys & (dpad_left | dpad_right)) && dingosdk::overlay::key_down(VK_SHIFT)) horizontal *= 10;
         if (!dirs) p.held_dir = 0;
         if (p.naming) {
             // A name being typed has the keyboard and the pad to itself.
@@ -1144,7 +1476,9 @@ void draw_panel() noexcept {
         }
         if (pressed & pad_b) {
             p.open = false;
+            p.pointer = false;
             link::panel_open().store(false, std::memory_order_release);
+            link::panel_pointer().store(false, std::memory_order_release);
             return;
         }
         if (pressed & (lb | rb)) {
@@ -1181,6 +1515,16 @@ void draw_panel() noexcept {
                     break;
                 }
             now_focus = next;
+        }
+        // Home and End: the first and the last row that applies.
+        if (!rows.empty() && (key_pressed(p, VK_HOME) || key_pressed(p, VK_END))) {
+            const bool first = dingosdk::overlay::key_down(VK_HOME);
+            for (int k = first ? 0 : static_cast<int>(rows.size()) - 1; k >= 0 && k < static_cast<int>(rows.size()); k += first ? 1 : -1)
+                if (!rows[static_cast<std::size_t>(k)].locked) {
+                    now_focus = k;
+                    break;
+                }
+            p.follow_focus = true;
         }
         if (!rows.empty()) {
             now_focus = std::clamp(now_focus, 0, static_cast<int>(rows.size()) - 1);
