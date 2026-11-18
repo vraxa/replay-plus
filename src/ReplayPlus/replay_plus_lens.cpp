@@ -1,0 +1,962 @@
+#include "replay_plus_lens.h"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <mutex>
+#include <thread>
+
+namespace dingosdk::replay_plus::lens {
+namespace {
+float clamp01(float v) noexcept { return std::clamp(v, 0.0f, 1.0f); }
+float smoothstep(float a, float b, float x) noexcept {
+    const float t = clamp01((x - a) / (b - a));
+    return t * t * (3.0f - 2.0f * t);
+}
+// The picture's visible half-height, in q: a 2.39:1 letterbox hides the top and bottom.
+float visible_height(const Frame& f, Bars bars) noexcept {
+    return bars == Bars::scope ? std::min(1.0f, f.view_aspect / scope_aspect) : 1.0f;
+}
+} // namespace
+
+namespace {
+// How far a picture's see-through middle reaches along a direction in the picture's own units (x, y 0 and up).
+float picture_reach(const Hole& hole, float ox, float oy) noexcept {
+    const float k = std::atan2(std::abs(oy), std::abs(ox)) / (pi * 0.5f) * static_cast<float>(hole_steps);
+    const int i = std::clamp(static_cast<int>(k), 0, static_cast<int>(hole_steps) - 1);
+    const float t = std::clamp(k - static_cast<float>(i), 0.0f, 1.0f);
+    return hole.radius[static_cast<std::size_t>(i)] + (hole.radius[static_cast<std::size_t>(i) + 1] - hole.radius[static_cast<std::size_t>(i)]) * t;
+}
+} // namespace
+
+Frame frame_for(const Settings& s, float screen_aspect, float fov, const Hole* hole) {
+    Frame f;
+    f.fisheye = lens_on(s);
+    f.fov = std::clamp(fov, 0.05f, 3.0f);
+    f.source_aspect = std::clamp(screen_aspect, 0.5f, 4.0f);
+    f.view_aspect = s.bars == Bars::four_three ? 4.0f / 3.0f : f.source_aspect;
+    f.zoom = std::max(s.zoom, 1.0f);
+    f.circle = std::clamp(s.circle, 0.5f, 3.0f);
+    f.squeeze = std::clamp(std::isfinite(s.squeeze) ? s.squeeze : 1.0f, 0.5f, 2.0f);
+    f.fit_to_lens = s.fov_mode == FovMode::automatic;
+    f.ease = std::clamp(std::isfinite(s.compress) ? s.compress : 0.0f, 0.0f, 0.5f) / (pi * 0.5f);
+    // The overlay, at its size: its dark edge reaches in from the window's corner hood_size times as far as drawn
+    // (a picture drawn larger about the middle; the circle's edge moved out).
+    const float corner = std::sqrt(f.view_aspect * f.view_aspect + 1.0f);
+    const float size = std::clamp(std::isfinite(s.hood_size) ? s.hood_size : 1.0f, 0.0f, 2.0f);
+    const auto sized = [&](float drawn) { return drawn < corner ? std::max(corner - size * (corner - drawn), 0.05f) : drawn; };
+    if (s.enabled && s.hood == Hood::picture && hole && hole->known) {
+        f.hole = *hole;
+        // Along the window's diagonal (the picture's own (1, 1)), where the corner's dark edge is drawn.
+        const float drawn = picture_reach(f.hole, 1.0f, 1.0f) * corner / std::sqrt(2.0f);
+        if (drawn > 1e-3f) f.hood_scale = sized(drawn) / drawn;
+    } else if (s.enabled && s.hood == Hood::circle) {
+        f.hood_circle = sized(f.circle);
+    }
+    f.fit_to_hood = s.enabled && s.hood_fit && s.hood != Hood::none;
+    // The projection, and the scale that puts 90 degrees at the image circle (equisolid: f = circle / sqrt 2,
+    // K = sqrt 2 / circle).
+    f.curve = std::clamp(std::isfinite(s.curve) ? s.curve : 1.0f, 0.0f, 2.0f);
+    f.scale = (f.curve >= 1.0f ? curve_radius(f.curve, pi * 0.5f) : pi * 0.5f) / f.circle;
+    if (f.curve > 1.001f) {
+        // Bent past equidistant, a lens runs out of angle (asin's 1) a little beyond its 90 degrees: never
+        // inside what shows (the window, or what the overlay leaves showing), where it would smear. Only a strongly
+        // bent lens on a wide window meets this (the Mk1 past about 160% without 4:3 bars).
+        // (Furthest as the lens sees it: across, times the squeeze.)
+        float furthest = 0.0f;
+        for (int i = 0; i <= 64; ++i) {
+            const float phi = static_cast<float>(i) * (pi * 0.5f / 64.0f);
+            const float dx = std::cos(phi), dy = std::sin(phi);
+            furthest = std::max(furthest, visible_radius(f, dx, dy) * std::sqrt(dx * dx * f.squeeze * f.squeeze + dy * dy));
+        }
+        f.scale = std::min(f.scale, 0.98f / ((f.curve - 1.0f) * furthest));
+    }
+    return f;
+}
+
+std::array<float, 2> window(const Frame& f) {
+    const float inner = f.view_aspect, outer = f.source_aspect;
+    return outer > inner ? std::array<float, 2>{inner / outer, 1.0f} : std::array<float, 2>{1.0f, outer / inner};
+}
+
+std::array<float, 2> tangents(const Frame& f) {
+    const float t = std::tan(f.fov * 0.5f);
+    return {t * f.source_aspect, t};
+}
+
+float curve_angle(float curve, float x) noexcept {
+    if (curve < 0.999f) {
+        const float a = 1.0f - curve;
+        return std::atan(a * x) / a;
+    }
+    if (curve > 1.001f) {
+        const float b = curve - 1.0f;
+        return std::asin(std::min(b * x, 1.0f)) / b;
+    }
+    return x;
+}
+float curve_radius(float curve, float theta) noexcept {
+    if (curve < 0.999f) {
+        const float a = 1.0f - curve;
+        return std::tan(std::min(a * theta, 1.5607f)) / a;
+    }
+    if (curve > 1.001f) {
+        const float b = curve - 1.0f;
+        return std::sin(std::min(b * theta, lens::pi * 0.5f)) / b;
+    }
+    return theta;
+}
+float theta(const Frame& f, float r, float fit) {
+    const float x = f.scale * r;
+    return f.scales_angles() ? fit * curve_angle(f.curve, x) : curve_angle(f.curve, fit * x);
+}
+
+float visible_radius(const Frame& f, float ux, float uy) noexcept {
+    float rb = std::min(f.view_aspect / std::max(ux, 1e-5f), 1.0f / std::max(uy, 1e-5f));
+    if (f.fit_to_hood) {
+        if (f.hood_circle > 0) {
+            rb = std::min(rb, f.hood_circle);
+        } else if (f.hole.known) {
+            // The picture spans the window: a point (q) is at (qx / view aspect, qy) of it, over its size.
+            const float ox = ux / f.view_aspect, oy = uy;
+            rb = std::min(rb, picture_reach(f.hole, ox, oy) * f.hood_scale / std::max(std::sqrt(ox * ox + oy * oy), 1e-6f));
+        }
+    }
+    return rb;
+}
+
+float fit(const Frame& f) {
+    if (!f.fisheye) return 1.0f;
+    const auto tg = tangents(f);
+    // A true fisheye (its own curve or more) sees no wider than the real lens (fit 1: 90 degrees at its image
+    // circle). A lens bent less than that may take in all the game drew: at no bend at all the picture is the
+    // game's own. (Auto: no more than the whole lens zoomed, which its field of view was picked for.)
+    float best = f.fit_to_lens ? 1.0f / std::max(f.zoom, 1.0f) : f.curve >= 1.0f ? 1.0f : 1.0f / std::max(f.curve * f.curve, 1e-4f);
+    const float va = f.view_aspect;
+    const auto consider = [&](float phi) {
+        const float dx = std::cos(phi), dy = std::sin(phi);
+        const float rb = visible_radius(f, dx, dy);
+        // The point the lens sees (across, times the squeeze): how far out, and which way the game's
+        // frustum is met.
+        const float lx = dx * f.squeeze, ly = dy, n = std::sqrt(lx * lx + ly * ly);
+        const float ux = lx / std::max(n, 1e-6f), uy = ly / std::max(n, 1e-6f);
+        const float lim = std::atan(std::min(tg[0] / std::max(ux, 1e-5f), tg[1] / std::max(uy, 1e-5f)) * 0.998f);
+        const float rl = rb * n;
+        if (rl <= 1e-6f) return;
+        // The angle the lens may see there before its edge compression: what the compression brings to lim
+        // (th (1 - ease th) = lim, the nearer root; compressed this hard, nothing it sees leaves the picture).
+        const float room = 1.0f - 4.0f * f.ease * lim;
+        if (room <= 0.0f) return;
+        const float allowed = 2.0f * lim / (1.0f + std::sqrt(room));
+        if (f.scales_angles()) {
+            // The angle the frustum allows over the angle the lens sees there.
+            const float th = curve_angle(f.curve, f.scale * rl);
+            if (th > 1e-6f) best = std::min(best, allowed / th);
+        } else {
+            // The focal length at which this edge point sees just the frustum's edge.
+            best = std::min(best, curve_radius(f.curve, allowed) / (f.scale * rl));
+        }
+    };
+    // Every way round the quarter, and exactly where what shows has its corners (the fit is tightest there): the
+    // window's corner; where the overlay's edge meets the window's top and its side; and a picture's measured
+    // directions, between which its edge is taken as straight.
+    constexpr int steps = 256;
+    for (int i = 0; i <= steps; ++i) consider(static_cast<float>(i) * (pi * 0.5f / steps));
+    consider(std::atan2(1.0f, va));
+    if (f.fit_to_hood && f.hood_circle > 0) {
+        const float hc = f.hood_circle;
+        if (hc > 1.0f && hc * hc - 1.0f < va * va) consider(std::atan2(1.0f, std::sqrt(hc * hc - 1.0f)));
+        if (hc > va && hc * hc - va * va < 1.0f) consider(std::atan2(std::sqrt(hc * hc - va * va), va));
+    } else if (f.fit_to_hood && f.hole.known) {
+        // In the picture's own units (it spans the window hood_scale times over) the window's edges are at 1 / scale;
+        // a direction there (psi) is this one in the picture (q).
+        const float edge = 1.0f / std::max(f.hood_scale, 1e-3f);
+        const auto in_q = [&](float psi) { return std::atan2(std::sin(psi), va * std::cos(psi)); };
+        constexpr float segment = pi * 0.5f / static_cast<float>(hole_steps);
+        for (std::size_t k = 0; k <= hole_steps; ++k) {
+            const float psi = static_cast<float>(k) * segment;
+            consider(in_q(psi)); // (each a corner, however slight, of its edge taken as straight between them)
+            if (k == hole_steps) break;
+            for (const bool top : {true, false}) {
+                // Where its edge crosses the window's top (reach sin psi = edge) or side (reach cos psi = edge).
+                const auto past = [&](float at) {
+                    return picture_reach(f.hole, std::cos(at), std::sin(at)) * (top ? std::sin(at) : std::cos(at)) > edge;
+                };
+                float a = psi, b = psi + segment;
+                const bool from = past(a);
+                if (past(b) == from) continue;
+                for (int i = 0; i < 24; ++i) {
+                    const float m = 0.5f * (a + b);
+                    (past(m) == from ? a : b) = m;
+                }
+                consider(in_q(a));
+                consider(in_q(b));
+            }
+        }
+    }
+    return f.fit_to_lens ? best : best / std::max(f.zoom, 1.0f);
+}
+
+// ---- Settings saved before 2026-11-17 ("true angles") --------------------------------------------------
+// The lens as it was then (frame_for, fit and true_ease of that version, word for word): it picked its own fit,
+// allowing true_allowance more angle at the edge of what shows than the game's picture reached, and an ease
+// that took just that back; the hood was a fixed ellipse (the image circle, stretched with the overlay
+// across the window). Only to read such settings as they drew (legacy_true_angles).
+namespace {
+constexpr float legacy_allowance = 1.12f;
+constexpr float legacy_hood_radius = 1.54f, legacy_hood_span = 720.0f / 704.0f;
+struct LegacyFrame {
+    float fov{}, source_aspect{}, view_aspect{}, zoom{}, circle{}, curve{}, scale{}, squeeze{};
+    bool fit_to_lens{};
+    float limit_x = 0, limit_y = 0;
+    bool scales_angles() const noexcept { return curve >= 1.0f; }
+};
+std::array<float, 2> legacy_tangents(const LegacyFrame& f) {
+    const float t = std::tan(f.fov * 0.5f);
+    return {t * f.source_aspect, t};
+}
+LegacyFrame legacy_frame(const Settings& s, bool mk1_hood, float screen_aspect, float fov) {
+    LegacyFrame f;
+    f.fov = std::clamp(fov, 0.05f, 3.0f);
+    f.source_aspect = std::clamp(screen_aspect, 0.5f, 4.0f);
+    f.view_aspect = s.bars == Bars::four_three ? 4.0f / 3.0f : f.source_aspect;
+    f.zoom = std::max(s.zoom, 1.0f);
+    f.circle = std::clamp(s.circle, 0.5f, 3.0f);
+    f.squeeze = std::clamp(std::isfinite(s.squeeze) ? s.squeeze : 1.0f, 0.5f, 2.0f);
+    f.fit_to_lens = s.fov_mode == FovMode::automatic;
+    if (s.hood_fit) {
+        if (mk1_hood) {
+            f.limit_x = legacy_hood_radius * f.view_aspect / (4.0f / 3.0f) / legacy_hood_span;
+            f.limit_y = legacy_hood_radius;
+        } else if (s.hood == Hood::circle) {
+            f.limit_x = f.limit_y = f.circle;
+        }
+    }
+    f.curve = std::clamp(std::isfinite(s.curve) ? s.curve : 1.0f, 0.0f, 2.0f);
+    f.scale = (f.curve >= 1.0f ? curve_radius(f.curve, pi * 0.5f) : pi * 0.5f) / f.circle;
+    if (f.curve > 1.001f) {
+        const float across = f.view_aspect * f.squeeze;
+        float furthest = std::sqrt(across * across + 1.0f);
+        if (f.limit_x > 0 && f.limit_y > 0) furthest = std::min(furthest, std::max(f.limit_x * f.squeeze, f.limit_y));
+        f.scale = std::min(f.scale, 0.98f / ((f.curve - 1.0f) * furthest));
+    }
+    return f;
+}
+float legacy_theta(const LegacyFrame& f, float r, float fit) {
+    const float x = f.scale * r;
+    return f.scales_angles() ? fit * curve_angle(f.curve, x) : curve_angle(f.curve, fit * x);
+}
+float legacy_fit(const LegacyFrame& f) {
+    const auto tg = legacy_tangents(f);
+    const float va = f.view_aspect;
+    float best = f.fit_to_lens ? 1.0f / std::max(f.zoom, 1.0f) : f.curve >= 1.0f ? 1.0f : 1.0f / std::max(f.curve * f.curve, 1e-4f);
+    std::array<float, 69> directions{};
+    for (int i = 0; i <= 64; ++i) directions[static_cast<std::size_t>(i)] = static_cast<float>(i) * (pi * 0.5f / 64.0f);
+    directions[65] = std::atan2(1.0f, va);
+    directions[66] = directions[67] = directions[68] = directions[65];
+    if (f.limit_x > 0 && f.limit_y > 0) {
+        if (f.limit_y > 1.0f) directions[66] = std::atan2(1.0f, f.limit_x * std::sqrt(1.0f - 1.0f / (f.limit_y * f.limit_y)));
+        if (f.limit_x > va) directions[67] = std::atan2(f.limit_y * std::sqrt(1.0f - (va * va) / (f.limit_x * f.limit_x)), va);
+    }
+    for (const float phi : directions) {
+        const float dx = std::cos(phi), dy = std::sin(phi);
+        float rb = std::min(va / std::max(dx, 1e-5f), 1.0f / std::max(dy, 1e-5f));
+        if (f.limit_x > 0 && f.limit_y > 0) {
+            const float ex = dx / f.limit_x, ey = dy / f.limit_y;
+            rb = std::min(rb, 1.0f / std::sqrt(ex * ex + ey * ey));
+        }
+        const float lx = dx * f.squeeze, ly = dy, n = std::sqrt(lx * lx + ly * ly);
+        const float ux = lx / std::max(n, 1e-6f), uy = ly / std::max(n, 1e-6f);
+        const float limit = std::min(tg[0] / std::max(ux, 1e-5f), tg[1] / std::max(uy, 1e-5f)) * 0.998f;
+        const float rl = rb * n;
+        if (rl <= 1e-6f) continue;
+        if (f.scales_angles()) {
+            const float th = curve_angle(f.curve, f.scale * rl);
+            if (th > 1e-6f) best = std::min(best, legacy_allowance * std::atan(limit) / th);
+        } else {
+            best = std::min(best, curve_radius(f.curve, std::atan(limit)) / (f.scale * rl));
+        }
+    }
+    return f.fit_to_lens ? best : best / std::max(f.zoom, 1.0f);
+}
+float legacy_ease(const LegacyFrame& f, float fit) noexcept {
+    if (!f.scales_angles()) return 0.0f;
+    const auto tg = legacy_tangents(f);
+    const float va = f.view_aspect;
+    float ease = 0.0f;
+    constexpr int steps = 512;
+    for (int i = 0; i <= steps + 2; ++i) {
+        float phi = static_cast<float>(std::min(i, steps)) * (pi * 0.5f / steps);
+        if (i == steps + 1) phi = std::atan2(1.0f, va);
+        if (i == steps + 2 && f.limit_x > 0 && f.limit_y > 0 && f.limit_x > va)
+            phi = std::atan2(f.limit_y * std::sqrt(1.0f - (va * va) / (f.limit_x * f.limit_x)), va);
+        const float ux = std::cos(phi), uy = std::sin(phi);
+        float rb = std::min(va / std::max(ux, 1e-5f), 1.0f / std::max(uy, 1e-5f));
+        if (f.limit_x > 0 && f.limit_y > 0) {
+            const float ex = ux / f.limit_x, ey = uy / f.limit_y;
+            rb = std::min(rb, 1.0f / std::sqrt(ex * ex + ey * ey));
+        }
+        const float lx = ux * f.squeeze, ly = uy, n = std::sqrt(lx * lx + ly * ly);
+        const float lim = std::atan(std::min(tg[0] / std::max(lx / n, 1e-5f), tg[1] / std::max(ly / n, 1e-5f)) * 0.998f);
+        const float vis = legacy_theta(f, rb * n, fit);
+        if (vis > lim && vis > 1e-4f) ease = std::max(ease, (1.0f - lim / vis) / vis);
+    }
+    return ease;
+}
+} // namespace
+
+Legacy legacy_true_angles(const Settings& s, bool mk1_hood, float screen_aspect) noexcept {
+    Legacy out;
+    try {
+        float fov = s.fov_mode == FovMode::fixed ? s.fov * pi / 180.0f : 65.0f * pi / 180.0f;
+        if (s.fov_mode == FovMode::automatic) {
+            // Its Auto then: the narrowest field of view at which the whole lens (zoomed) shows.
+            const float most = std::clamp(s.fov_widest, 30.0f, 170.0f) * pi / 180.0f;
+            const auto full = [&](float v) {
+                const auto f = legacy_frame(s, mk1_hood, screen_aspect, v);
+                return legacy_fit(f) * f.zoom >= 0.999f;
+            };
+            fov = most;
+            if (full(most)) {
+                float low = 20.0f * pi / 180.0f, high = most;
+                if (full(low)) {
+                    high = low;
+                } else {
+                    for (int i = 0; i < 24; ++i) {
+                        const float mid = (low + high) * 0.5f;
+                        (full(mid) ? high : low) = mid;
+                    }
+                }
+                fov = high;
+            }
+        }
+        const auto f = legacy_frame(s, mk1_hood, screen_aspect, fov);
+        const float fit = legacy_fit(f);
+        out.compress = std::clamp(legacy_ease(f, fit) * (pi * 0.5f), 0.0f, 0.5f);
+        out.zoom = std::clamp(fit > 1e-3f ? 1.0f / fit : 1.0f, 1.0f, 2.0f);
+    } catch (...) {
+        out = {};
+    }
+    return out;
+}
+
+Hole measure_hole(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) noexcept {
+    Hole hole;
+    if (!rgba || width < 8 || height < 8) return hole;
+    // 1 opaque (alpha half or more), 0 see-through, -1 off the picture; (u, v) its own -1..1, v up.
+    const auto at = [&](float u, float v) {
+        const float x = (u + 1.0f) * 0.5f * static_cast<float>(width), y = (1.0f - v) * 0.5f * static_cast<float>(height);
+        if (!(x >= 0.0f && y >= 0.0f && x < static_cast<float>(width) && y < static_cast<float>(height))) return -1;
+        return rgba[(static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)) * 4 + 3] >= 128 ? 1 : 0;
+    };
+    if (at(0.0f, 0.0f) != 0) return hole; // nothing to see through in the middle
+    // Out from the middle in each direction in each quarter, half a pixel at a time: the nearest it turns opaque.
+    const float step = 0.5f / static_cast<float>(std::max(width, height)) * 2.0f;
+    for (std::size_t k = 0; k <= hole_steps; ++k) {
+        const float psi = static_cast<float>(k) * (pi * 0.5f / static_cast<float>(hole_steps)), cu = std::cos(psi), sv = std::sin(psi);
+        float nearest = 4.0f;
+        for (const float sx : {1.0f, -1.0f})
+            for (const float sy : {1.0f, -1.0f})
+                for (float t = step; t < 2.0f; t += step) {
+                    const int o = at(sx * t * cu, sy * t * sv);
+                    if (o < 0) break; // see-through to the picture's edge
+                    if (o > 0) {
+                        nearest = std::min(nearest, t);
+                        break;
+                    }
+                }
+        hole.radius[k] = nearest;
+    }
+    hole.known = true;
+    return hole;
+}
+
+std::array<float, 2> to_game(const Frame& f, float scale, float qx, float qy) {
+    const auto tg = tangents(f);
+    if (!f.fisheye) return {0.5f + 0.5f * qx / f.source_aspect, 0.5f - 0.5f * qy};
+    qx *= f.squeeze;
+    const float r = std::max(std::sqrt(qx * qx + qy * qy), 1e-6f);
+    float th0 = theta(f, r, scale);
+    if (f.ease > 0) {
+        // Edge compression: eased in, level past where it would turn back (far beyond anything that shows).
+        const float top = 0.5f / f.ease;
+        th0 = th0 < top ? th0 * (1.0f - f.ease * th0) : 0.25f / f.ease;
+    }
+    const float th = std::min(th0, most_theta);
+    const float k = std::tan(th) / r;
+    return {0.5f + 0.5f * qx * k / tg[0], 0.5f - 0.5f * qy * k / tg[1]};
+}
+
+std::array<float, 2> hood_uv(const Frame& f, float qx, float qy) {
+    const float s = std::max(f.hood_scale, 1e-3f);
+    return {0.5f + 0.5f * qx / (f.view_aspect * s), 0.5f - 0.5f * qy / s};
+}
+
+float centre_zoom(const Frame& f, float fit) {
+    // Near the middle every projection sees theta = fit K r (the fit scales the angles or the focal
+    // length, alike there): the picture's half-height spans fit K radians, the game's tan(fov / 2).
+    if (!f.fisheye || fit <= 0 || f.scale <= 0) return 1.0f;
+    return std::tan(f.fov * 0.5f) / (fit * f.scale);
+}
+float auto_fov(const Settings& s, float screen_aspect, float widest, const Hole* hole) {
+    const float most = std::clamp(widest, 30.0f, 170.0f) * pi / 180.0f;
+    if (!lens_on(s)) return most;
+    Settings a = s;
+    a.fov_mode = FovMode::automatic;
+    const auto full = [&](float fov) {
+        const auto f = frame_for(a, screen_aspect, fov, hole);
+        return fit(f) * f.zoom >= 0.9999f;
+    };
+    if (!full(most)) return most;
+    float low = 20.0f * pi / 180.0f, high = most;
+    if (full(low)) return low;
+    for (int i = 0; i < 24; ++i) {
+        const float mid = (low + high) * 0.5f;
+        (full(mid) ? high : low) = mid;
+    }
+    return high;
+}
+
+Glass glass_for(const Settings& s) {
+    Glass g;
+    if (!lens_on(s)) return g;
+    g.fringe = std::clamp(s.fringe, 0.0f, 4.0f);
+    g.shade = std::clamp(s.shade, 0.0f, 3.0f);
+    g.glare = std::clamp(std::isfinite(s.glare) ? s.glare : 0.0f, 0.0f, 3.0f) * glare_light;
+    g.soft = std::clamp(s.soft, 0.0f, 1.0f);
+    return g;
+}
+
+Grade grade_for(const Settings& s) {
+    Grade g;
+    if (!s.enabled) return g;
+    g.exposure = s.exposure;
+    g.contrast = s.contrast;
+    g.saturation = s.saturation;
+    g.warmth = s.warmth;
+    g.tint = s.tint;
+    g.black = s.black;
+    g.vignette = s.vignette;
+    g.camera = s.camera;
+    g.camera_gamma = std::clamp(s.camera_gamma, 0.1f, 1.0f);
+    g.camera_knee = std::clamp(s.camera_knee, 0.0f, 2.0f);
+    g.camera_knee_slope = std::clamp(s.camera_knee_slope, 0.0f, 1.0f);
+    g.camera_black = std::clamp(s.camera_black, -0.5f, 0.5f);
+    g.camera_clip = std::clamp(s.camera_clip, 0.5f, 2.0f);
+    g.camera_colour = std::clamp(s.camera_colour, 0.0f, 3.0f);
+    g.vignette_soft = s.vignette_soft;
+    g.vignette_round = s.vignette_round;
+    g.hue = s.hue;
+    g.filter = s.filter;
+    g.filter_hue = s.filter_hue;
+    g.lift = s.lift;
+    g.gamma = s.gamma;
+    g.gain = s.gain;
+    g.split_shadows = s.split_shadows;
+    g.split_shadows_hue = s.split_shadows_hue;
+    g.split_highlights = s.split_highlights;
+    g.split_highlights_hue = s.split_highlights_hue;
+    g.split_balance = s.split_balance;
+    g.grain = s.grain;
+    g.grain_size = s.grain_size;
+    return g;
+}
+
+std::array<float, 3> hue_colour(float degrees) noexcept {
+    float h = std::fmod(degrees, 360.0f);
+    if (h < 0) h += 360.0f;
+    h /= 60.0f;
+    const auto channel = [&](float offset) { return clamp01(std::abs(std::fmod(h + offset, 6.0f) - 3.0f) - 1.0f); };
+    return {channel(0.0f), channel(4.0f), channel(2.0f)};
+}
+std::array<float, 9> colour_matrix(const Grade& g) noexcept {
+    // The hue turned about the grey axis, keeping Rec.709 brightness (SVG's hueRotate, with Rec.709's weights).
+    const float a = g.hue * pi / 180.0f, c = std::cos(a), s = std::sin(a);
+    const float lr = 0.2126f, lg = 0.7152f, lb = 0.0722f;
+    const std::array<float, 9> h{lr + c * (1 - lr) - s * lr,        lg - c * lg - s * lg,         lb - c * lb + s * (1 - lb),
+                                 lr - c * lr + s * 0.143f,          lg + c * (1 - lg) + s * 0.140f, lb - c * lb - s * 0.283f,
+                                 lr - c * lr - s * (1 - lr),        lg - c * lg + s * lg,         lb + c * (1 - lb) + s * lb};
+    // Then the saturation, about the same brightness.
+    const float k = g.saturation;
+    const std::array<float, 9> sat{lr + (1 - lr) * k, lg - lg * k,       lb - lb * k,
+                                   lr - lr * k,       lg + (1 - lg) * k, lb - lb * k,
+                                   lr - lr * k,       lg - lg * k,       lb + (1 - lb) * k};
+    std::array<float, 9> m{};
+    for (int r = 0; r < 3; ++r)
+        for (int col = 0; col < 3; ++col) {
+            float v = 0;
+            for (int i = 0; i < 3; ++i) v += sat[static_cast<std::size_t>(r * 3 + i)] * h[static_cast<std::size_t>(i * 3 + col)];
+            m[static_cast<std::size_t>(r * 3 + col)] = v;
+        }
+    return m;
+}
+std::array<float, 3> filter_gains(const Grade& g) noexcept {
+    std::array<float, 3> f{1, 1, 1};
+    if (g.filter > 0) {
+        const auto colour = hue_colour(g.filter_hue);
+        for (std::size_t i = 0; i < 3; ++i) f[i] = 1.0f + (colour[i] - 1.0f) * std::clamp(g.filter, 0.0f, 1.0f);
+        const float y = std::max(0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2], 1e-3f);
+        for (auto& v : f) v /= y;
+    }
+    const auto wb = balance(g.warmth, g.tint);
+    return {f[0] * wb[0], f[1] * wb[1], f[2] * wb[2]};
+}
+std::array<float, 3> split_offset(float hue, float amount) noexcept {
+    if (!(amount > 0)) return {0, 0, 0};
+    const auto colour = hue_colour(hue);
+    const float y = 0.2126f * colour[0] + 0.7152f * colour[1] + 0.0722f * colour[2];
+    const float k = 0.22f * std::clamp(amount, 0.0f, 1.0f);
+    return {(colour[0] - y) * k, (colour[1] - y) * k, (colour[2] - y) * k};
+}
+float vignette_edge(const Grade& g, float qx, float qy, float va) noexcept {
+    const float round = std::sqrt(qx * qx + qy * qy) / std::sqrt(va * va + 1.0f);
+    const float sx = qx / std::max(va, 1e-3f);
+    const float own = std::sqrt(sx * sx + qy * qy) / std::sqrt(2.0f);
+    const float k = clamp01(g.vignette_round);
+    return own + (round - own) * k;
+}
+float vignette_power(float soft) noexcept { return 2.5f * std::exp2((0.5f - clamp01(soft)) * 2.0f); }
+float grain_noise(float x, float y, float size, float seed) noexcept {
+    // Dave Hoskins's hash12, on cells of `size` pixels, smoothly between them (as the shader).
+    const auto hash = [](float px, float py) {
+        float a = px * 0.1031f, b = py * 0.1031f, c = px * 0.1031f;
+        a -= std::floor(a);
+        b -= std::floor(b);
+        c -= std::floor(c);
+        const float d = a * (b + 33.33f) + b * (c + 33.33f) + c * (a + 33.33f);
+        a += d;
+        b += d;
+        c += d;
+        const float v = (a + b) * c;
+        return v - std::floor(v);
+    };
+    const float cell = std::max(size, 0.5f);
+    const float gx = x / cell + seed * 17.0f, gy = y / cell + seed * 59.0f;
+    const float ix = std::floor(gx), iy = std::floor(gy);
+    float fx = gx - ix, fy = gy - iy;
+    fx = fx * fx * (3.0f - 2.0f * fx);
+    fy = fy * fy * (3.0f - 2.0f * fy);
+    const float a = hash(ix, iy), b = hash(ix + 1, iy), c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+    const float v = (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
+    // Smoothing between cells lowers the spread: brought back for coarse grain.
+    return (v - 0.5f) * (1.0f + 0.7f * clamp01(cell - 1.0f));
+}
+
+std::array<float, 3> balance(float warmth, float tint) {
+    float r = (1.0f + 0.18f * warmth) * (1.0f + 0.05f * tint);
+    float g = 1.0f - 0.15f * tint;
+    float b = (1.0f - 0.22f * warmth) * (1.0f + 0.05f * tint);
+    const float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    return {r / y, g / y, b / y};
+}
+
+float srgb_to_linear(float v) noexcept {
+    v = std::max(v, 0.0f);
+    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+float linear_to_srgb(float v) noexcept {
+    v = std::max(v, 0.0f);
+    return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+}
+
+float inverse_filmic(float y) noexcept {
+    y = std::clamp(y, 0.0f, 0.995f);
+    const float a = 2.43f * y - 2.51f, b = 0.59f * y - 0.03f, c = 0.14f * y;
+    return (-b - std::sqrt(std::max(b * b - 4.0f * a * c, 0.0f))) / (2.0f * a);
+}
+float camera_toe_slope(float gamma) noexcept {
+    if (gamma == 0.45f) return 4.5f;
+    const float here = 1.099f * std::pow(0.018f, gamma) - 0.099f, rec709 = 1.099f * std::pow(0.018f, 0.45f) - 0.099f;
+    return 4.5f * here / rec709;
+}
+std::array<float, 3> camera_curve(const Grade& g, std::array<float, 3> l) noexcept {
+    const float toe = camera_toe_slope(g.camera_gamma);
+    for (auto& v : l) {
+        v = std::max(v, 0.0f);
+        v = v < 0.018f ? toe * v : 1.099f * std::pow(v, g.camera_gamma) - 0.099f;
+        if (v > g.camera_knee) v = g.camera_knee + (v - g.camera_knee) * g.camera_knee_slope;
+        v = std::min((v + g.camera_black) / (1.0f + g.camera_black), g.camera_clip);
+    }
+    const float y = 0.2126f * l[0] + 0.7152f * l[1] + 0.0722f * l[2];
+    for (auto& v : l) v = clamp01(y + (v - y) * g.camera_colour);
+    return l;
+}
+
+std::array<float, 3> graded(const Grade& g, std::array<float, 3> c, float edge, float shade, float glare) {
+    if (g.camera)
+        for (auto& v : c) v = inverse_filmic(v) * shade + glare;
+    else
+        for (auto& v : c) v = v * shade + glare;
+    const float gain = std::exp2(g.exposure);
+    const auto wb = filter_gains(g); // white balance and the colour filter
+    for (int i = 0; i < 3; ++i) c[i] = std::max(c[i] * gain * wb[i], 0.0f);
+    if (g.contrast != 1.0f)
+        for (auto& v : c) v = 0.18f * std::pow(std::max(v, 1e-6f) / 0.18f, g.contrast);
+    // The hue and the saturation.
+    const auto m = colour_matrix(g);
+    const std::array<float, 3> in = c;
+    for (int r = 0; r < 3; ++r) {
+        const auto row = static_cast<std::size_t>(r * 3);
+        c[static_cast<std::size_t>(r)] = std::max(m[row] * in[0] + m[row + 1] * in[1] + m[row + 2] * in[2], 0.0f);
+    }
+    if (g.vignette > 0) {
+        const float darken = 1.0f - 0.9f * g.vignette * std::pow(clamp01(edge), vignette_power(g.vignette_soft));
+        for (auto& v : c) v *= darken;
+    }
+    if (g.camera) {
+        c = camera_curve(g, c);
+        for (auto& v : c) v = srgb_to_linear(v);
+    }
+    // On the picture's values: lift, gamma and gain, split toning, faded blacks.
+    if (g.tones() || g.black > 0) {
+        std::array<float, 3> p{linear_to_srgb(c[0]), linear_to_srgb(c[1]), linear_to_srgb(c[2])};
+        if (g.lift != 0 || g.gain != 1 || g.gamma != 1)
+            for (auto& v : p) {
+                v = std::max(v * g.gain + g.lift * (1.0f - v), 0.0f);
+                if (g.gamma != 1) v = std::pow(v, 1.0f / std::max(g.gamma, 0.05f));
+            }
+        if (g.split_shadows > 0 || g.split_highlights > 0) {
+            const auto low = split_offset(g.split_shadows_hue, g.split_shadows), high = split_offset(g.split_highlights_hue, g.split_highlights);
+            const float lum = 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+            const float pivot = 0.5f - 0.35f * std::clamp(g.split_balance, -1.0f, 1.0f);
+            const float w = smoothstep(pivot - 0.35f, pivot + 0.35f, lum);
+            for (std::size_t i = 0; i < 3; ++i) p[i] = std::max(p[i] + low[i] * (1.0f - w) + high[i] * w, 0.0f);
+        }
+        if (g.black > 0)
+            for (auto& v : p) v = g.black + v * (1.0f - g.black);
+        for (std::size_t i = 0; i < 3; ++i) c[i] = srgb_to_linear(p[i]);
+    }
+    return c;
+}
+
+Finish finish_for(const Settings& s, float screen_aspect, float fov, const Hole* hole) {
+    Finish f;
+    f.frame = frame_for(s, screen_aspect, fov, hole);
+    f.fit = fit(f.frame);
+    f.glass = glass_for(s);
+    f.grade = grade_for(s);
+    f.bars = s.enabled ? s.bars : Bars::none;
+    f.hood = s.enabled ? s.hood : Hood::none;
+    f.hood_opacity = clamp01(s.hood_opacity);
+    return f;
+}
+
+bool changes(const Finish& f) noexcept {
+    return f.frame.fisheye || !f.grade.identity() || !f.glass.none() || f.bars != Bars::none ||
+           (f.hood != Hood::none && f.hood_opacity > 0 && (f.hood == Hood::circle || f.texture.rgba));
+}
+
+namespace {
+// The trace of every pixel of a picture back into the game's, kept while nothing about it changes
+// (most exports film one lens at one field of view throughout).
+struct Trace {
+    std::uint32_t width{}, height{};
+    Frame frame;
+    float fit{};
+    Bars bars{};
+    std::vector<float> uv;   // two per pixel: where in the game's picture (in its pixels); x < -1e8: black
+    std::vector<float> foot; // two per pixel: how many of the game's pixels one of ours spans, across and up
+};
+std::mutex trace_mutex;
+Trace& trace() {
+    static auto* value = new Trace;
+    return *value;
+}
+bool same(const Frame& a, const Frame& b) noexcept {
+    return a.fisheye == b.fisheye && a.fov == b.fov && a.source_aspect == b.source_aspect && a.view_aspect == b.view_aspect && a.zoom == b.zoom &&
+           a.circle == b.circle && a.curve == b.curve && a.scale == b.scale && a.squeeze == b.squeeze && a.ease == b.ease &&
+           a.fit_to_hood == b.fit_to_hood && a.hole.known == b.hole.known && a.hole.radius == b.hole.radius && a.hood_scale == b.hood_scale &&
+           a.hood_circle == b.hood_circle;
+}
+void build_trace(Trace& t, const Finish& f, std::uint32_t w, std::uint32_t h, unsigned threads) {
+    t.width = w;
+    t.height = h;
+    t.frame = f.frame;
+    t.fit = f.fit;
+    t.bars = f.bars;
+    t.uv.assign(std::size_t{w} * h * 2, 0.0f);
+    t.foot.assign(std::size_t{w} * h * 2, 1.0f);
+    const auto win = window(f.frame);
+    const float va = f.frame.view_aspect;
+    const float half = visible_height(f.frame, f.bars);
+    const bool lens = f.frame.fisheye;
+    const auto rows = [&](std::uint32_t first, std::uint32_t last) {
+        for (std::uint32_t y = first; y < last; ++y)
+            for (std::uint32_t x = 0; x < w; ++x) {
+                const std::size_t at = (std::size_t{y} * w + x) * 2;
+                const float wx = ((static_cast<float>(x) + 0.5f) / static_cast<float>(w) - 0.5f) / win[0] + 0.5f;
+                const float wy = ((static_cast<float>(y) + 0.5f) / static_cast<float>(h) - 0.5f) / win[1] + 0.5f;
+                const float qx = (wx - 0.5f) * 2.0f * va, qy = 1.0f - 2.0f * wy;
+                if (wx < 0 || wx > 1 || wy < 0 || wy > 1 || std::abs(qy) > half) {
+                    t.uv[at] = -1e9f;
+                    continue;
+                }
+                if (!lens) {
+                    t.uv[at] = static_cast<float>(x) + 0.5f;
+                    t.uv[at + 1] = static_cast<float>(y) + 0.5f;
+                    continue;
+                }
+                const float dqx = 2.0f * va / static_cast<float>(w) / win[0], dqy = -2.0f / static_cast<float>(h) / win[1];
+                const auto p = to_game(f.frame, f.fit, qx, qy);
+                const auto px = to_game(f.frame, f.fit, qx + dqx, qy);
+                const auto py = to_game(f.frame, f.fit, qx, qy + dqy);
+                t.uv[at] = p[0] * static_cast<float>(w);
+                t.uv[at + 1] = p[1] * static_cast<float>(h);
+                t.foot[at] = std::hypot((px[0] - p[0]) * static_cast<float>(w), (px[1] - p[1]) * static_cast<float>(h));
+                t.foot[at + 1] = std::hypot((py[0] - p[0]) * static_cast<float>(w), (py[1] - p[1]) * static_cast<float>(h));
+            }
+    };
+    if (threads <= 1 || h < 64) {
+        rows(0, h);
+        return;
+    }
+    std::vector<std::thread> pool;
+    const std::uint32_t each = (h + threads - 1) / threads;
+    for (unsigned i = 0; i < threads; ++i) {
+        const std::uint32_t first = i * each, last = std::min(h, first + each);
+        if (first < last) pool.emplace_back(rows, first, last);
+    }
+    for (auto& thread : pool) thread.join();
+}
+
+struct Luts {
+    std::array<float, 256> decode{};
+    std::array<std::uint8_t, 4097> encode{};
+    Luts() {
+        for (int i = 0; i < 256; ++i) decode[static_cast<std::size_t>(i)] = srgb_to_linear(static_cast<float>(i) / 255.0f);
+        for (int i = 0; i <= 4096; ++i)
+            encode[static_cast<std::size_t>(i)] =
+                static_cast<std::uint8_t>(std::clamp(std::lround(linear_to_srgb(static_cast<float>(i) / 4096.0f) * 255.0f), 0L, 255L));
+    }
+};
+const Luts& luts() {
+    static const Luts value;
+    return value;
+}
+std::uint8_t encode8(float linear) noexcept {
+    const float at = std::clamp(linear, 0.0f, 1.0f) * 4096.0f;
+    return luts().encode[static_cast<std::size_t>(at + 0.5f)];
+}
+
+// Reading the game's picture (the scratch copy): linear light, clamped to its edge.
+struct Source {
+    const std::uint8_t* pixels;
+    std::uint32_t width, height, pitch;
+    std::array<float, 3> texel(int x, int y) const noexcept {
+        x = std::clamp(x, 0, static_cast<int>(width) - 1);
+        y = std::clamp(y, 0, static_cast<int>(height) - 1);
+        const auto* p = pixels + static_cast<std::size_t>(y) * pitch + static_cast<std::size_t>(x) * 4;
+        const auto& d = luts().decode;
+        return {d[p[0]], d[p[1]], d[p[2]]};
+    }
+    std::array<float, 3> bilinear(float x, float y) const noexcept {
+        x -= 0.5f;
+        y -= 0.5f;
+        const float fx = std::floor(x), fy = std::floor(y);
+        const int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
+        const float ax = x - fx, ay = y - fy;
+        const auto a = texel(ix, iy), b = texel(ix + 1, iy), c = texel(ix, iy + 1), d = texel(ix + 1, iy + 1);
+        std::array<float, 3> r{};
+        for (int i = 0; i < 3; ++i) {
+            const auto k = static_cast<std::size_t>(i);
+            r[k] = (a[k] * (1 - ax) + b[k] * ax) * (1 - ay) + (c[k] * (1 - ax) + d[k] * ax) * ay;
+        }
+        return r;
+    }
+    // Catmull-Rom where the picture is enlarged: sharp, and exact at the game's pixels.
+    std::array<float, 3> bicubic(float x, float y) const noexcept {
+        x -= 0.5f;
+        y -= 0.5f;
+        const float fx = std::floor(x), fy = std::floor(y);
+        const int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
+        const auto weights = [](float t) {
+            const float t2 = t * t, t3 = t2 * t;
+            return std::array<float, 4>{-0.5f * t3 + t2 - 0.5f * t, 1.5f * t3 - 2.5f * t2 + 1.0f, -1.5f * t3 + 2.0f * t2 + 0.5f * t,
+                                        0.5f * t3 - 0.5f * t2};
+        };
+        const auto wx = weights(x - fx), wy = weights(y - fy);
+        std::array<float, 3> r{};
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i) {
+                const auto t = texel(ix - 1 + i, iy - 1 + j);
+                const float w = wx[static_cast<std::size_t>(i)] * wy[static_cast<std::size_t>(j)];
+                for (std::size_t k = 0; k < 3; ++k) r[k] += t[k] * w;
+            }
+        for (auto& v : r) v = std::max(v, 0.0f);
+        return r;
+    }
+};
+
+std::array<float, 4> hood_texel(const Hood8& t, float u, float v) noexcept {
+    const float x = std::clamp(u, 0.0f, 1.0f) * static_cast<float>(t.width) - 0.5f;
+    const float y = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(t.height) - 0.5f;
+    const float fx = std::floor(x), fy = std::floor(y);
+    const float ax = x - fx, ay = y - fy;
+    const auto at = [&](int ix, int iy) {
+        ix = std::clamp(ix, 0, static_cast<int>(t.width) - 1);
+        iy = std::clamp(iy, 0, static_cast<int>(t.height) - 1);
+        const auto* p = t.rgba + (static_cast<std::size_t>(iy) * t.width + static_cast<std::size_t>(ix)) * 4;
+        return std::array<float, 4>{p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f, p[3] / 255.0f};
+    };
+    const int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
+    const auto a = at(ix, iy), b = at(ix + 1, iy), c = at(ix, iy + 1), d = at(ix + 1, iy + 1);
+    std::array<float, 4> r{};
+    for (std::size_t k = 0; k < 4; ++k) r[k] = (a[k] * (1 - ax) + b[k] * ax) * (1 - ay) + (c[k] * (1 - ax) + d[k] * ax) * ay;
+    return r;
+}
+} // namespace
+
+void finish(const Finish& f, Picture picture, std::vector<std::uint8_t>& scratch, unsigned threads) noexcept {
+    try {
+        if (!picture.pixels || picture.width < 16 || picture.height < 16 || picture.pitch < picture.width * 4) return;
+        const std::uint32_t w = picture.width, h = picture.height;
+        threads = std::clamp(threads, 1u, 32u);
+        std::lock_guard lock(trace_mutex);
+        auto& t = trace();
+        if (t.width != w || t.height != h || !same(t.frame, f.frame) || t.fit != f.fit || t.bars != f.bars) build_trace(t, f, w, h, threads);
+        const std::size_t bytes = std::size_t{picture.pitch} * h;
+        scratch.resize(bytes);
+        std::memcpy(scratch.data(), picture.pixels, bytes);
+        const Source source{scratch.data(), w, h, picture.pitch};
+        const bool lens = f.frame.fisheye;
+        const auto win = window(f.frame);
+        const float va = f.frame.view_aspect;
+        // The grain's seed: a new one each frame finished.
+        static std::atomic<std::uint32_t> frames_finished{0};
+        const float seed = static_cast<float>(frames_finished.fetch_add(1, std::memory_order_relaxed) % 1024u);
+        // The grade, with the lens's corner shade and glare (which go with it: graded()).
+        const bool grade = !f.grade.identity() || (lens && (f.glass.shade > 0 || f.glass.glare > 0));
+        const bool circle = f.hood == Hood::circle && f.hood_opacity > 0;
+        const bool textured = f.hood == Hood::picture && f.texture.rgba && f.hood_opacity > 0;
+        // Channel order: the hood's texture and the grade's warmth are in red, green, blue.
+        const std::size_t red = picture.bgra ? 2 : 0, blue = picture.bgra ? 0 : 2;
+        // The lens's glass, on what the lens shows (replay_plus.hlsl does the same on the screen): red and
+        // blue a little bigger and smaller about the middle (colour fringe), softer towards the edges
+        // (a wider average blended in, as wide for the picture's height as on a 1080-line one), and the
+        // corners darker.
+        const bool glassy = lens && !f.glass.none();
+        const float to_1080 = static_cast<float>(h) / 1080.0f;
+        const auto glass = [&](std::array<float, 3>& c, float u, float v, float magnified, float qx, float qy) {
+            const float rn = std::sqrt(qx * qx + qy * qy) / (5.0f / 3.0f);
+            if (f.glass.fringe > 0) {
+                // As what moving red out and blue in changes, on the sharp sample: none in the middle.
+                const float d = 0.003f * f.glass.fringe;
+                const auto out = to_game(f.frame, f.fit, qx * (1 + d), qy * (1 + d));
+                const auto in = to_game(f.frame, f.fit, qx * (1 - d), qy * (1 - d));
+                const auto here = source.bilinear(u, v);
+                c[red] = std::max(0.0f, c[red] + source.bilinear(out[0] * static_cast<float>(w), out[1] * static_cast<float>(h))[red] - here[red]);
+                c[blue] = std::max(0.0f, c[blue] + source.bilinear(in[0] * static_cast<float>(w), in[1] * static_cast<float>(h))[blue] - here[blue]);
+            }
+            if (f.glass.soft > 0) {
+                const float spread = f.glass.soft * rn * rn;
+                const float o = 0.5f * magnified * std::exp2(1.0f + 3.0f * spread) * to_1080;
+                std::array<float, 3> blur{};
+                for (const auto& [ox, oy] : {std::pair{-o, -o}, std::pair{o, -o}, std::pair{-o, o}, std::pair{o, o}}) {
+                    const auto b = source.bilinear(u + ox, v + oy);
+                    for (std::size_t k = 0; k < 3; ++k) blur[k] += b[k] * 0.25f;
+                }
+                const float mix = std::clamp(spread * 1.5f, 0.0f, 1.0f);
+                for (std::size_t k = 0; k < 3; ++k) c[k] += (blur[k] - c[k]) * mix;
+            }
+            // (The corner shade and the glare go with the grade: lens::graded.)
+        };
+        const auto rows = [&](std::uint32_t first, std::uint32_t last) {
+            for (std::uint32_t y = first; y < last; ++y) {
+                auto* out = picture.pixels + static_cast<std::size_t>(y) * picture.pitch;
+                for (std::uint32_t x = 0; x < w; ++x) {
+                    const std::size_t at = (std::size_t{y} * w + x) * 2;
+                    auto* px = out + static_cast<std::size_t>(x) * 4;
+                    const float u = t.uv[at];
+                    if (u < -1e8f) {
+                        px[0] = px[1] = px[2] = 0;
+                        continue;
+                    }
+                    const float wx = ((static_cast<float>(x) + 0.5f) / static_cast<float>(w) - 0.5f) / win[0] + 0.5f;
+                    const float wy = ((static_cast<float>(y) + 0.5f) / static_cast<float>(h) - 0.5f) / win[1] + 0.5f;
+                    const float qx = (wx - 0.5f) * 2.0f * va, qy = 1.0f - 2.0f * wy;
+                    std::array<float, 3> c;
+                    if (!lens) {
+                        c = source.texel(static_cast<int>(x), static_cast<int>(y));
+                    } else {
+                        const float v = t.uv[at + 1], fx = t.foot[at], fy = t.foot[at + 1];
+                        if (std::max(fx, fy) <= 1.25f) {
+                            c = source.bicubic(u, v);
+                        } else {
+                            // The footprint of our pixel in the game's: averaged over a grid along it.
+                            const int nx = std::clamp(static_cast<int>(std::ceil(fx)), 1, 6), ny = std::clamp(static_cast<int>(std::ceil(fy)), 1, 6);
+                            const float ux = (t.uv[(std::size_t{y} * w + std::min(x + 1, w - 1)) * 2] - u) * (x + 1 < w ? 1.0f : -1.0f);
+                            const float uxy = (t.uv[(std::size_t{y} * w + std::min(x + 1, w - 1)) * 2 + 1] - v) * (x + 1 < w ? 1.0f : -1.0f);
+                            const std::size_t below = (std::size_t{std::min(y + 1, h - 1)} * w + x) * 2;
+                            const float vx = (t.uv[below] - u) * (y + 1 < h ? 1.0f : -1.0f);
+                            const float vy = (t.uv[below + 1] - v) * (y + 1 < h ? 1.0f : -1.0f);
+                            c = {0, 0, 0};
+                            for (int j = 0; j < ny; ++j)
+                                for (int i = 0; i < nx; ++i) {
+                                    const float oi = (static_cast<float>(i) + 0.5f) / static_cast<float>(nx) - 0.5f;
+                                    const float oj = (static_cast<float>(j) + 0.5f) / static_cast<float>(ny) - 0.5f;
+                                    const auto s = source.bilinear(u + ux * oi + vx * oj, v + uxy * oi + vy * oj);
+                                    for (std::size_t k = 0; k < 3; ++k) c[k] += s[k];
+                                }
+                            const float n = 1.0f / static_cast<float>(nx * ny);
+                            for (auto& value : c) value *= n;
+                        }
+                        if (glassy) glass(c, u, v, std::max({fx, fy, 1.0f}), qx, qy);
+                    }
+                    if (grade) {
+                        // In red, green, blue order for the grade.
+                        std::array<float, 3> rgb{c[red], c[1], c[blue]};
+                        const float rq = std::sqrt(qx * qx + qy * qy);
+                        const float shade = lens && f.glass.shade > 0
+                                                ? std::exp2(-f.glass.shade * std::pow(std::min(rq / (5.0f / 3.0f), 1.5f), 2.5f))
+                                                : 1.0f;
+                        rgb = graded(f.grade, rgb, vignette_edge(f.grade, qx, qy, va), shade, lens ? f.glass.glare : 0.0f);
+                        c[red] = rgb[0];
+                        c[1] = rgb[1];
+                        c[blue] = rgb[2];
+                    }
+                    if (f.grade.grain > 0) {
+                        // Grain, as the shader has it (more in the shadows and midtones).
+                        std::array<float, 3> p{linear_to_srgb(c[0]), linear_to_srgb(c[1]), linear_to_srgb(c[2])};
+                        const float lum = 0.2126f * p[red] + 0.7152f * p[1] + 0.0722f * p[blue];
+                        const float n = grain_noise(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f,
+                                                    std::max(f.grade.grain_size, 0.5f) * static_cast<float>(h) / 1080.0f, seed) *
+                                        f.grade.grain * 0.2f * (1.0f - 0.6f * clamp01(lum));
+                        for (std::size_t k = 0; k < 3; ++k) c[k] = srgb_to_linear(std::max(p[k] + n, 0.0f));
+                    }
+                    if (circle) {
+                        const float r = std::sqrt(qx * qx + qy * qy);
+                        const float dark = smoothstep(f.frame.hood_circle - 0.025f, f.frame.hood_circle + 0.004f, r) * f.hood_opacity;
+                        for (auto& value : c) value *= 1.0f - dark;
+                    }
+                    std::array<std::uint8_t, 3> e{encode8(c[0]), encode8(c[1]), encode8(c[2])};
+                    if (textured) {
+                        const auto uv = hood_uv(f.frame, qx, qy);
+                        const auto o = hood_texel(f.texture, uv[0], uv[1]);
+                        const float a = o[3] * f.hood_opacity;
+                        if (a > 0) {
+                            const std::array<float, 3> in_order{o[red == 0 ? 0 : 2], o[1], o[red == 0 ? 2 : 0]};
+                            for (std::size_t k = 0; k < 3; ++k)
+                                e[k] = static_cast<std::uint8_t>(std::clamp(
+                                    std::lround(static_cast<float>(e[k]) * (1 - a) + in_order[k] * 255.0f * a), 0L, 255L));
+                        }
+                    }
+                    px[0] = e[0];
+                    px[1] = e[1];
+                    px[2] = e[2];
+                }
+            }
+        };
+        if (threads <= 1 || h < 64) {
+            rows(0, h);
+            return;
+        }
+        std::vector<std::thread> pool;
+        const std::uint32_t each = (h + threads - 1) / threads;
+        for (unsigned i = 0; i < threads; ++i) {
+            const std::uint32_t first = i * each, last = std::min(h, first + each);
+            if (first < last) pool.emplace_back(rows, first, last);
+        }
+        for (auto& thread : pool) thread.join();
+    } catch (...) { /* the frame goes out as the game made it */ }
+}
+} // namespace dingosdk::replay_plus::lens

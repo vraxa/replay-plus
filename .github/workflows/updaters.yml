@@ -1,0 +1,92 @@
+name: updaters
+
+# Builds the macOS app and the Linux AppImage of the updater (updater/replay_plus_updater.py), then tries each one:
+# its window opens, and a real install from the latest release into a test folder works, as does putting it back.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build the app
+        working-directory: updater
+        run: |
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+          python -m pip install pyinstaller==6.22.3 certifi pillow
+          pyinstaller --noconfirm --windowed --name "Replay Plus Updater" --icon icon.png \
+            --osx-bundle-identifier com.vraxa.replayplus.updater --collect-data certifi replay_plus_updater.py
+          ditto -c -k --keepParent "dist/Replay Plus Updater.app" "$GITHUB_WORKSPACE/ReplayPlusUpdater-macOS.zip"
+      - name: Try it
+        env:
+          REPLAY_PLUS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          app="updater/dist/Replay Plus Updater.app/Contents/MacOS/Replay Plus Updater"
+          "$app" --check-ui
+          test="$RUNNER_TEMP/ReSkate"
+          mkdir -p "$test"
+          printf 'test' > "$test/ReSkateLauncher.exe"
+          "$app" --folder "$test" --install
+          ls -la "$test"
+          "$app" --folder "$test" --restore
+          ls -la "$test"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: ReplayPlusUpdater-macOS.zip
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-22.04
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build the AppImage
+        working-directory: updater
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tk8.6 libfuse2 file xvfb
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+          python -m pip install pyinstaller==6.22.3 certifi
+          pyinstaller --noconfirm --name replay-plus-updater --collect-data certifi replay_plus_updater.py
+          mkdir -p AppDir/usr/bin
+          cp -a dist/replay-plus-updater/. AppDir/usr/bin/
+          cp icon.png AppDir/replay-plus-updater.png
+          printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Replay Plus Updater' 'Exec=replay-plus-updater' \
+            'Icon=replay-plus-updater' 'Categories=Utility;' 'Terminal=false' > AppDir/replay-plus-updater.desktop
+          printf '%s\n' '#!/bin/sh' 'HERE="$(dirname "$(readlink -f "$0")")"' \
+            'exec "$HERE/usr/bin/replay-plus-updater" "$@"' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir "$GITHUB_WORKSPACE/ReplayPlusUpdater-x86_64.AppImage"
+      - name: Try it
+        env:
+          REPLAY_PLUS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          app="$GITHUB_WORKSPACE/ReplayPlusUpdater-x86_64.AppImage"
+          chmod +x "$app"
+          xvfb-run -a "$app" --check-ui
+          test="$RUNNER_TEMP/ReSkate"
+          mkdir -p "$test"
+          printf 'test' > "$test/ReSkateLauncher.exe"
+          "$app" --folder "$test" --install
+          ls -la "$test"
+          "$app" --folder "$test" --restore
+          ls -la "$test"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: ReplayPlusUpdater-x86_64.AppImage
+          if-no-files-found: error
