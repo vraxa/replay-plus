@@ -64,6 +64,10 @@ the [guide](GUIDE.md) has the rest.
 - the 4:3 picture needs the game in borderless fullscreen (that's the default)
 - the R3 shortcuts need an xinput controller, so an xbox pad, or a ps pad through ds4windows or steam input
 
+## why isn't this a plugin?
+
+unfortunately, reskate's plugin system doesnt support the methods i'm using to hook into the replay editor. when/if support is added, then ill port it to a plugin.
+
 ## source
 
 [src](src) has the code for replay shake and replay plus, and [patches](patches) has the same changes as patches
