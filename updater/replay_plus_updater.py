@@ -362,6 +362,51 @@ class Updater:
         self.log("Kept what you had before: " + (", ".join(originals.values()) or "nothing to keep"))
         return {"originals": originals}
 
+    def remove_replay_plus(self):
+        """Replay Plus out, the Animator Studio kept: the Studio's own ReSkate.dll of the version this Replay Plus was
+        built on (so it fits the launcher), from its own release and checked against its SHA-256. The launcher, the
+        settings and what was kept from before Replay Plus stay as they are."""
+        busy = running()
+        if busy:
+            raise RuntimeError("close %s first" % busy)
+        installed = self.inspect()
+        if not installed.ours:
+            raise RuntimeError("Replay Plus isn't installed here")
+        try:
+            release = json.loads(get_text(API + STUDIO_REPO + "/releases/tags/" + urllib.parse.quote(installed.studio)))
+        except urllib.error.HTTPError:
+            release = json.loads(get_text(API + STUDIO_REPO + "/releases/latest"))
+        tag = release["tag_name"]
+        assets = release.get("assets") or []
+        dll_asset = next((a for a in assets if a.get("name") == "ReSkate.dll"), None)
+        sum_asset = next((a for a in assets if a.get("name") == "ReSkate.dll.sha256"), None)
+        if not dll_asset:
+            raise RuntimeError("the Animator Studio's release %s has no ReSkate.dll" % tag)
+        digest = dll_asset.get("digest") or ""
+        sha = digest[7:] if digest.startswith("sha256:") else None
+        if not sha and sum_asset:
+            m = re.search(r"[0-9a-fA-F]{64}", get_text(sum_asset["browser_download_url"]))
+            sha = m.group(0) if m else None
+        if not sha or len(sha) != 64:
+            raise RuntimeError("couldn't get the Animator Studio's checksum, so nothing was changed")
+        pin = Pin({"repo": STUDIO_REPO, "tag": tag, "name": "ReSkate.dll", "sha256": sha, "size": dll_asset.get("size") or 0})
+        cache = data_folder() / "downloads" / ("studio-" + tag)
+        cache.mkdir(parents=True, exist_ok=True)
+        self.log("Getting Animator Studio %s from its own release" % tag)
+        studio_dll = self.fetch(pin, cache)
+        check = Installed(studio_dll)
+        if check.ours or not check.studio:
+            raise RuntimeError("that download isn't the Animator Studio's ReSkate.dll, so nothing was changed")
+        busy = running()
+        if busy:
+            raise RuntimeError("close %s first" % busy)
+        self.put(studio_dll, self.folder / "ReSkate.dll")
+        record = self.read_record()
+        if record is not None:
+            record.update(installed=None, now="Animator Studio " + check.studio)
+            self.write_record(record)
+        self.log("Done: Replay Plus is out and Animator Studio %s is in. Your presets and settings are still there if you want it back." % check.studio)
+
     def can_restore(self):
         record = self.read_record() or {}
         return bool(record.get("originals")) or (self.folder / "ReSkate.dll.studio").exists()
@@ -470,16 +515,17 @@ def run_window(updater, saved_path):
     buttons = ttk.Frame(frame)
     buttons.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 8))
     install = ttk.Button(buttons, text="Install")
+    remove = ttk.Button(buttons, text="Remove Replay Plus")
     restore = ttk.Button(buttons, text="Put back what I had before")
     open_folder = ttk.Button(buttons, text="Open the folder")
-    for b in (install, restore, open_folder):
+    for b in (install, remove, restore, open_folder):
         b.pack(side="left", padx=(0, 8))
     bar = ttk.Progressbar(frame, maximum=1000)
     bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 8))
     log = tk.Text(frame, height=10, wrap="word", state="disabled", relief="solid", borderwidth=1,
                   font=tkfont.nametofont("TkDefaultFont"), padx=6, pady=4)
     log.grid(row=6, column=0, columnspan=3, sticky="nsew")
-    state = {"latest": None, "busy": False, "said": False}
+    state = {"latest": None, "busy": False, "said": False, "installed": None}
 
     def short(path, most=58):
         path = str(path)
@@ -521,11 +567,11 @@ def run_window(updater, saved_path):
         root.after(80, pump)
 
     def set_buttons(on):
-        for b in (install, restore, change):
+        for b in (install, remove, restore, change):
             b.state(["!disabled"] if on else ["disabled"])
 
     def show(installed, newest, studio, problem, error):
-        state["busy"], state["latest"] = False, newest
+        state["busy"], state["latest"], state["installed"] = False, newest, installed
         labels["You have"].configure(text=installed.describe if installed else "?")
         labels["Newest"].configure(text=(newest.title + (" (pre-release)" if newest.prerelease else "")) if newest else "?")
         notes = [problem] if problem else []
@@ -541,6 +587,8 @@ def run_window(updater, saved_path):
             install.state(["disabled"])
         if not updater.can_restore():
             restore.state(["disabled"])
+        if not (installed and installed.ours):
+            remove.state(["disabled"])
         if error is None and newest and installed and not state["said"]:
             state["said"] = True
             say("You're up to date." if up_to_date else "There's an update." if installed.ours else "Ready to install.")
@@ -605,12 +653,20 @@ def run_window(updater, saved_path):
         opener = ["open"] if sys.platform == "darwin" else ["explorer"] if sys.platform == "win32" else ["xdg-open"]
         subprocess.Popen(opener + [str(updater.folder)])
 
+    def ask_remove():
+        installed = state["installed"]
+        version = " " + installed.studio if installed and installed.studio else ""
+        if messagebox.askyesno("Replay Plus Updater", "Take Replay Plus out and put the plain Animator Studio%s back in? "
+                                                      "Your presets and settings stay." % version):
+            work(updater.remove_replay_plus)
+
     def ask_restore():
         if messagebox.askyesno("Replay Plus Updater", "Put back the ReSkate.dll and launcher you had before Replay Plus?"):
             work(updater.restore)
 
     change.configure(command=pick_folder)
     install.configure(command=lambda: work(lambda: updater.install(state["latest"])))
+    remove.configure(command=ask_remove)
     restore.configure(command=ask_restore)
     open_folder.configure(command=open_it)
 
@@ -634,6 +690,7 @@ def main():
     parser.add_argument("--prerelease", action="store_true")
     parser.add_argument("--install", action="store_true")
     parser.add_argument("--restore", action="store_true")
+    parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--version", action="version", version="Replay Plus Updater " + VERSION)
     parser.add_argument("--check-ui", action="store_true", help=argparse.SUPPRESS)  # (the builds' own test: Tk works)
     args, _ = parser.parse_known_args()  # (macOS may add its own arguments to an app)
@@ -656,17 +713,19 @@ def main():
             folder = None
     updater = Updater(folder, args.prerelease, args.from_folder)
     write_log("---- Replay Plus Updater %s (%s)%s%s%s, folder %s" % (
-        VERSION, sys.platform, " --install" if args.install else " --restore" if args.restore else "",
+        VERSION, sys.platform, " --install" if args.install else " --restore" if args.restore else " --uninstall" if args.uninstall else "",
         " --prerelease" if args.prerelease else "", " --from " + args.from_folder if args.from_folder else "",
         folder or "(not found yet)"))
 
-    if args.install or args.restore:
+    if args.install or args.restore or args.uninstall:
         updater.log = lambda text: (write_log(text), print(text))
         try:
             if not is_reskate_folder(updater.folder):
                 raise RuntimeError("no ReSkate folder (pass --folder)")
             if args.install:
                 updater.install(updater.latest())
+            elif args.uninstall:
+                updater.remove_replay_plus()
             else:
                 updater.restore()
             return 0

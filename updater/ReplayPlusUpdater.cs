@@ -425,6 +425,56 @@ namespace ReplayPlusUpdater
             return record;
         }
 
+        // Replay Plus out, the Animator Studio kept: the Studio's own ReSkate.dll of the version this Replay Plus was
+        // built on (so it fits the launcher), from its own GitHub release and checked against its SHA-256. The
+        // launcher, the settings and what was kept from before Replay Plus stay as they are; the Studio's own updater
+        // takes it on from there.
+        public void RemoveReplayPlus()
+        {
+            var running = Running();
+            if (running != null) throw new Exception("close " + running + " first");
+            var installed = Inspect();
+            if (!installed.Ours) throw new Exception("Replay Plus isn't installed here");
+            Dictionary<string, object> release;
+            try { release = Json.Obj(Json.Parse(Web.Text(Api + StudioRepo + "/releases/tags/" + Uri.EscapeDataString(installed.Studio)))); }
+            catch (WebException) { release = Json.Obj(Json.Parse(Web.Text(Api + StudioRepo + "/releases/latest"))); }
+            var tag = Json.Str(release, "tag_name");
+            string sumUrl = null, digest = null;
+            long size = 0;
+            bool hasDll = false;
+            var assets = Json.Get(release, "assets") as object[];
+            if (assets != null)
+                foreach (var item in assets)
+                {
+                    var a = Json.Obj(item);
+                    var name = Json.Str(a, "name");
+                    if (name == "ReSkate.dll") { hasDll = true; size = Json.Num(a, "size"); digest = Json.Str(a, "digest"); }
+                    else if (name == "ReSkate.dll.sha256") sumUrl = Json.Str(a, "browser_download_url");
+                }
+            if (!hasDll) throw new Exception("the Animator Studio's release " + tag + " has no ReSkate.dll");
+            string sha = digest != null && digest.StartsWith("sha256:") ? digest.Substring(7) : null;
+            if (sha == null && sumUrl != null) sha = Regex.Match(Web.Text(sumUrl), "[0-9a-fA-F]{64}").Value;
+            if (string.IsNullOrEmpty(sha) || sha.Length != 64) throw new Exception("couldn't get the Animator Studio's checksum, so nothing was changed");
+            var pin = new Pin { Repo = StudioRepo, Tag = tag, Name = "ReSkate.dll", Sha256 = sha.ToLowerInvariant(), Size = size };
+            var cache = Path.Combine(DataFolder, "Updater downloads", "studio-" + tag);
+            Directory.CreateDirectory(cache);
+            Log("Getting Animator Studio " + tag + " from its own release");
+            var studioDll = Fetch(pin, cache, false);
+            var check = InspectFile(studioDll);
+            if (check.Ours || check.Studio == null) throw new Exception("that download isn't the Animator Studio's ReSkate.dll, so nothing was changed");
+            running = Running();
+            if (running != null) throw new Exception("close " + running + " first");
+            Put(studioDll, Path.Combine(Folder, "ReSkate.dll"));
+            var record = ReadRecord();
+            if (record != null)
+            {
+                record["installed"] = null;
+                record["now"] = "Animator Studio " + check.Studio;
+                WriteRecord(record);
+            }
+            Log("Done: Replay Plus is out and Animator Studio " + check.Studio + " is in. Your presets and settings are still there if you want it back.");
+        }
+
         public bool CanRestore()
         {
             var record = ReadRecord();
@@ -516,10 +566,11 @@ namespace ReplayPlusUpdater
     {
         readonly Updater updater;
         readonly Label folderValue = new Label(), installedValue = new Label(), latestValue = new Label(), notice = new Label();
-        readonly Button installButton = new Button(), restoreButton = new Button(), folderButton = new Button(), openButton = new Button();
+        readonly Button installButton = new Button(), removeButton = new Button(), restoreButton = new Button(), folderButton = new Button(), openButton = new Button();
         readonly ProgressBar progress = new ProgressBar();
         readonly TextBox log = new TextBox();
         Build latest;
+        Installed shown;
         bool busy;
 
         public MainForm(Updater updater)
@@ -550,13 +601,14 @@ namespace ReplayPlusUpdater
             table.SetColumnSpan(notice, 3);
 
             var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
-            foreach (var b in new[] { installButton, restoreButton, openButton })
+            foreach (var b in new[] { installButton, removeButton, restoreButton, openButton })
             {
                 b.AutoSize = true;
                 b.Padding = new Padding(8, 2, 8, 2);
                 buttons.Controls.Add(b);
             }
             installButton.Text = "Install";
+            removeButton.Text = "Remove Replay Plus";
             restoreButton.Text = "Put back what I had before";
             openButton.Text = "Open the folder";
             table.Controls.Add(buttons, 0, 4);
@@ -587,6 +639,13 @@ namespace ReplayPlusUpdater
             folderButton.Click += (s, e) => PickFolder();
             openButton.Click += (s, e) => { if (Updater.IsReSkateFolder(updater.Folder)) Process.Start("explorer.exe", "\"" + updater.Folder + "\""); };
             installButton.Click += (s, e) => Work(() => { updater.Install(latest); });
+            removeButton.Click += (s, e) =>
+            {
+                var version = shown != null && shown.Studio != null ? " " + shown.Studio : "";
+                if (MessageBox.Show(this, "Take Replay Plus out and put the plain Animator Studio" + version + " back in? Your presets and settings stay.",
+                        "Replay Plus Updater", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                    Work(() => { updater.RemoveReplayPlus(); });
+            };
             restoreButton.Click += (s, e) =>
             {
                 if (MessageBox.Show(this, "Put back the ReSkate.dll and launcher you had before Replay Plus?", "Replay Plus Updater",
@@ -675,6 +734,7 @@ namespace ReplayPlusUpdater
         {
             busy = false;
             latest = newest;
+            shown = installed;
             installedValue.Text = installed == null ? "?" : installed.Describe;
             latestValue.Text = newest == null ? "?" : newest.Title + (newest.Prerelease ? " (pre-release)" : "");
             var notes = new List<string>();
@@ -689,6 +749,7 @@ namespace ReplayPlusUpdater
             SetButtons(true);
             installButton.Enabled = newest != null;
             restoreButton.Enabled = updater.CanRestore();
+            removeButton.Enabled = installed != null && installed.Ours;
             progress.Value = error == null && newest != null ? progress.Value : 0;
             if (installed != null && newest != null && error == null && log.TextLength == 0)
                 updater.Log(upToDate ? "You're up to date." : installed.Ours ? "There's an update." : "Ready to install.");
@@ -697,6 +758,7 @@ namespace ReplayPlusUpdater
         void SetButtons(bool on)
         {
             installButton.Enabled = on;
+            removeButton.Enabled = on;
             restoreButton.Enabled = on;
             folderButton.Enabled = on;
         }
@@ -739,7 +801,7 @@ namespace ReplayPlusUpdater
         {
             ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
             var updater = new Updater();
-            bool install = false, restore = false;
+            bool install = false, restore = false, uninstall = false;
             for (int i = 0; i < args.Length; ++i)
             {
                 var a = args[i].ToLowerInvariant();
@@ -748,6 +810,7 @@ namespace ReplayPlusUpdater
                 else if (a == "--prerelease") updater.Prerelease = true;
                 else if (a == "--install") install = true;
                 else if (a == "--restore") restore = true;
+                else if (a == "--uninstall") uninstall = true;
             }
             if (string.IsNullOrEmpty(updater.Folder))
             {
@@ -755,11 +818,11 @@ namespace ReplayPlusUpdater
                 var here = Path.GetDirectoryName(Application.ExecutablePath);
                 updater.Folder = Updater.IsReSkateFolder(saved) ? saved : Updater.IsReSkateFolder(here) ? here : null;
             }
-            WriteLog("---- Replay Plus Updater " + Updater.Version + (install ? " --install" : restore ? " --restore" : "") +
+            WriteLog("---- Replay Plus Updater " + Updater.Version + (install ? " --install" : restore ? " --restore" : uninstall ? " --uninstall" : "") +
                      (updater.Prerelease ? " --prerelease" : "") + (updater.FromFolder != null ? " --from " + updater.FromFolder : "") +
                      ", folder " + (updater.Folder ?? "(not found yet)"));
 
-            if (install || restore)
+            if (install || restore || uninstall)
             {
                 updater.Log = WriteLog;
                 updater.Progress = delegate { };
@@ -767,6 +830,7 @@ namespace ReplayPlusUpdater
                 {
                     if (!Updater.IsReSkateFolder(updater.Folder)) throw new Exception("no ReSkate folder (pass --folder)");
                     if (install) updater.Install(updater.Latest());
+                    else if (uninstall) updater.RemoveReplayPlus();
                     else updater.Restore();
                     return 0;
                 }
