@@ -709,7 +709,9 @@ namespace ReplayPlusUpdater
             Log("Newest Animator Studio: " + (studio ?? "?") + ", newest ReSkate: " + (reskate != null ? reskate.Version : "?"));
             Log("Building here: " + (NoBuild ? "off (--no-build)" : Tools.Ready ? "possible (git, CMake and Visual Studio 2022's C++ tools are here)" : "needs " + Tools.MissingText));
             var latest = ChooseFor(release, studio);
-            Log("1 Install Replay Plus + Animator Studio: " + Says(latest, release));
+            Log("1 Install Replay Plus + Animator Studio: " + (release == null || release.Newest == null ? "can't: there's no ready-made Replay Plus yet"
+                : "ready-made " + release.Newest.Title + " (" + release.Newest.Dll.Name + ")" +
+                  (studio != null && Compare(studio, release.Newest.Studio) > 0 ? " (Studio " + studio + " has none yet)" : "")));
             if (installed.HasStudio) Log("3 " + (installed.Ours ? "Update" : "Add") + " Replay Plus for Studio " + installed.Studio + ": " + Says(ChooseFor(release, installed.Studio), null));
             if (installed.Ours) Log("4 Update Animator Studio (keeping Replay Plus): " + (studio != null && Compare(studio, installed.Studio) > 0 ? Says(latest, null) : "already the newest Studio"));
             else Log("4 " + (installed.HasStudio ? "Update" : "Get") + " Animator Studio: " + (studio == null ? "?" : installed.HasStudio && Compare(studio, installed.Studio) <= 0 ? "already the newest Studio" : "plain Animator Studio " + studio));
@@ -727,34 +729,19 @@ namespace ReplayPlusUpdater
 
         // ---- The five things it does -----------------------------------------------------------------------------
 
-        // 1. The newest Animator Studio with Replay Plus on it, and the ReSkate launcher it needs.
+        // 1. Replay Plus on the newest Animator Studio there's a ready-made build for, and the ReSkate launcher it needs. Always
+        // a download, never a build here, so it's quick: when a newer Studio is out that has no ready-made Replay Plus yet,
+        // this is the one before it (Update Replay Plus or Update Animator Studio can build for the newer one later).
         public void InstallWithStudio(Release release)
         {
             if (release == null) throw new Exception("couldn't check GitHub for Replay Plus");
+            var newest = release.Newest;
+            if (newest == null) throw new Exception("there's no ready-made Replay Plus to install yet");
             var studio = LatestStudio();
-            if (studio == null && release.Newest != null)
-            {
-                Log("(couldn't check GitHub for the newest Animator Studio, so this is the newest one Replay Plus is ready for)");
-                studio = release.Newest.Studio;
-            }
-            var choice = ChooseFor(release, studio);
-            if (!choice.Possible)
-            {
-                var newest = release.Newest;
-                if (newest == null) throw new Exception(Program.Sentence(choice.Why));
-                Log("(" + Program.Sentence(choice.Why) + " So this is Replay Plus on Animator Studio " + newest.Studio + ", the newest one it's ready for.)");
-                choice = new Choice { Build = newest, Studio = newest.Studio };
-            }
-            Build build;
-            try { build = Get(choice, release); }
-            catch (Exception e)
-            {
-                // A build here that didn't work: the newest ready-made one instead.
-                if (!choice.BuildHere || !(e is PatchesDontFit || e is BuildFailed) || release.Newest == null) throw;
-                Log("(" + Program.Sentence(e.Message) + " So this is Replay Plus on Animator Studio " + release.Newest.Studio + ", the newest one it's ready for.)");
-                build = Get(new Choice { Build = release.Newest, Studio = release.Newest.Studio }, release);
-            }
-            Install(build, true);
+            if (studio != null && Compare(studio, newest.Studio) > 0)
+                Log("(Animator Studio " + studio + " is out, but there's no ready-made Replay Plus for it yet, so this is Replay Plus on Animator Studio " +
+                    newest.Studio + ", the newest one it's ready-made for.)");
+            Install(Get(new Choice { Build = newest, Studio = newest.Studio }, release), true);
         }
 
         // 3. The newest Replay Plus for the Animator Studio version that's in now; the Studio stays as it is.
@@ -1662,10 +1649,10 @@ namespace ReplayPlusUpdater
             var release = s.Release;
             if (what == 1)
             {
-                var choice = updater.ChooseFor(release, s.Studio ?? (release != null && release.Newest != null ? release.Newest.Studio : null));
-                var studio = choice.Possible ? choice.Studio : release != null && release.Newest != null ? release.Newest.Studio : s.Studio;
-                if (Ask("Get Animator Studio " + studio + " with Replay Plus on it, and the ReSkate launcher it goes with?" + (choice.BuildHere ? BuildNote : "")))
-                    Work(() => { updater.InstallWithStudio(release); updater.CleanBuild(); });
+                // (Always the newest ready-made build: a download, no building here.)
+                var studio = release != null && release.Newest != null ? release.Newest.Studio : s.Studio;
+                if (Ask("Get Animator Studio " + studio + " with Replay Plus on it, and the ReSkate launcher it goes with?"))
+                    Work(() => { updater.InstallWithStudio(release); });
             }
             else if (what == 2)
             {
@@ -1802,11 +1789,9 @@ namespace ReplayPlusUpdater
                 notes.Add(forLatest.Possible ? "Animator Studio " + s.Studio + " is out. Update Animator Studio moves you to it and keeps Replay Plus" + (forLatest.BuildHere ? " (it builds Replay Plus for it here first)." : ".")
                     : "Animator Studio " + s.Studio + " is out, but " + forLatest.Why + ", so you stay on " + installed.Studio + " for now.");
             if (!ours && hasStudio && studioNewer) notes.Add("Animator Studio " + s.Studio + " is out (you have " + installed.Studio + ").");
-            if (!ours && release != null && s.Studio != null && !forLatest.Possible && release.Newest != null)
-                notes.Add(Program.Sentence(forLatest.Why) + " Install puts it on Animator Studio " + release.Newest.Studio + ", the newest one it's ready for.");
-            else if (!ours && forLatest.BuildHere)
-                notes.Add("There's no ready-made Replay Plus for Animator Studio " + s.Studio + " yet, so Install builds it here (10 to 30 minutes)" +
-                    (release != null && release.Newest != null ? ", or puts it on Studio " + release.Newest.Studio + " if it doesn't fit." : "."));
+            if (!ours && release != null && release.Newest != null && s.Studio != null && Updater.Compare(s.Studio, release.Newest.Studio) > 0)
+                notes.Add("There's no ready-made Replay Plus for Animator Studio " + s.Studio + " yet, so Install puts it on Animator Studio " +
+                    release.Newest.Studio + ", the newest one it's ready-made for.");
             if (hasStudio && forMine != null && !forMine.Possible && (ours || s.Studio == null || Updater.Compare(s.Studio, installed.Studio) != 0))
                 notes.Add(Program.Sentence(forMine.Why) + (ours ? "" : " (Install gets you the newest Studio with Replay Plus instead.)"));
             if (hasStudio && forMine != null && forMine.BuildHere && (ours || s.Studio == null || Updater.Compare(s.Studio, installed.Studio) != 0))

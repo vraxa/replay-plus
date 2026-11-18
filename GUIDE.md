@@ -6,8 +6,9 @@ easiest way is the updater. grab `ReplayPlusUpdater.exe` from the
 [releases page](https://github.com/vraxa/replay-plus/releases/latest), close skate. and the reskate launcher, and
 run it. the first time it asks where your ReSkateLauncher.exe is. then pick one:
 
-- Install Replay Plus + Animator Studio: the newest animator studio with replay plus on it, and the reskate
-  launcher that goes with it
+- Install Replay Plus + Animator Studio: grabs the newest ready-made animator studio with replay plus on it, and
+  the reskate launcher that goes with it. it's a download, never a build, so it's quick. if a brand new studio
+  hasn't got a build yet you get the one before it
 - Update Replay Plus: the newest replay plus for the studio you have now. the studio stays exactly as it is. on the
   plain studio this button says Add Replay Plus
 - Update Animator Studio: the newest studio, and replay plus stays on it if you have it
@@ -23,7 +24,8 @@ while the studio or replay plus is in it turns off the launcher's auto updates s
 it again whenever you want to update.
 
 replay plus is built into the studio's dll, so there's a build for each studio version (`ReSkate-studio-2.1.5.dll`
-and so on in the release). if there isn't one for your studio yet, the windows updater can make it itself: it grabs
+and so on in the release), and Install always uses one of those. if you update replay plus or the studio onto a
+version that hasn't got one yet, the windows updater can make it itself: it grabs
 that studio's source, puts replay plus on it, builds it and runs the tests before it installs anything. for that you
 need git, cmake and the visual studio 2022 build tools with c++ (all free), about 4 GB of space and 10 to 30
 minutes. if replay plus doesn't go onto that studio by itself (the studio changed too much), it says so and leaves

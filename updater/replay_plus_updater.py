@@ -503,7 +503,10 @@ class Updater:
             return "can't: " + choice.why
 
         latest = self.choose_for(release, studio)
-        self.log("1 Install Replay Plus + Animator Studio: " + says(latest, release))
+        newest = release.newest if release else None
+        self.log("1 Install Replay Plus + Animator Studio: " + ("can't: there's no ready-made Replay Plus yet" if not newest else
+                 "ready-made %s (%s)%s" % (newest.title, newest.dll.name,
+                                           " (Studio %s has none yet)" % studio if studio and compare(studio, newest.studio) > 0 else "")))
         if installed.has_studio:
             self.log("3 %s Replay Plus for Studio %s: %s" % ("Update" if installed.ours else "Add", installed.studio,
                                                              says(self.choose_for(release, installed.studio))))
@@ -521,17 +524,18 @@ class Updater:
 
     # ---- The five things it does -----------------------------------------------------------------------------
     def install_with_studio(self, release):
-        """1. The newest Animator Studio with Replay Plus on it, and the ReSkate launcher it needs."""
+        """1. Replay Plus on the newest Animator Studio there's a ready-made build for, and the ReSkate launcher it needs:
+        always a download. When a newer Studio is out with no ready-made Replay Plus yet, this is the one before it."""
         if release is None:
             raise RuntimeError("couldn't check GitHub for Replay Plus")
-        studio = self.latest_studio() or (release.newest.studio if release.newest else None)
-        choice = self.choose_for(release, studio)
-        if not choice.possible:
-            if not release.newest:
-                raise RuntimeError(choice.why)
-            self.log("(%s So this is Replay Plus on Animator Studio %s, the newest one it's ready for.)" % (sentence(choice.why), release.newest.studio))
-            choice = Choice(release.newest.studio, release.newest)
-        self.install(self.get(choice))
+        newest = release.newest
+        if not newest:
+            raise RuntimeError("there's no ready-made Replay Plus to install yet")
+        studio = self.latest_studio()
+        if studio and compare(studio, newest.studio) > 0:
+            self.log("(Animator Studio %s is out, but there's no ready-made Replay Plus for it yet, so this is Replay Plus on "
+                     "Animator Studio %s, the newest one it's ready-made for.)" % (studio, newest.studio))
+        self.install(self.get(Choice(newest.studio, newest)))
 
     def update_replay_plus(self, release):
         """3. The newest Replay Plus for the Animator Studio version that's in now; the Studio stays as it is."""
@@ -981,8 +985,9 @@ def run_window(updater, saved_path):
                          "Animator Studio %s is out, but %s, so you stay on %s for now." % (studio, for_latest.why, installed.studio))
         if not ours and has_studio and studio_newer:
             notes.append("Animator Studio %s is out (you have %s)." % (studio, installed.studio))
-        if not ours and release and studio and not for_latest.possible and release.newest:
-            notes.append("%s Install puts it on Animator Studio %s, the newest one it's ready for." % (sentence(for_latest.why), release.newest.studio))
+        if not ours and release and release.newest and studio and compare(studio, release.newest.studio) > 0:
+            notes.append("There's no ready-made Replay Plus for Animator Studio %s yet, so Install puts it on Animator Studio %s, the newest one "
+                         "it's ready-made for." % (studio, release.newest.studio))
         if has_studio and for_mine and not for_mine.possible and (ours or not studio or compare(studio, installed.studio) != 0):
             notes.append(sentence(for_mine.why) + ("" if ours else " (Install gets you the newest Studio with Replay Plus instead.)"))
         if release and release.updater and compare(release.updater, VERSION) > 0:
@@ -1098,8 +1103,8 @@ def run_window(updater, saved_path):
 
     def ask_install():
         release, studio = state["release"], state["studio"]
-        choice = updater.choose_for(release, studio)
-        target = choice.studio if choice.possible else (release.newest.studio if release and release.newest else studio)
+        # (Always the newest ready-made build.)
+        target = release.newest.studio if release and release.newest else studio
         if ask("Get Animator Studio %s with Replay Plus on it, and the ReSkate launcher it goes with?" % target):
             work(lambda: updater.install_with_studio(release))
 

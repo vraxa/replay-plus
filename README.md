@@ -27,8 +27,8 @@ close skate. and the reskate launcher, and run it:
 point it at the folder with ReSkateLauncher.exe (on mac and linux it looks inside your crossover, whisky, proton or
 wine bottles for it first) and pick what you want:
 
-- **Install Replay Plus + Animator Studio**: the newest studio with replay plus on it, and the reskate launcher
-  that goes with it
+- **Install Replay Plus + Animator Studio**: grabs the newest ready-made studio + replay plus and the reskate
+  launcher that goes with it, so it's quick (never builds anything)
 - **Update Replay Plus**: the newest replay plus for the studio you've got, the studio stays as it is (on the plain
   studio this one says Add Replay Plus)
 - **Update Animator Studio**: moves you to the newest studio, and keeps replay plus on it if you have it
@@ -38,8 +38,9 @@ wine bottles for it first) and pick what you want:
 everything comes from the original releases and gets checked before it touches anything. it keeps a copy of what
 you had, so "Put back what I had before" undoes the lot.
 
-replay plus is built into the studio's dll, so the release has a build for each studio version. if yours doesn't
-have one yet, the windows updater can build it for you from the studio's source (needs git, cmake and the free
+replay plus is built into the studio's dll, so the release has a build for each studio version. Install always
+takes one of those. if you update onto a studio that doesn't have one yet, the windows updater can build it for you
+from the studio's source (needs git, cmake and the free
 visual studio 2022 build tools with c++, and 10-30 minutes). if replay plus doesn't fit onto that studio by itself it
 tells you and leaves everything alone.
 
