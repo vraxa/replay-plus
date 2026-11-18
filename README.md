@@ -78,3 +78,7 @@ built on [ReSkate](https://github.com/Dingo-Shenanigans/ReSkate) by Dingo Shenan
 none of this would exist without them.
 
 GPL-3.0, same as reskate. not affiliated with EA or Full Circle.
+
+## ai disclosure
+
+a local version of [qwen 3.8](https://huggingface.co/Qwen/Qwen3.8-27B) running on my personal server, connected to [ghidra](https://github.com/nationalsecurityagency/ghidra) was used for unit tests, debugging, search for the hooks in the replay editor, putting together the updater and keeping this repo up to date. While 99% of the things created for reskate are ai assisted, if you feel very strongly against ai usage then i completely understand.
