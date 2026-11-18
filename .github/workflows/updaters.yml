@@ -2,7 +2,7 @@ name: updaters
 
 # Builds the macOS app and the Linux AppImage of the updater (updater/replay_plus_updater.py), then tries each one:
 # its window opens, and a real install from the latest release into a test folder works, as do taking Replay Plus
-# out again (the plain Animator Studio back) and putting everything back.
+# out again (the plain Animator Studio back), updating that Studio, and putting everything back.
 on:
   workflow_dispatch:
 
@@ -37,6 +37,8 @@ jobs:
           "$app" --folder "$test" --install
           ls -la "$test"
           "$app" --folder "$test" --uninstall
+          ls -la "$test"
+          "$app" --folder "$test" --update-studio
           ls -la "$test"
           "$app" --folder "$test" --restore
           ls -la "$test"
@@ -87,6 +89,8 @@ jobs:
           "$app" --folder "$test" --install
           ls -la "$test"
           "$app" --folder "$test" --uninstall
+          ls -la "$test"
+          "$app" --folder "$test" --update-studio
           ls -la "$test"
           "$app" --folder "$test" --restore
           ls -la "$test"

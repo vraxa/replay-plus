@@ -1,4 +1,4 @@
-From 060b411cfcfaaf5de74a39190371dfea4f0d183c Mon Sep 17 00:00:00 2001
+From 49303dfacf9a982d28c47502cf68efdc12275d38 Mon Sep 17 00:00:00 2001
 From: vraxa <200693817+vraxa@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 18:20:03 +0000
 Subject: [PATCH] Replay Plus: a camera kit for the replay editor, on top of
@@ -14,7 +14,7 @@ game's UI and into exported videos.
 
 On Replay Shake (Animator Studio 2.1.5, ReSkate 20261116).
 ---
- Extension/ReplayPlus/README.md                |   99 +
+ Extension/ReplayPlus/README.md                |  100 +
  Extension/ReplayPlus/ReplayPlus.cmake         |   98 +
  .../ReplayPlus/Test/replay_plus_tests.cpp     | 1132 +++++++++
  Extension/ReplayPlus/replay_plus.cpp          | 2121 +++++++++++++++++
@@ -51,7 +51,7 @@ On Replay Shake (Animator Studio 2.1.5, ReSkate 20261116).
  Extension/UI/Overlay/depth_tap.cpp            |    3 +
  Extension/UI/Overlay/input_capture.cpp        |   29 +-
  Extension/UI/Overlay/overlay_render.cpp       |   12 +-
- 37 files changed, 11368 insertions(+), 125 deletions(-)
+ 37 files changed, 11369 insertions(+), 125 deletions(-)
  create mode 100644 Extension/ReplayPlus/README.md
  create mode 100644 Extension/ReplayPlus/ReplayPlus.cmake
  create mode 100644 Extension/ReplayPlus/Test/replay_plus_tests.cpp
@@ -74,10 +74,10 @@ On Replay Shake (Animator Studio 2.1.5, ReSkate 20261116).
 
 diff --git a/Extension/ReplayPlus/README.md b/Extension/ReplayPlus/README.md
 new file mode 100644
-index 00000000..68329ab5
+index 00000000..a0c4abb2
 --- /dev/null
 +++ b/Extension/ReplayPlus/README.md
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,100 @@
 +# replay plus guide
 +
 +## installing
@@ -90,7 +90,8 @@ index 00000000..68329ab5
 +checks every file before it touches anything, keeps a copy of what you had, and turns off the launcher's auto
 +updates so it doesn't swap the dll back. run it again whenever you want to update. "Remove Replay Plus" swaps it
 +back to the plain animator studio (the same version, from fourth studio's own release) and keeps your presets, and
-+"Put back what I had before" undoes the lot.
++"Put back what I had before" undoes the lot. if you're not running replay plus, "Update Animator Studio" keeps the
++plain studio up to date (with the reskate launcher it goes with), or gets it for you on plain reskate.
 +
 +on mac and linux the game runs through crossover, whisky, proton or wine, so reskate lives inside that bottle or
 +prefix (its drive_c). there's an updater for those too, in the same release:

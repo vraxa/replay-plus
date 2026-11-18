@@ -22,7 +22,8 @@ point it at the folder with ReSkateLauncher.exe and hit Install (on mac and linu
 whisky, proton or wine bottles for it first). it gets the newest replay plus and the reskate launcher that goes with
 it (from reskate's own releases), checks the files, keeps a copy of what you had and sets everything up. run it
 again to update. "Remove Replay Plus" swaps it for the plain animator studio (your presets stay), and "Put back what
-I had before" undoes the lot.
+I had before" undoes the lot. if you don't have replay plus, "Update Animator Studio" keeps the plain studio (and its
+reskate launcher) up to date.
 
 none of them are signed, so windows or macOS might complain the first time. on windows hit More info > Run anyway,
 on mac go to System Settings > Privacy & Security > Open Anyway, and on linux make the AppImage executable first.

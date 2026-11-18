@@ -27,9 +27,10 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 REPO = "vraxa/replay-plus"
 STUDIO_REPO = "FourthStudio/ReSkate-Animator-Studio"
+RESKATE_REPO = "Dingo-Shenanigans/ReSkate"
 API = "https://api.github.com/repos/"
 AGENT = "ReplayPlusUpdater"
 RECORD = "replay-plus-updater.json"
@@ -242,6 +243,24 @@ def running():
     return None
 
 
+def studio_dll_pin(release):
+    """An Animator Studio release's ReSkate.dll: where it is and its SHA-256 (GitHub's own, else its .sha256 file)."""
+    tag = release["tag_name"]
+    assets = release.get("assets") or []
+    dll_asset = next((a for a in assets if a.get("name") == "ReSkate.dll"), None)
+    sum_asset = next((a for a in assets if a.get("name") == "ReSkate.dll.sha256"), None)
+    if not dll_asset:
+        raise RuntimeError("the Animator Studio's release %s has no ReSkate.dll" % tag)
+    digest = dll_asset.get("digest") or ""
+    sha = digest[7:] if digest.startswith("sha256:") else None
+    if not sha and sum_asset:
+        m = re.search(r"[0-9a-fA-F]{64}", get_text(sum_asset["browser_download_url"]))
+        sha = m.group(0) if m else None
+    if not sha or len(sha) != 64:
+        raise RuntimeError("couldn't get the Animator Studio's checksum, so nothing was changed")
+    return Pin({"repo": STUDIO_REPO, "tag": tag, "name": "ReSkate.dll", "sha256": sha, "size": dll_asset.get("size") or 0}), tag
+
+
 class Updater:
     def __init__(self, folder=None, prerelease=False, from_folder=None, log=None, progress=None):
         self.folder = Path(folder) if folder else None
@@ -376,20 +395,7 @@ class Updater:
             release = json.loads(get_text(API + STUDIO_REPO + "/releases/tags/" + urllib.parse.quote(installed.studio)))
         except urllib.error.HTTPError:
             release = json.loads(get_text(API + STUDIO_REPO + "/releases/latest"))
-        tag = release["tag_name"]
-        assets = release.get("assets") or []
-        dll_asset = next((a for a in assets if a.get("name") == "ReSkate.dll"), None)
-        sum_asset = next((a for a in assets if a.get("name") == "ReSkate.dll.sha256"), None)
-        if not dll_asset:
-            raise RuntimeError("the Animator Studio's release %s has no ReSkate.dll" % tag)
-        digest = dll_asset.get("digest") or ""
-        sha = digest[7:] if digest.startswith("sha256:") else None
-        if not sha and sum_asset:
-            m = re.search(r"[0-9a-fA-F]{64}", get_text(sum_asset["browser_download_url"]))
-            sha = m.group(0) if m else None
-        if not sha or len(sha) != 64:
-            raise RuntimeError("couldn't get the Animator Studio's checksum, so nothing was changed")
-        pin = Pin({"repo": STUDIO_REPO, "tag": tag, "name": "ReSkate.dll", "sha256": sha, "size": dll_asset.get("size") or 0})
+        pin, tag = studio_dll_pin(release)
         cache = data_folder() / "downloads" / ("studio-" + tag)
         cache.mkdir(parents=True, exist_ok=True)
         self.log("Getting Animator Studio %s from its own release" % tag)
@@ -406,6 +412,57 @@ class Updater:
             record.update(installed=None, now="Animator Studio " + check.studio)
             self.write_record(record)
         self.log("Done: Replay Plus is out and Animator Studio %s is in. Your presets and settings are still there if you want it back." % check.studio)
+
+    def update_studio(self):
+        """The newest Animator Studio on its own (without Replay Plus): its ReSkate.dll from its own release, checked,
+        and the ReSkate launcher it is built on (its version string names it) from ReSkate's release of that version,
+        checked against that release's launcher.json. "updates" stays off, as the Studio needs."""
+        busy = running()
+        if busy:
+            raise RuntimeError("close %s first" % busy)
+        if self.inspect().ours:
+            raise RuntimeError("Replay Plus has the Studio built in, so it gets newer Studios with its own updates")
+        pin, tag = studio_dll_pin(json.loads(get_text(API + STUDIO_REPO + "/releases/latest")))
+        cache = data_folder() / "downloads" / ("studio-" + tag)
+        cache.mkdir(parents=True, exist_ok=True)
+        self.log("Getting Animator Studio %s from its own release" % tag)
+        studio_dll = self.fetch(pin, cache)
+        check = Installed(studio_dll)
+        if check.ours or not check.studio:
+            raise RuntimeError("that download isn't the Animator Studio's ReSkate.dll, so nothing was changed")
+        new_launcher = new_json = None
+        launcher_path = self.folder / "ReSkateLauncher.exe"
+        if check.reskate:
+            json_path, reskate_tag = cache / "launcher.json", None
+            for t in (check.reskate, "v" + check.reskate):
+                try:
+                    download("https://github.com/%s/releases/download/%s/launcher.json" % (RESKATE_REPO, t), json_path, 0,
+                             lambda done, total: None)
+                    reskate_tag = t
+                    break
+                except urllib.error.HTTPError:
+                    pass
+            launcher = json.loads(json_path.read_text(encoding="utf-8-sig")).get("launcher") if reskate_tag else None
+            if not launcher or len(launcher.get("sha256") or "") != 64:
+                self.log("(couldn't find the ReSkate %s launcher, so the launcher stays as it is)" % check.reskate)
+            else:
+                launcher_pin = Pin({"repo": RESKATE_REPO, "tag": reskate_tag, "name": "ReSkateLauncher.exe",
+                                    "sha256": launcher["sha256"], "size": launcher.get("size") or 0})
+                if not self.matches(launcher_path, launcher_pin):
+                    self.log("Getting the ReSkate %s launcher from ReSkate's own release" % check.reskate)
+                    new_launcher = self.fetch(launcher_pin, cache)
+                new_json = json_path
+        busy = running()
+        if busy:
+            raise RuntimeError("close %s first" % busy)
+        self.put(studio_dll, self.folder / "ReSkate.dll")
+        if new_launcher:
+            self.put(new_launcher, launcher_path)
+        if new_json:
+            self.put(new_json, self.folder / "launcher.json")
+        self.set_updates(self.folder / "ReSkateLauncher.settings.json", False)
+        self.log("Done: Animator Studio %s is in%s. Start ReSkate like you normally do." % (
+            check.studio, ", with the ReSkate %s launcher" % check.reskate if new_launcher else ""))
 
     def can_restore(self):
         record = self.read_record() or {}
@@ -516,16 +573,24 @@ def run_window(updater, saved_path):
     buttons.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 8))
     install = ttk.Button(buttons, text="Install")
     remove = ttk.Button(buttons, text="Remove Replay Plus")
+    studio_button = ttk.Button(buttons, text="Update Animator Studio")
     restore = ttk.Button(buttons, text="Put back what I had before")
     open_folder = ttk.Button(buttons, text="Open the folder")
-    for b in (install, remove, restore, open_folder):
-        b.pack(side="left", padx=(0, 8))
+
+    def lay_out(shown):
+        for b in (install, remove, studio_button, restore, open_folder):
+            b.pack_forget()
+        for b in (install, remove, studio_button, restore, open_folder):
+            if b in shown:
+                b.pack(side="left", padx=(0, 8))
+
+    lay_out((install, restore, open_folder))
     bar = ttk.Progressbar(frame, maximum=1000)
     bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 8))
     log = tk.Text(frame, height=10, wrap="word", state="disabled", relief="solid", borderwidth=1,
                   font=tkfont.nametofont("TkDefaultFont"), padx=6, pady=4)
     log.grid(row=6, column=0, columnspan=3, sticky="nsew")
-    state = {"latest": None, "busy": False, "said": False, "installed": None}
+    state = {"latest": None, "busy": False, "said": False, "installed": None, "studio": None}
 
     def short(path, most=58):
         path = str(path)
@@ -567,28 +632,38 @@ def run_window(updater, saved_path):
         root.after(80, pump)
 
     def set_buttons(on):
-        for b in (install, remove, restore, change):
+        for b in (install, remove, studio_button, restore, change):
             b.state(["!disabled"] if on else ["disabled"])
 
     def show(installed, newest, studio, problem, error):
-        state["busy"], state["latest"], state["installed"] = False, newest, installed
+        state["busy"], state["latest"], state["installed"], state["studio"] = False, newest, installed, studio
+        ours, has_studio = bool(installed and installed.ours), bool(installed and installed.studio)
         labels["You have"].configure(text=installed.describe if installed else "?")
         labels["Newest"].configure(text=(newest.title + (" (pre-release)" if newest.prerelease else "")) if newest else "?")
         notes = [problem] if problem else []
-        if newest and studio and compare(studio, newest.studio) > 0:
+        if ours and newest and studio and compare(studio, newest.studio) > 0:
             notes.append("Animator Studio %s is out. Replay Plus for it isn't ready yet, so this one stays on %s." % (studio, newest.studio))
+        if not ours and has_studio and studio and compare(studio, installed.studio) > 0:
+            notes.append("Animator Studio %s is out (you have %s). Update Animator Studio gets it." % (studio, installed.studio))
+        if not ours and has_studio and newest and compare(newest.studio, installed.studio) < 0:
+            notes.append("Replay Plus is on Animator Studio %s for now, so installing it would go back from your %s." % (newest.studio, installed.studio))
         if newest and newest.updater and compare(newest.updater, VERSION) > 0:
             notes.append("There's a newer updater (%s) on the releases page." % newest.updater)
         notice.configure(text="\n".join(notes))
         up_to_date = bool(installed and newest and installed.ours and installed.sha256 == newest.dll.sha256)
-        install.configure(text="Install" if not newest else "Reinstall" if up_to_date else "Update" if installed and installed.ours else "Install")
+        install.configure(text="Reinstall" if up_to_date else "Update" if ours else "Install Replay Plus")
+        studio_button.configure(text="Update Animator Studio" if has_studio else "Get Animator Studio")
+        lay_out((install, remove, restore, open_folder) if ours else
+                (install, studio_button, restore, open_folder) if installed else (install, restore, open_folder))
         set_buttons(True)
         if not newest:
             install.state(["disabled"])
         if not updater.can_restore():
             restore.state(["disabled"])
-        if not (installed and installed.ours):
+        if not ours:
             remove.state(["disabled"])
+        if not studio or (has_studio and compare(studio, installed.studio) <= 0):
+            studio_button.state(["disabled"])
         if error is None and newest and installed and not state["said"]:
             state["said"] = True
             say("You're up to date." if up_to_date else "There's an update." if installed.ours else "Ready to install.")
@@ -660,6 +735,10 @@ def run_window(updater, saved_path):
                                                       "Your presets and settings stay." % version):
             work(updater.remove_replay_plus)
 
+    def ask_studio():
+        if messagebox.askyesno("Replay Plus Updater", "Get Animator Studio %s and the ReSkate launcher it goes with?" % (state["studio"] or "")):
+            work(updater.update_studio)
+
     def ask_restore():
         if messagebox.askyesno("Replay Plus Updater", "Put back the ReSkate.dll and launcher you had before Replay Plus?"):
             work(updater.restore)
@@ -667,6 +746,7 @@ def run_window(updater, saved_path):
     change.configure(command=pick_folder)
     install.configure(command=lambda: work(lambda: updater.install(state["latest"])))
     remove.configure(command=ask_remove)
+    studio_button.configure(command=ask_studio)
     restore.configure(command=ask_restore)
     open_folder.configure(command=open_it)
 
@@ -691,6 +771,7 @@ def main():
     parser.add_argument("--install", action="store_true")
     parser.add_argument("--restore", action="store_true")
     parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--update-studio", action="store_true")
     parser.add_argument("--version", action="version", version="Replay Plus Updater " + VERSION)
     parser.add_argument("--check-ui", action="store_true", help=argparse.SUPPRESS)  # (the builds' own test: Tk works)
     args, _ = parser.parse_known_args()  # (macOS may add its own arguments to an app)
@@ -713,11 +794,11 @@ def main():
             folder = None
     updater = Updater(folder, args.prerelease, args.from_folder)
     write_log("---- Replay Plus Updater %s (%s)%s%s%s, folder %s" % (
-        VERSION, sys.platform, " --install" if args.install else " --restore" if args.restore else " --uninstall" if args.uninstall else "",
+        VERSION, sys.platform, " --install" if args.install else " --restore" if args.restore else " --uninstall" if args.uninstall else " --update-studio" if args.update_studio else "",
         " --prerelease" if args.prerelease else "", " --from " + args.from_folder if args.from_folder else "",
         folder or "(not found yet)"))
 
-    if args.install or args.restore or args.uninstall:
+    if args.install or args.restore or args.uninstall or args.update_studio:
         updater.log = lambda text: (write_log(text), print(text))
         try:
             if not is_reskate_folder(updater.folder):
@@ -726,6 +807,8 @@ def main():
                 updater.install(updater.latest())
             elif args.uninstall:
                 updater.remove_replay_plus()
+            elif args.update_studio:
+                updater.update_studio()
             else:
                 updater.restore()
             return 0

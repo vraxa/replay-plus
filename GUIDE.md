@@ -10,7 +10,8 @@ it downloads the newest replay plus and the reskate launcher that goes with it (
 checks every file before it touches anything, keeps a copy of what you had, and turns off the launcher's auto
 updates so it doesn't swap the dll back. run it again whenever you want to update. "Remove Replay Plus" swaps it
 back to the plain animator studio (the same version, from fourth studio's own release) and keeps your presets, and
-"Put back what I had before" undoes the lot.
+"Put back what I had before" undoes the lot. if you're not running replay plus, "Update Animator Studio" keeps the
+plain studio up to date (with the reskate launcher it goes with), or gets it for you on plain reskate.
 
 on mac and linux the game runs through crossover, whisky, proton or wine, so reskate lives inside that bottle or
 prefix (its drive_c). there's an updater for those too, in the same release:
