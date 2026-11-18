@@ -1,8 +1,9 @@
 name: updaters
 
 # Builds the macOS app and the Linux AppImage of the updater (updater/replay_plus_updater.py), then tries each one:
-# its window opens, and a real install from the latest release into a test folder works, as do taking Replay Plus
-# out again (the plain Animator Studio back), updating that Studio, and putting everything back.
+# its window opens, and against the latest release in a test folder: Replay Plus + the newest Animator Studio in,
+# Replay Plus out again (the plain Studio back), that Studio updated, Replay Plus back onto it, vanilla ReSkate, and
+# putting everything back.
 on:
   workflow_dispatch:
 
@@ -34,14 +35,12 @@ jobs:
           test="$RUNNER_TEMP/ReSkate"
           mkdir -p "$test"
           printf 'test' > "$test/ReSkateLauncher.exe"
-          "$app" --folder "$test" --install
-          ls -la "$test"
-          "$app" --folder "$test" --uninstall
-          ls -la "$test"
-          "$app" --folder "$test" --update-studio
-          ls -la "$test"
-          "$app" --folder "$test" --restore
-          ls -la "$test"
+          for step in --status --install --uninstall --update-studio --update-plus --vanilla --status --restore; do
+            echo "::group::$step"
+            "$app" --folder "$test" $step
+            ls -la "$test"
+            echo "::endgroup::"
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: macos
@@ -86,14 +85,12 @@ jobs:
           test="$RUNNER_TEMP/ReSkate"
           mkdir -p "$test"
           printf 'test' > "$test/ReSkateLauncher.exe"
-          "$app" --folder "$test" --install
-          ls -la "$test"
-          "$app" --folder "$test" --uninstall
-          ls -la "$test"
-          "$app" --folder "$test" --update-studio
-          ls -la "$test"
-          "$app" --folder "$test" --restore
-          ls -la "$test"
+          for step in --status --install --uninstall --update-studio --update-plus --vanilla --status --restore; do
+            echo "::group::$step"
+            "$app" --folder "$test" $step
+            ls -la "$test"
+            echo "::endgroup::"
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: linux

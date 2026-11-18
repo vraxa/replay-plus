@@ -24,12 +24,24 @@ close skate. and the reskate launcher, and run it:
 - mac (apple silicon): ReplayPlusUpdater-macOS.zip
 - linux: ReplayPlusUpdater-x86_64.AppImage
 
-point it at the folder with ReSkateLauncher.exe and hit Install (on mac and linux it looks inside your crossover,
-whisky, proton or wine bottles for it first). it gets the newest replay plus and the reskate launcher that goes with
-it (from reskate's own releases), checks the files, keeps a copy of what you had and sets everything up. run it
-again to update. "Remove Replay Plus" swaps it for the plain animator studio (your presets stay), and "Put back what
-I had before" undoes the lot. if you don't have replay plus, "Update Animator Studio" keeps the plain studio (and its
-reskate launcher) up to date.
+point it at the folder with ReSkateLauncher.exe (on mac and linux it looks inside your crossover, whisky, proton or
+wine bottles for it first) and pick what you want:
+
+- **Install Replay Plus + Animator Studio**: the newest studio with replay plus on it, and the reskate launcher
+  that goes with it
+- **Update Replay Plus**: the newest replay plus for the studio you've got, the studio stays as it is (on the plain
+  studio this one says Add Replay Plus)
+- **Update Animator Studio**: moves you to the newest studio, and keeps replay plus on it if you have it
+- **Remove Replay Plus**: back to the plain animator studio, same version (your presets stay)
+- **Vanilla ReSkate**: plain reskate, no studio and no replay plus, with the launcher's own updates back on
+
+everything comes from the original releases and gets checked before it touches anything. it keeps a copy of what
+you had, so "Put back what I had before" undoes the lot.
+
+replay plus is built into the studio's dll, so the release has a build for each studio version. if yours doesn't
+have one yet, the windows updater can build it for you from the studio's source (needs git, cmake and the free
+visual studio 2022 build tools with c++, and 10-30 minutes). if replay plus doesn't fit onto that studio by itself it
+tells you and leaves everything alone.
 
 none of them are signed, so windows or macOS might complain the first time. on windows hit More info > Run anyway,
 on mac go to System Settings > Privacy & Security > Open Anyway, and on linux make the AppImage executable first.
@@ -77,7 +89,8 @@ unfortunately, reskate's plugin system doesnt support the methods i'm using to h
 [src](src) has the code for replay shake and replay plus, and [patches](patches) has the same changes as patches
 for the [animator studio](https://github.com/FourthStudio/ReSkate-Animator-Studio)'s source, which the release dll
 is built from ([patches/SOURCE.txt](patches/SOURCE.txt) has the steps). [updater](updater) is the updater's source:
-the windows one in c#, the mac and linux one in python, built by the workflow in [.github](.github/workflows).
+the windows one in c#, the mac and linux one in python, built by the workflow in [.github](.github/workflows). the
+builds workflow in there makes the replay plus dll for any studio version.
 
 ## credits
 

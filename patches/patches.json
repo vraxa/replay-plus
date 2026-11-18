@@ -1,0 +1,4 @@
+{
+  "replay_plus": "1.1",
+  "patches": ["replay-shake.patch", "replay-plus.patch"]
+}

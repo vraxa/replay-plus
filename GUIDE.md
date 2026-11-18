@@ -4,14 +4,30 @@
 
 easiest way is the updater. grab `ReplayPlusUpdater.exe` from the
 [releases page](https://github.com/vraxa/replay-plus/releases/latest), close skate. and the reskate launcher, and
-run it. the first time it asks where your ReSkateLauncher.exe is, then just hit Install.
+run it. the first time it asks where your ReSkateLauncher.exe is. then pick one:
 
-it downloads the newest replay plus and the reskate launcher that goes with it (from reskate's own releases),
-checks every file before it touches anything, keeps a copy of what you had, and turns off the launcher's auto
-updates so it doesn't swap the dll back. run it again whenever you want to update. "Remove Replay Plus" swaps it
-back to the plain animator studio (the same version, from fourth studio's own release) and keeps your presets, and
-"Put back what I had before" undoes the lot. if you're not running replay plus, "Update Animator Studio" keeps the
-plain studio up to date (with the reskate launcher it goes with), or gets it for you on plain reskate.
+- Install Replay Plus + Animator Studio: the newest animator studio with replay plus on it, and the reskate
+  launcher that goes with it
+- Update Replay Plus: the newest replay plus for the studio you have now. the studio stays exactly as it is. on the
+  plain studio this button says Add Replay Plus
+- Update Animator Studio: the newest studio, and replay plus stays on it if you have it
+- Remove Replay Plus: swaps it back to the plain animator studio (the same version, from fourth studio's own
+  release) and keeps your presets
+- Vanilla ReSkate: plain reskate from reskate's own release, no studio and no replay plus. it turns the launcher's
+  own updates back on, so reskate keeps itself up to date like normal
+- Put back what I had before: undoes the lot
+
+everything comes from the original releases (replay plus from here, the studio from fourth studio, reskate and its
+launcher from reskate), every file gets checked before it touches anything, it keeps a copy of what you had, and
+while the studio or replay plus is in it turns off the launcher's auto updates so it doesn't swap the dll back. run
+it again whenever you want to update.
+
+replay plus is built into the studio's dll, so there's a build for each studio version (`ReSkate-studio-2.1.5.dll`
+and so on in the release). if there isn't one for your studio yet, the windows updater can make it itself: it grabs
+that studio's source, puts replay plus on it, builds it and runs the tests before it installs anything. for that you
+need git, cmake and the visual studio 2022 build tools with c++ (all free), about 4 GB of space and 10 to 30
+minutes. if replay plus doesn't go onto that studio by itself (the studio changed too much), it says so and leaves
+everything alone.
 
 on mac and linux the game runs through crossover, whisky, proton or wine, so reskate lives inside that bottle or
 prefix (its drive_c). there's an updater for those too, in the same release:
@@ -22,10 +38,11 @@ prefix (its drive_c). there's an updater for those too, in the same release:
   running it as a program) and open it
 
 they look for your reskate folder in the usual bottles and prefixes on their own, or you can point them at it (on
-mac, Cmd+Shift+. shows hidden folders like Library).
+mac, Cmd+Shift+. shows hidden folders like Library). they do the same things as the windows one, they just can't
+build replay plus themselves, so they stick to the ready-made builds.
 
-doing it by hand: rename your ReSkate.dll to ReSkate.dll.studio, put the new one in, and set `"updates"` to
-`false` in ReSkateLauncher.settings.json.
+doing it by hand: rename your ReSkate.dll to ReSkate.dll.studio, put the new one in (the `ReSkate-studio-...dll`
+for your studio version, renamed to ReSkate.dll), and set `"updates"` to `false` in ReSkateLauncher.settings.json.
 
 ## the menu
 

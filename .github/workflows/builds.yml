@@ -1,0 +1,141 @@
+name: builds
+
+# Builds Replay Plus for one Animator Studio version on Windows, with Visual Studio 2022's C++ tools (v143) like the
+# Studio's own releases: the Studio's source at its tag, the Replay Plus patches put on with git am --3way, a Release
+# build, then the Replay Shake and Replay Plus tests. The updater does the build itself (ReplayPlusUpdater.exe
+# --build-only), so this is the same build it makes on a PC when there's no ready-made one for a Studio.
+#
+# The DLL, its .sha256 and its build entry are kept as the run's artifact. With "attach" on they also go into a
+# release (the newest one unless you name one), whose replay-plus-builds.json and replay-plus.json are made again to
+# list it.
+#
+# Every day it also looks for a new Animator Studio release that the newest Replay Plus release has no build for, and
+# builds it (attached only when the repository variable AUTO_ATTACH is "true"). When the patches don't go onto that
+# Studio by themselves, the run fails and says so.
+on:
+  workflow_dispatch:
+    inputs:
+      studio:
+        description: Animator Studio tag to build for (empty = its newest release)
+        required: false
+        default: ""
+      patches:
+        description: "release = the newest release's patches (adding a build to it), repo = this commit's patches folder (for a new release)"
+        type: choice
+        options: [release, repo]
+        default: release
+      attach:
+        description: Attach the build to the release and update its manifests
+        type: boolean
+        default: false
+      release:
+        description: Release tag to attach to (empty = the newest release; a draft works too)
+        required: false
+        default: ""
+  schedule:
+    - cron: "23 5 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: builds
+  cancel-in-progress: false
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      studio: ${{ steps.pick.outputs.studio }}
+    steps:
+      - name: Which Animator Studio
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANTED: ${{ inputs.studio }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          studio="$WANTED"
+          if [ -z "$studio" ]; then
+            studio=$(gh api repos/FourthStudio/ReSkate-Animator-Studio/releases/latest --jq .tag_name)
+          fi
+          if [ "$EVENT" = "schedule" ]; then
+            tag=$(gh api "repos/$REPO/releases/latest" --jq .tag_name)
+            if ! gh release download "$tag" --repo "$REPO" --pattern replay-plus-builds.json --dir "$RUNNER_TEMP/m"; then
+              echo "release $tag has no replay-plus-builds.json yet, so there's nothing to add a build to"
+              studio=""
+            elif jq -e --arg s "$studio" '.builds[] | select(.studio == $s)' "$RUNNER_TEMP/m/replay-plus-builds.json" > /dev/null; then
+              echo "release $tag already has Replay Plus for Animator Studio $studio"
+              studio=""
+            fi
+          fi
+          echo "studio=$studio" >> "$GITHUB_OUTPUT"
+          echo "building for: ${studio:-nothing}"
+
+  build:
+    needs: pick
+    if: needs.pick.outputs.studio != ''
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      STUDIO: ${{ needs.pick.outputs.studio }}
+      PATCHES: ${{ inputs.patches || 'release' }}
+      REPLAY_PLUS_GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build the updater
+        run: ./updater/build.ps1
+      - name: Build Replay Plus for Animator Studio ${{ env.STUDIO }}
+        run: |
+          $a = @('--build-only', $env:STUDIO, '--out', "$env:RUNNER_TEMP\out", '--data', "$env:RUNNER_TEMP\data", '--jobs', '4')
+          if ($env:PATCHES -eq 'repo') { $a += @('--patches', "$PWD\patches") }
+          $p = Start-Process -FilePath updater\ReplayPlusUpdater.exe -ArgumentList $a -Wait -PassThru
+          Get-Content "$env:RUNNER_TEMP\data\updater.log"
+          if ($p.ExitCode -eq 2) { "::error::The Replay Plus patches don't go onto Animator Studio $env:STUDIO by themselves. It needs porting by hand." }
+          elseif ($p.ExitCode -ne 0) { "::error::The build or its tests didn't work (exit $($p.ExitCode)). The build-log artifact has the rest." }
+          exit $p.ExitCode
+      - name: Keep the build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-studio-${{ env.STUDIO }}
+          path: ${{ runner.temp }}/data/Build/build.log
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        with:
+          name: replay-plus-studio-${{ env.STUDIO }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+      - name: Attach it to the release
+        if: inputs.attach || (github.event_name == 'schedule' && vars.AUTO_ATTACH == 'true')
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: |
+          $tag = $env:RELEASE
+          if (-not $tag) { $tag = gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq .tag_name }
+          $m = "$env:RUNNER_TEMP\manifest"
+          New-Item -ItemType Directory -Force $m | Out-Null
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern 'replay-plus*.json' --dir $m
+          $out = "$env:RUNNER_TEMP\out"
+          $mf = @{ Tag = $tag; Add = @("$out\build-$env:STUDIO.json"); Out = $m }
+          if (Test-Path "$m\replay-plus-builds.json") { $mf.Current = "$m\replay-plus-builds.json" }
+          elseif (Test-Path "$m\replay-plus.json") { $mf.Old = "$m\replay-plus.json" }
+          $files = @("$out\ReSkate-studio-$env:STUDIO.dll", "$out\ReSkate-studio-$env:STUDIO.dll.sha256")
+          if ($env:PATCHES -eq 'repo') {
+            $mf.Patches = "$PWD\patches"
+            $files += (Get-Content -Raw patches\patches.json | ConvertFrom-Json).patches | ForEach-Object { "patches\$_" }
+          }
+          ./updater/make-manifest.ps1 @mf
+          $files += @("$m\replay-plus-builds.json", "$m\replay-plus.json")
+          gh release upload $tag @files --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "attached Replay Plus for Animator Studio $env:STUDIO to $tag"

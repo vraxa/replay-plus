@@ -7,6 +7,13 @@ How this ReSkate.dll is built (GPL-3.0: the source of what you were given)
 5. With Visual Studio 2022's C++ build tools (v143):
    cmake --preset vs2022-x64 -DDINGOSDK_VERSION=20261116 -DDINGOSDK_MOD_ID=AnimatorStudio_ReplayPlus
          "-DDINGOSDK_MOD_NAME=Animator Studio 2.1.5 + Replay Plus" -DDINGOSDK_MOD_VERSION=1.1+studio-2.1.5.reskate-20261116
-         -DDINGOSDK_CRASH_REPORT_URL=
+         -DDINGOSDK_CRASH_REPORT_URL= -DDINGOSDK_CARGO=OFF
    cmake --build --preset release
    The DLL is build\vs2022-x64\Release\ReSkate.dll.
+
+The builds for other Animator Studio versions (ReSkate-studio-<version>.dll in the release) are made the same way:
+step 2 checks out that version's tag (replay-plus-builds.json has its commit as studio_commit), and step 5 takes
+DINGOSDK_VERSION and the ReSkate version from that version's own CMakePresets.json ("DINGOSDK_MOD_VERSION":
+"<studio>+reskate.<reskate>"). The updater does exactly this when it builds one itself
+(ReplayPlusUpdater.exe --build-only <studio> --out <folder>), and so does .github/workflows/builds.yml.
+patches.json says which Replay Plus these patches are and the order they go on in.
