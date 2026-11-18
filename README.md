@@ -2,6 +2,8 @@
 
 ![replay plus in the replay editor](images/screenshot.webp)
 
+![replay plus in action](images/preview.gif)
+
 a filming mod for the skate. replay editor. proper fisheye lenses, camcorder colour, real 4:3, focus you can
 keyframe, a light on the camera and handheld shake. and it all shows up in your exported clips too, not just on
 screen.
