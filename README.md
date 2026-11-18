@@ -15,7 +15,9 @@ and online still works like normal.
 
 ## install
 
-grab the updater for your system from the [latest release](https://github.com/vraxa/replay-plus/releases/latest),
+easiest install method is to just put the ReSkate.dll file from releases into your reskate folder, replacing the original.
+
+if you want auto updating, grab the updater for your system from the [latest release](https://github.com/vraxa/replay-plus/releases/latest),
 close skate. and the reskate launcher, and run it:
 
 - windows: ReplayPlusUpdater.exe
