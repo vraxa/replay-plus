@@ -1,7 +1,9 @@
 #include "replay_plus.h"
 #include "replay_plus_depth.h"
 #include "replay_plus_lens.h"
+#include "replay_plus_light.h"
 #include "replay_plus_link.h"
+#include "replay_plus_native.h"
 #include "replay_plus_settings.h"
 #include "replay_plus_window.h"
 #include "Extension/ReplayKeyframes/replay_keyframes.h"
@@ -138,7 +140,11 @@ struct State {
     std::uint32_t pad_before{};      // the pad's buttons last tick (ReSkate's own read: the pad as it is)
     bool r3_down{}, r3_used{};       // R3 held, and something pressed with it this time
     std::uint64_t r3_at{};
-    std::array<std::uint64_t, 4> repeat_at{}; // focus nearer / further, blur less / more: held, when they start moving
+    std::array<std::uint64_t, action_count> repeat_at{};     // focus / blur held on the pad: when they start moving
+    std::array<std::uint64_t, action_count> key_repeat_at{}; // likewise on the keyboard
+    std::array<bool, action_count> key_was{};                // each shortcut's key down last tick
+    std::map<std::string, bool> preset_key_was;              // and each preset's
+    std::uint64_t key_tick_at{};
     std::uint64_t pad_tick_at{};
     std::string toast;               // what the last shortcut did (the guide shows it)
     std::uint64_t toast_at{};
@@ -179,7 +185,9 @@ struct State {
     std::uint64_t combo_down_at{};
     bool combo_down{}, combo_consumed{}, combo_armed{};
     bool timeline_ok{};
+    float bar_from{}, bar_to{1.0f}; // the part of the whole replay the editor's timeline shows (link::timeline_share)
     double timeline_start{}, timeline_length{};
+    bool timeline_published{}; // replay_shake_export.h set_timeline
     std::vector<link::Chunk> chunks; // the replay's footage, as the game strings it (replay_chunks)
     bool input_held{};
     bool pad_held{}; // the panel was open on a pad: its buttons were kept from the game
@@ -210,6 +218,15 @@ struct State {
     // position), and when it was seen (GetTickCount64).
     std::array<std::atomic<float>, 16> camera{};
     std::atomic<std::uint64_t> camera_at{};
+    // The camera light as a light of the game's (replay_plus_light.h): which way its transform's axes go from the
+    // camera's (0: as the camera's rows; 1: right and back turned round, its forward the camera's), how far above the
+    // lens it sits (m), how many lumens 100% brightness is; and whether it is made now.
+    int light_axes{0};
+    // 100% brightness: a skater 2 to 3 m away as lit as the light drawn over the picture had them, at night (2026-11-19);
+    // the game's own lamps are 10 000 to 25 000 000 in the same units.
+    float light_above{0.1f}, light_lumens{12000.0f};
+    bool game_light_made{};
+    bool light_on_here{}; // keyed: whether the keys have the light on at the playhead
     // The game's keyframe functions are the ones known (this game build): Keep keys can put its camera keyframes
     // back, and the skater's autofocus can read where the replay has the skater.
     bool keyframes_checked{}, keyframes_ok{};
@@ -425,8 +442,37 @@ void read_chunks(State& s) {
 // Where a time on the replay's clock is on the editor's timeline, in seconds from its start (as the editor shows it).
 double timeline_seconds(const State& s, double clock) {
     if (!s.timeline_ok) return clock;
-    const float share = link::timeline_share(s.chunks, s.timeline_start, s.timeline_length, clock);
+    const float share = link::timeline_share(s.chunks, s.timeline_start, s.timeline_length, clock, s.bar_from, s.bar_to);
     return share >= 0 ? share * s.timeline_length : clock - s.timeline_start;
+}
+// The rows of a frame in a buffer of its own: a private allocation that starts at the frame (the game's readback for the
+// encoder), its size the frame's rows (rounded up to a page); else 0.
+std::uint32_t own_rows(std::uintptr_t pixels, std::uintptr_t pitch) noexcept {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!pixels || pitch < 256 || VirtualQuery(reinterpret_cast<const void*>(pixels), &info, sizeof info) != sizeof info) return 0;
+    if (reinterpret_cast<std::uintptr_t>(info.AllocationBase) != pixels || info.State != MEM_COMMIT || info.Type != MEM_PRIVATE) return 0;
+    const std::uintptr_t bytes = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize - pixels;
+    const std::uintptr_t rows = bytes / pitch;
+    return rows <= 8192 ? static_cast<std::uint32_t>(rows) : 0u;
+}
+// How many rows (of `row_bytes`, `pitch` apart) the memory from `pixels` on holds, up to `wanted`: committed, writable
+// and unguarded, region by region (VirtualQuery). An exported frame is never read or written past its buffer.
+std::uint32_t rows_held(std::uintptr_t pixels, std::uintptr_t pitch, std::uint32_t row_bytes, std::uint32_t wanted) noexcept {
+    if (!pixels || !pitch || !row_bytes || !wanted) return 0;
+    const std::uintptr_t need = pixels + (static_cast<std::uintptr_t>(wanted) - 1) * pitch + row_bytes;
+    constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    std::uintptr_t at = pixels;
+    while (at < need) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof info) != sizeof info) break;
+        if (info.State != MEM_COMMIT || !(info.Protect & writable) || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) break;
+        const auto end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (end <= at) break;
+        at = end;
+    }
+    if (at >= need) return wanted;
+    if (at < pixels + row_bytes) return 0;
+    return static_cast<std::uint32_t>((at - pixels - row_bytes) / pitch + 1);
 }
 bool poke_bytes(std::uintptr_t address, const void* source, std::size_t size) noexcept {
     if (!source || !size || address < 0x10000 || address > memory::highest_user_address - size) return false;
@@ -597,6 +643,8 @@ fs::path free_name(const fs::path& folder, const fs::path& name) {
 }
 void move_videos(State& s, fs::path to, fs::file_time_type since) {
     std::thread([&s, to = std::move(to), since] {
+      // (Nothing may leave a thread of its own: the game would close.)
+      try {
         std::set<fs::path> moved;
         const auto deadline = GetTickCount64() + 120000;
         std::error_code error;
@@ -605,7 +653,9 @@ void move_videos(State& s, fs::path to, fs::file_time_type since) {
             bool waiting = false;
             for (const auto& folder : game_video_folders()) {
                 if (!fs::is_directory(folder, error)) continue;
-                for (const auto& item : fs::directory_iterator(folder, error)) {
+                std::error_code walk;
+                for (auto entry = fs::directory_iterator(folder, walk); !walk && entry != fs::directory_iterator(); entry.increment(walk)) {
+                    const auto& item = *entry;
                     if (!item.is_regular_file(error)) continue;
                     auto extension = item.path().extension().wstring();
                     std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
@@ -637,9 +687,11 @@ void move_videos(State& s, fs::path to, fs::file_time_type since) {
                     } catch (...) {}
                 }
             }
+            error.clear();
             if (!waiting && !moved.empty()) return;
             Sleep(500);
         }
+      } catch (...) {}
     }).detach();
 }
 // Every tick: an export ending sends its video to the player's folder, when one is set.
@@ -816,7 +868,7 @@ void refresh_lists(State& s, bool now) {
         name.resize(name.size() - 5);
         presets.push_back(std::move(name));
     }
-    auto hoods = files_in(s.overlays, {L".png", L".jpg", L".jpeg", L".bmp"});
+    auto hoods = files_in(s.overlays, {L".png", L".jpg", L".jpeg", L".bmp", L".webp"});
     if (presets != s.preset_names || hoods != s.hood_files) {
         s.preset_names = std::move(presets);
         s.hood_files = std::move(hoods);
@@ -1004,6 +1056,8 @@ float centre_zoom_now(const State& s) {
 // seconds (the editor's own field of view keys move it, and each change has the game remake its targets).
 void keep_sharp_scale(State& s) {
     const auto& v = s.settings;
+    // (Held while a video is exported: a zoom keyed into the clip would have raised it part way through.)
+    if (replay_shake::export_frames::busy()) return;
     float wanted = 0;
     if (v.enabled && s.in_replay && s.timeline_ok && v.sharp_middle && lens_on(v)) {
         const float zoom = centre_zoom_now(s);
@@ -1092,6 +1146,8 @@ std::optional<std::pair<std::uint64_t, std::uint64_t>> video_memory(State::Memor
 }
 void keep_memory_guard(State& s) {
     auto& m = s.memory;
+    // (The scale stays as it is while a video is exported: the game would remake its targets under the encoder.)
+    if (replay_shake::export_frames::busy()) return;
     const float wanted = s.in_replay ? scale_wanted(s) : 0.0f;
     const auto now = GetTickCount64();
     const auto set = [&](float asked, std::uint64_t usage, double pixels_now, const char* why) {
@@ -1230,6 +1286,8 @@ window::Size wanted_shape(State& s) {
     return window::fitted(aspect_ratios[static_cast<std::size_t>(v.replay_aspect)], monitor);
 }
 void keep_shape(State& s) {
+    // (Not while a video is exported: the game would remake its swap chain under the encoder.)
+    if (replay_shake::export_frames::busy()) return;
     const auto shape = wanted_shape(s);
     std::error_code error;
     const auto record = resolution_record(s);
@@ -1466,17 +1524,71 @@ std::string native_verb(State& s, const std::vector<std::string>& words) {
 // ---- The panel's combo: tapped it switches the shake, held it opens the panel -------------------
 // F10 opens the panel (and closes it) from the keyboard, in the replay editor.
 void switch_shake(State& s); // (R3's shortcuts, below)
+void do_action(State& s, Action action);                          // (R3's shortcuts, below)
+void step_focus(State& s, Action action, double steps, bool first); // likewise
+std::string preset_verb(State& s, const std::vector<std::string>& words);
+// The keyboard's: each shortcut's key (F10 the menu, F11 the shake, as they came; the rest as the player sets them), and
+// presets' keys. Focus and blur keys held go on moving, as on the pad.
 void read_key(State& s) {
+    const auto& v = s.settings;
     // (While the panel has the pointer, ReSkate's overlay counts as open: it is the panel's own.)
     const bool others = overlay::interface_open() && !link::panel_has_pointer();
-    const bool down = s.level && s.in_replay && overlay::key_down(VK_F10) && !others;
-    if (down && !s.f10_down) link::ask_panel(!link::panel_open().load(std::memory_order_acquire), true);
-    s.f10_down = down;
-    // F11: the shake on or off for the whole replay (as R3 + D-pad left).
-    const bool shake = s.level && s.in_replay && s.settings.enabled && overlay::key_down(VK_F11) && !overlay::interface_open() &&
-                       !link::panel_open().load(std::memory_order_acquire);
-    if (shake && !s.f11_down) switch_shake(s);
-    s.f11_down = shake;
+    const bool open = link::panel_open().load(std::memory_order_acquire);
+    // While the panel waits for a key to bind, every key is the panel's: those down then count as held (no press).
+    const bool capturing = link::panel_capturing().load(std::memory_order_acquire);
+    const bool ctrl = overlay::key_down(VK_CONTROL), shift = overlay::key_down(VK_SHIFT), alt = overlay::key_down(VK_MENU);
+    const auto held = [&](std::uint32_t key) {
+        if (!(key & 0xff)) return false;
+        return overlay::key_down(static_cast<int>(key & 0xff)) && ctrl == ((key & key_ctrl) != 0) && shift == ((key & key_shift) != 0) &&
+               alt == ((key & key_alt) != 0);
+    };
+    const auto now = link::now_ms();
+    const double dt = s.key_tick_at ? std::clamp(static_cast<double>(now - s.key_tick_at) / 1000.0, 0.0, 0.1) : 0.0;
+    s.key_tick_at = now;
+    // The menu's key opens it and closes it.
+    constexpr auto menu = static_cast<std::size_t>(Action::panel);
+    const bool menu_down = held(v.binds[menu].key);
+    if (menu_down && !s.key_was[menu] && !capturing && s.level && s.in_replay && !others) link::ask_panel(!open, true);
+    s.key_was[menu] = menu_down;
+    // The rest with the menu closed (and nothing else of ReSkate's open).
+    const bool free = s.level && s.in_replay && v.enabled && !open && !overlay::interface_open() && !capturing;
+    for (std::size_t a = 0; a < action_count; ++a) {
+        if (a == menu) continue;
+        const auto action = static_cast<Action>(a);
+        const bool down = held(v.binds[a].key);
+        const bool pressed = down && !s.key_was[a];
+        s.key_was[a] = down;
+        if (!free || !down) {
+            s.key_repeat_at[a] = 0;
+            continue;
+        }
+        const bool moves = action == Action::focus_further || action == Action::focus_nearer || action == Action::blur_less || action == Action::blur_more;
+        if (!moves) {
+            if (pressed) do_action(s, action);
+            continue;
+        }
+        double steps = 0;
+        if (pressed) {
+            steps = 1;
+            s.key_repeat_at[a] = now + 300;
+        } else if (s.key_repeat_at[a] && now >= s.key_repeat_at[a]) {
+            const double long_held = static_cast<double>(now - s.key_repeat_at[a]) / 1000.0;
+            steps = (12.0 + 24.0 * std::min(long_held, 2.0)) * dt;
+        }
+        if (steps > 0) step_focus(s, action, steps, pressed);
+    }
+    // Presets by their keys.
+    for (const auto& p : v.preset_binds) {
+        const bool down = held(p.bind.key);
+        auto& was = s.preset_key_was[p.preset];
+        const bool pressed = down && !was;
+        was = down;
+        if (free && pressed) {
+            const auto reply = preset_verb(s, {"load", p.preset});
+            say_toast(s, reply, false);
+            return; // (the preset's binds are the same ones: the rest next tick)
+        }
+    }
 }
 // The replay's clock (Engine/Game/Build/<build>/replay_activity.h: its time, while the replay lane is
 // up), and the focus at it: fixed, from the keys, or following the middle of the picture.
@@ -1486,9 +1598,27 @@ void read_focus(State& s) {
     s.playhead_ok = memory::peek(s.base + addr::replay_activity::playing, lane) && lane &&
                     memory::peek(s.base + addr::replay_activity::playhead, playhead) && std::isfinite(playhead);
     if (s.playhead_ok) s.playhead = playhead;
-    // While a video is exported the replay's clock stands where the export began (2026-11-17: the focus keys did not
-    // play through the video): on from there by the frames encoded so far (a few behind the one being drawn).
-    if (s.playhead_ok) s.playhead = playhead + replay_shake::export_frames::seconds_exported();
+    // While a video is exported: the replay's time as the export has it (replay_shake_export.h replay_time: the clock
+    // stands where the editor's playhead was; the export runs from the trim's start).
+    if (s.playhead_ok) s.playhead = replay_shake::export_frames::replay_time(playhead);
+#if defined(REPLAY_PLUS_TEST_INBOX)
+    // (Test builds: while a video is exported, the replay's clock against the frames encoded: each tick for the first 20
+    // frames, then every 15th.)
+    if (s.playhead_ok) {
+        const auto running = replay_shake::export_frames::capture();
+        static std::uint64_t traced_session{}, traced_frames{};
+        if (running.running && (running.session != traced_session || running.frames < 20 || running.frames >= traced_frames + 15)) {
+            traced_session = running.session;
+            traced_frames = running.frames;
+            const auto light = light_at(s.settings, s.playhead);
+            logging::write(logging::Level::info, logging::Channel::graphics,
+                           std::format("Replay Plus export clock: {} ms, frame {}, clock {:.4f}, time {:.4f}, light {} {:.2f} warmth {:.2f}, camera at {:.2f} {:.2f} {:.2f}",
+                                       GetTickCount64(), running.frames, playhead, s.playhead, light.on ? "on" : "off", light.power, light.warmth,
+                                       s.camera[12].load(std::memory_order_relaxed), s.camera[13].load(std::memory_order_relaxed),
+                                       s.camera[14].load(std::memory_order_relaxed)));
+        }
+    }
+#endif
     const auto now = link::now_ms();
     const double dt = s.focus_tick_at ? std::clamp(static_cast<double>(now - s.focus_tick_at) / 1000.0, 0.0, 0.25) : 0.0;
     s.focus_tick_at = now;
@@ -1545,6 +1675,7 @@ void read_pad(ControllerInput& input, bool allow_menu) {
 #endif
 }
 // ---- R3's shortcuts in the replay editor (replay_plus_link.h pad_filter) ------------------------
+bool layer_button_ok(std::uint32_t bits) noexcept { return layer_button(bits); }
 constexpr std::uint32_t pad_up = 0x0001, pad_down = 0x0002, pad_left = 0x0004, pad_right = 0x0008, pad_view = 0x0020, pad_r3 = 0x0080,
                         pad_lb = 0x0100, pad_rb = 0x0200, pad_lt = 0x10000, pad_rt = 0x20000;
 void say_toast(State& s, std::string text, bool log) {
@@ -1583,6 +1714,28 @@ void switch_shake(State& s) {
                                                                                             s.settings.shake_keys.size() == 1 ? "" : "s"))
                     : std::string("Shake off."));
 }
+// The light switched at the playhead (keyed): the key there turned the other way, or a new key there that turns it the
+// other way from how the keys have it.
+void switch_light_key(State& s) {
+    if (!s.playhead_ok) {
+        say_toast(s, "Light keys go on the replay's time: play or scrub the replay first.");
+        return;
+    }
+    auto& v = s.settings;
+    if (v.light_keys.empty()) {
+        // The first key: on from here (it is as this key before it too, so the light starts off with an off key at 0).
+        set_light_key(v, 0.0, {false, v.light_power, v.light_range, v.light_cone, v.light_warmth});
+        set_light_key(v, s.playhead, {true, v.light_power, v.light_range, v.light_cone, v.light_warmth});
+    } else {
+        LightAt here = light_at(v, s.playhead);
+        here.on = !here.on;
+        set_light_key(v, s.playhead, here);
+    }
+    changed(s);
+    const bool on = light_at(v, s.playhead).on;
+    say_toast(s, std::format("Camera light {} from {:.2f} s ({} light key{}).", on ? "on" : "off", timeline_seconds(s, s.playhead), v.light_keys.size(),
+                             v.light_keys.size() == 1 ? "" : "s"));
+}
 // The shake switched at the playhead (a shake key, or the key there taken away).
 void key_shake(State& s) {
     if (!s.playhead_ok) {
@@ -1602,8 +1755,14 @@ void delete_keys_here(State& s) {
     constexpr double near_enough = 0.15;
     const bool focus = remove_focus_key(s.settings, s.playhead, near_enough);
     const bool shake = remove_shake_key(s.settings, s.playhead, near_enough);
-    if (!focus && !shake) {
-        say_toast(s, "No focus or shake key at the playhead.");
+    const bool light = remove_light_key(s.settings, s.playhead, near_enough);
+    if (!focus && !shake && !light) {
+        say_toast(s, "No focus, shake or light key at the playhead.");
+        return;
+    }
+    if (light && !focus && !shake) {
+        changed(s);
+        say_toast(s, std::format("Deleted the light key at the playhead ({} left).", s.settings.light_keys.size()));
         return;
     }
     if (focus) {
@@ -1625,80 +1784,109 @@ void read_shortcuts(State& s) {
     if (layer) link::renew_pad_layer();
     const std::uint32_t pressed = buttons & ~s.pad_before;
     s.pad_before = buttons;
-    const bool r3 = (buttons & pad_r3) != 0;
+    // The shortcut button: R3 unless the player picked another (CONTROLS).
+    const std::uint32_t layer_button = layer_button_ok(s.settings.pad_layer) ? s.settings.pad_layer : default_pad_layer;
+    link::pad_layer_button().store(static_cast<std::uint16_t>(layer_button), std::memory_order_relaxed);
+    const bool r3 = (buttons & layer_button) != 0;
     if (!layer || !r3) {
         if (s.r3_down) {
             // A tap of R3 alone is the game's own (Photo): given back to it as a short press.
-            if (layer && !s.r3_used && now - s.r3_at < 600) link::inject_pad(static_cast<std::uint16_t>(pad_r3), 120);
+            if (layer && !s.r3_used && now - s.r3_at < 600) link::inject_pad(static_cast<std::uint16_t>(layer_button), 120);
             s.r3_down = false;
             ++s.revision;
         }
         return;
     }
-    if (pressed & pad_r3 || !s.r3_down) {
+    if (pressed & layer_button || !s.r3_down) {
         s.r3_down = true;
-        s.r3_used = (pressed & pad_r3) == 0; // held already as the layer came on: not a tap
+        s.r3_used = (pressed & layer_button) == 0; // held already as the layer came on: not a tap
         s.r3_at = now;
         s.repeat_at = {};
         ++s.revision;
     }
     const auto used = [&] { s.r3_used = true; };
-    if (pressed & pad_rb) {
+    // Each shortcut on its button (with the shortcut button held), as the player set them (CONTROLS).
+    const auto& v = s.settings;
+    const auto on = [&](std::uint32_t bits) { return bits && (buttons & bits) == bits; };
+    for (std::size_t a = 0; a < action_count; ++a) {
+        const auto action = static_cast<Action>(a);
+        const bool moves = action == Action::focus_further || action == Action::focus_nearer || action == Action::blur_less || action == Action::blur_more;
+        if (moves || !on(v.binds[a].pad) || !(pressed & v.binds[a].pad)) continue;
         used();
-        link::ask_panel(true);
-        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus: the panel opens (R3 + RB).");
-        return;
+        do_action(s, action);
+        if (action == Action::panel) return;
     }
-    if (pressed & pad_right) {
-        // The camera light on or off (it was a focus key here: dpad up / down make those as they move the focus).
-        used();
-        s.settings.light = !s.settings.light;
-        changed(s);
-        say_toast(s, s.settings.light ? std::format("Camera light on ({:.0f}%).", s.settings.light_power * 100) : std::string("Camera light off."));
-    }
-    if (pressed & pad_left) {
-        used();
-        switch_shake(s);
-    }
-    if (pressed & pad_lb) {
-        used();
-        key_shake(s);
-    }
-    if (pressed & pad_view) {
-        used();
-        delete_keys_here(s);
-    }
+    // Presets by their buttons.
+    for (const auto& p : v.preset_binds)
+        if (on(p.bind.pad) && (pressed & p.bind.pad)) {
+            used();
+            const auto reply = preset_verb(s, {"load", p.preset});
+            say_toast(s, reply, false);
+            return;
+        }
     // Held, these move: a step at once, then on their own from a moment later, quicker the longer they
     // are held (by the time between ticks, so as fast at any tick rate): focus further / nearer (5% a
     // step), blur less / more (5% a step).
-    const std::array<std::uint32_t, 4> repeating{pad_up, pad_down, pad_lt, pad_rt};
     const double dt = s.pad_tick_at ? std::clamp(static_cast<double>(now - s.pad_tick_at) / 1000.0, 0.0, 0.1) : 0.0;
     s.pad_tick_at = now;
-    for (std::size_t i = 0; i < repeating.size(); ++i) {
-        const auto bit = repeating[i];
-        if (!(buttons & bit)) {
-            s.repeat_at[i] = 0;
+    for (const auto action : {Action::focus_further, Action::focus_nearer, Action::blur_less, Action::blur_more}) {
+        const auto a = static_cast<std::size_t>(action);
+        const auto bits = v.binds[a].pad;
+        if (!on(bits)) {
+            s.repeat_at[a] = 0;
             continue;
         }
         double steps = 0;
-        if (pressed & bit) {
+        const bool first = (pressed & bits) != 0;
+        if (first) {
             steps = 1;
-            s.repeat_at[i] = now + 300;
-        } else if (s.repeat_at[i] && now >= s.repeat_at[i]) {
-            const double held = static_cast<double>(now - s.repeat_at[i]) / 1000.0;
+            s.repeat_at[a] = now + 300;
+        } else if (s.repeat_at[a] && now >= s.repeat_at[a]) {
+            const double held = static_cast<double>(now - s.repeat_at[a]) / 1000.0;
             steps = (12.0 + 24.0 * std::min(held, 2.0)) * dt;
         }
         if (steps <= 0) continue;
         used();
-        auto here = s.playhead_ok ? focus_at(s.settings, s.playhead) : s.focus_now;
-        if (s.settings.focus != Focus::keys) here = s.focus_now;
-        const float factor = static_cast<float>(std::pow(1.05, steps));
-        if (bit == pad_up) here.distance = std::min(here.distance * factor, 200.0f);
-        if (bit == pad_down) here.distance = std::max(here.distance / factor, 0.2f);
-        if (bit == pad_lt) here.blur = std::max(here.blur - 0.05f * static_cast<float>(steps), 0.0f);
-        if (bit == pad_rt) here.blur = std::min(here.blur + 0.05f * static_cast<float>(steps), 4.0f);
-        key_focus(s, here.distance, here.blur, bit == pad_up || bit == pad_down ? "Focus" : "Blur", (pressed & bit) != 0);
+        step_focus(s, action, steps, first);
     }
+}
+// A shortcut done (from its button or its key).
+void do_action(State& s, Action action) {
+    switch (action) {
+    case Action::panel:
+        link::ask_panel(true);
+        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus: the panel opens (its shortcut).");
+        return;
+    case Action::light:
+        // The camera light on or off; keyed, a key switching it from the playhead.
+        if (s.settings.light && s.settings.light_keyed && s.playhead_ok) {
+            switch_light_key(s);
+        } else {
+            s.settings.light = !s.settings.light;
+            changed(s);
+            say_toast(s, s.settings.light ? std::format("Camera light on ({:.0f}%).", s.settings.light_power * 100) : std::string("Camera light off."));
+        }
+        return;
+    case Action::shake: switch_shake(s); return;
+    case Action::shake_key: key_shake(s); return;
+    case Action::delete_keys: delete_keys_here(s); return;
+    case Action::focus_further:
+    case Action::focus_nearer:
+    case Action::blur_less:
+    case Action::blur_more: step_focus(s, action, 1, true); return;
+    case Action::count: return;
+    }
+}
+// Focus further / nearer (5% a step), blur less / more (5% a step), as a focus key at the playhead.
+void step_focus(State& s, Action action, double steps, bool first) {
+    auto here = s.playhead_ok ? focus_at(s.settings, s.playhead) : s.focus_now;
+    if (s.settings.focus != Focus::keys) here = s.focus_now;
+    const float factor = static_cast<float>(std::pow(1.05, steps));
+    if (action == Action::focus_further) here.distance = std::min(here.distance * factor, 200.0f);
+    if (action == Action::focus_nearer) here.distance = std::max(here.distance / factor, 0.2f);
+    if (action == Action::blur_less) here.blur = std::max(here.blur - 0.05f * static_cast<float>(steps), 0.0f);
+    if (action == Action::blur_more) here.blur = std::min(here.blur + 0.05f * static_cast<float>(steps), 4.0f);
+    key_focus(s, here.distance, here.blur, action == Action::focus_further || action == Action::focus_nearer ? "Focus" : "Blur", first);
 }
 // The shake keys to Replay Shake (as gates on the replay's clock), when they change.
 void send_gates(State& s) {
@@ -1715,10 +1903,48 @@ void read_timeline(State& s, const replay_shake::PanelState& shake) {
     if (!s.in_replay) {
         s.timeline_ok = false;
         if (!s.chunks.empty()) s.chunks.clear();
+        if (s.timeline_published) {
+            replay_shake::export_frames::set_timeline({});
+            s.timeline_published = false;
+        }
         return;
     }
     read_chunks(s);
     if (!shake.timeline || !shake.playhead_ok || shake.timeline_length <= 0) return;
+    // Trimmed, the editor's timeline is the trimmed part (Advanced Edit's own tabs, the export's) or the whole replay (its
+    // Trim tab): whichever puts the playhead where the timeline has it. The trim and the chunks are shares of the whole.
+    const float trim_from = std::clamp(shake.timeline_from, 0.0f, 1.0f), trim_to = std::clamp(shake.timeline_to, 0.0f, 1.0f);
+    float bar_from = 0.0f, bar_to = 1.0f;
+    if (trim_to - trim_from > 1e-4f && (trim_from > 1e-4f || trim_to < 1.0f - 1e-4f) && !s.chunks.empty()) {
+        const float whole = link::timeline_share(s.chunks, 0.0, 0.0, shake.playhead);
+        if (whole >= 0) {
+            const float as_trimmed = (whole - trim_from) / (trim_to - trim_from);
+            if (std::abs(as_trimmed - shake.timeline_at) < std::abs(whole - shake.timeline_at)) {
+                bar_from = trim_from;
+                bar_to = trim_to;
+            }
+        }
+    }
+    if (bar_from != s.bar_from || bar_to != s.bar_to) {
+        s.bar_from = bar_from;
+        s.bar_to = bar_to;
+        ++s.revision;
+    }
+    // What exports are timed by (replay_shake_export.h replay_time): kept fresh while the editor shows its timeline, and
+    // not while a video is exported (what was shown when it began times it).
+    if (!replay_shake::export_frames::capture().running) {
+        replay_shake::export_frames::Timeline shown;
+        for (const auto& c : s.chunks) shown.chunks.push_back({c.clock_from, c.clock_to, c.from, c.to});
+        shown.start = shake.playhead - static_cast<double>(shake.timeline_at) * shake.timeline_length;
+        shown.length = shake.timeline_length;
+        shown.trim_from = trim_from;
+        shown.trim_to = std::max(trim_to, trim_from);
+        shown.bar_from = bar_from;
+        shown.bar_to = bar_to;
+        shown.known = true;
+        replay_shake::export_frames::set_timeline(std::move(shown));
+        s.timeline_published = true;
+    }
     const double start = shake.playhead - static_cast<double>(shake.timeline_at) * shake.timeline_length;
     if (!s.timeline_ok || std::abs(start - s.timeline_start) > 1e-3 || std::abs(shake.timeline_length - s.timeline_length) > 1e-3) {
         if (!s.timeline_ok || std::abs(start - s.timeline_start) > 0.05 || std::abs(shake.timeline_length - s.timeline_length) > 0.05)
@@ -1857,9 +2083,12 @@ void publish(State& s) {
     view->timeline_start = s.timeline_start;
     view->chunks = s.chunks;
     view->timeline_length = s.timeline_length;
+    view->bar_from = s.bar_from;
+    view->bar_to = s.bar_to;
     view->shake_switch = shake.on;
     view->shake_here = s.playhead_ok ? shake.on && shake_on_at(s.settings, s.playhead, true) : shake.on;
     view->r3_held = s.r3_down;
+    view->light_on_here = s.light_on_here;
     view->toast = s.toast;
     view->toast_at = s.toast_at;
     view->video_folder = path_text(video_folder(s.settings));
@@ -2137,6 +2366,11 @@ bool start(std::uintptr_t base) noexcept {
     auto& s = state();
     if (s.ready.load(std::memory_order_acquire)) return s.base == base;
     try {
+        // The game's own faces and button glyphs for the panel, read from its data in the background while it starts.
+        native::prepare();
+#if defined(REPLAY_PLUS_TEST_INBOX)
+        light::watch_makes(base);
+#endif
         std::lock_guard lock(s.mutex);
         s.base = base;
         const auto local = local_app_data();
@@ -2158,12 +2392,14 @@ bool start(std::uintptr_t base) noexcept {
         }
         // Focus and shake keys are on the replay's clock, and the replay goes with the game: those of an earlier run
         // would land on whatever footage has their times now.
-        if (!s.settings.focus_keys.empty() || !s.settings.shake_keys.empty()) {
+        if (!s.settings.focus_keys.empty() || !s.settings.shake_keys.empty() || !s.settings.light_keys.empty()) {
             logging::log(logging::Level::info, logging::Channel::graphics,
-                         "Replay Plus: {} focus key(s) and {} shake key(s) from the last time the game ran are cleared (their footage went with it).",
-                         s.settings.focus_keys.size(), s.settings.shake_keys.size());
+                         "Replay Plus: {} focus key(s), {} shake key(s) and {} light key(s) from the last time the game ran are cleared (their footage "
+                         "went with it).",
+                         s.settings.focus_keys.size(), s.settings.shake_keys.size(), s.settings.light_keys.size());
             s.settings.focus_keys.clear();
             s.settings.shake_keys.clear();
+            s.settings.light_keys.clear();
             s.dirty = true;
             s.save_at = GetTickCount64() + save_after_ms;
         }
@@ -2184,6 +2420,63 @@ bool start(std::uintptr_t base) noexcept {
 #if defined(REPLAY_PLUS_TEST_INBOX)
 void probe_skater(State& s); // (research, below)
 #endif
+// The camera light as a light of the game's (replay_plus_light.h): on the replay camera (a little above its lens, as a
+// light on a camera sits), pointing where it looks, as bright, wide and warm as the LIGHT tab says. Only in the replay
+// editor (exports too), and while the camera's pose is fresh; else taken away. When the game's light renderer is not
+// the one known, the light is drawn over the picture instead (link::game_light stays false).
+void keep_light(State& s) {
+    const auto& v = s.settings;
+    light::Wanted w;
+    const auto seen = s.camera_at.load(std::memory_order_acquire);
+    const bool fresh = seen && GetTickCount64() - seen < 1500;
+    const bool where = s.in_replay;
+    // Keyed: as the keys have it at the playhead (and the panel shows, and steps from, the light there).
+    const bool keyed = v.light_keyed && !v.light_keys.empty() && s.playhead_ok;
+    const LightAt at = keyed ? light_at(v, s.playhead) : LightAt{v.light, v.light_power, v.light_range, v.light_cone, v.light_warmth};
+    if (keyed && (at.power != v.light_power || at.range != v.light_range || at.cone != v.light_cone || at.warmth != v.light_warmth)) {
+        s.settings.light_power = at.power;
+        s.settings.light_range = at.range;
+        s.settings.light_cone = at.cone;
+        s.settings.light_warmth = at.warmth;
+        ++s.revision;
+    }
+    if (keyed && at.on != s.light_on_here) {
+        s.light_on_here = at.on;
+        ++s.revision;
+    }
+    w.on = where && v.enabled && at.on && v.light_real && at.power > 0 && fresh;
+    if (w.on) {
+        std::array<float, 16> c{};
+        for (std::size_t i = 0; i < c.size(); ++i) c[i] = s.camera[i].load(std::memory_order_relaxed);
+        // The camera's rows: right, up, back, position.
+        const float turn = s.light_axes == 1 ? -1.0f : 1.0f;
+        for (std::size_t i = 0; i < 3; ++i) {
+            w.transform[i] = c[i] * turn;
+            w.transform[4 + i] = c[4 + i];
+            w.transform[8 + i] = c[8 + i] * turn;
+            w.transform[12 + i] = c[12 + i] + c[4 + i] * s.light_above;
+        }
+        w.transform[15] = 1.0f;
+        w.lumens = s.light_lumens * std::clamp(at.power, 0.0f, 8.0f);
+        w.range = std::max(at.range, 0.5f);
+        w.outer = std::clamp(at.cone, 1.0f, 179.0f);
+        w.inner = w.outer * (1.0f - 0.9f * std::clamp(v.light_soft, 0.0f, 1.0f));
+        // Its colour as the picture's light had it: a cold LED to a warm tungsten bulb, as bright whatever its colour.
+        const float k = std::clamp(at.warmth, -1.0f, 1.0f);
+        w.colour = k >= 0 ? std::array<float, 3>{1.0f, 1.0f - 0.18f * k, 1.0f - 0.42f * k} : std::array<float, 3>{1.0f + 0.12f * k, 1.0f + 0.05f * k, 1.0f};
+        const float y = 0.2126f * w.colour[0] + 0.7152f * w.colour[1] + 0.0722f * w.colour[2];
+        for (auto& c3 : w.colour) c3 /= y;
+        w.shadows = v.light_shadows;
+    }
+    (void)light::update(s.base, w);
+    const bool made = w.on && light::exists();
+    if (made != s.game_light_made) {
+        s.game_light_made = made;
+        ++s.revision;
+    }
+    link::light_on_now().store(at.on && at.power > 0, std::memory_order_release);
+    link::game_light().store(made, std::memory_order_release);
+}
 void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noexcept {
     auto& s = state();
     if (!s.ready.load(std::memory_order_acquire) || base != s.base) return;
@@ -2227,9 +2520,10 @@ void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noe
             if (s.in_replay) (void)keyframes_known(s);
             if (!s.in_replay && !s.settings.keep_keys) {
                 s.camera_keys.clear();
-                if (!s.settings.focus_keys.empty() || !s.settings.shake_keys.empty()) {
+                if (!s.settings.focus_keys.empty() || !s.settings.shake_keys.empty() || !s.settings.light_keys.empty()) {
                     s.settings.focus_keys.clear();
                     s.settings.shake_keys.clear();
+                    s.settings.light_keys.clear();
                     changed(s);
                 }
             }
@@ -2257,6 +2551,7 @@ void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noe
         read_combo(s);
         send_gates(s);
         read_key(s);
+        keep_light(s);
         hold_input(s);
         keep_hood(s);
         refresh_lists(s, false);
@@ -2434,8 +2729,9 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
         const auto name = lower(verb);
         if (name == "help") {
             return "replayplus status | on | off | set <key> <value> | get <key> | step <key> <n> | reset [all|tab|key] | list [tab] | "
-                   "panel [open|close] | preset list|load|save|new|rename|export|delete|open | focus list|key|delete|clear | shake list|key|clear | bind <0x..>|default | "
-                   "shot <name> [clean] | probe | white [auto|<value>] | lightfacing [none|smooth|triangles]";
+                   "panel [open|close] | preset list|load|save|new|rename|export|delete|open | focus list|key|delete|clear | shake list|key|clear | "
+                   "light list|key|off|switch|delete|clear | bind <0x..>|default | shot <name> [clean] | probe | white [auto|<value>] | "
+                   "lightfacing [none|smooth|triangles] | gamelight [lumens <at 100%>] [above <m>]";
         }
         if (name == "status") {
             const auto report = link::render_report();
@@ -2448,7 +2744,7 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
                                : s.settings.fov_mode == FovMode::automatic ? std::format("auto ({:.1f})", s.fov_auto)
                                                                             : std::string("the editor's"),
                                bars_names[static_cast<std::size_t>(s.settings.bars)], hood_names[static_cast<std::size_t>(s.settings.hood)],
-                               s.settings.light ? "on" : "off",
+                               s.settings.light ? (s.game_light_made ? "on (a light of the game's: " + light::status() + ")" : std::string("on")) : std::string("off"),
                                s.sharp_scale > 0 ? std::format("sharp middle {:.0f}%", s.sharp_scale * 100) : s.settings.resolution ? "own" : "the game's",
                                s.resolution_now, report.frames, report.width,
                                report.height) +
@@ -2498,6 +2794,21 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
                 return std::format("{} = {}", words[0], value ? *value : std::string("(not read)"));
             }
             return change_named_setting(words[0], lower(words[1]) == "restore" ? std::string() : words[1], lower(words[1]) == "restore");
+        }
+        if (name == "gamelight") {
+            // `gamelight [axes 0|1] [above <m>] [lumens <at 100%>] [marks <B, hex>] [flag <n>]`: the real light's set-up, to try in
+            // the game (marks and flag: what it is made with; made again).
+            for (std::size_t i = 0; i + 1 < words.size(); i += 2) {
+                const auto what = lower(words[i]);
+                const float v = static_cast<float>(std::atof(words[i + 1].c_str()));
+                if (what == "axes") s.light_axes = std::clamp(static_cast<int>(v), 0, 1);
+                else if (what == "above") s.light_above = std::clamp(v, -1.0f, 2.0f);
+                else if (what == "lumens") s.light_lumens = std::clamp(v, 1.0f, 1.0e6f);
+                else if (what == "marks") light::research(s.base, static_cast<std::uint32_t>(std::strtoul(words[i + 1].c_str(), nullptr, 16)), -1);
+                else if (what == "flag") light::research(s.base, 0xce5fffffu, static_cast<int>(v));
+            }
+            return std::format("Camera light (real): axes {}, {:.2f} m above the lens, {:.0f} lm at 100%; {}.", s.light_axes, s.light_above, s.light_lumens,
+                               light::status());
         }
         if (name == "lightfacing") {
             // The camera light's facing: not taken into it (none, as it comes), smoothed over 25 cm counting 80%
@@ -2647,6 +2958,47 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
             }
             return "shake list | key | clear";
         }
+        if (name == "light") {
+            // `light list | key | off | switch | delete | clear`: the camera light's keys (at the playhead).
+            const auto what = words.empty() ? std::string("list") : lower(words[0]);
+            if (what == "list") {
+                if (s.settings.light_keys.empty()) return "No light keys.";
+                std::string text = std::format("{} light key(s){}:", s.settings.light_keys.size(), s.settings.light_keyed ? "" : " (Light keys is off)");
+                for (const auto& key : s.settings.light_keys)
+                    text += std::format("\n  {:.2f} s: {}, {:.0f}%, {:.1f} m, {:.0f} deg, colour {:.2f}{}", timeline_seconds(s, key.time), key.on ? "on" : "off",
+                                        key.power * 100, key.range, key.cone, key.warmth,
+                                        s.playhead_ok && std::abs(key.time - s.playhead) <= 1.0 / 30.0 ? " (here)" : "");
+                return text;
+            }
+            if (what == "clear") {
+                const auto count = s.settings.light_keys.size();
+                s.settings.light_keys.clear();
+                changed(s);
+                return std::format("{} light key(s) removed.", count);
+            }
+            if (!s.playhead_ok) return "Light keys go on the replay's time: open a replay first.";
+            if (what == "key" || what == "add" || what == "on" || what == "off") {
+                LightAt here = light_at(s.settings, s.playhead);
+                here.on = what != "off";
+                if (!s.settings.light_keyed || s.settings.light_keys.empty())
+                    here = {what != "off", s.settings.light_power, s.settings.light_range, s.settings.light_cone, s.settings.light_warmth};
+                set_light_key(s.settings, s.playhead, here);
+                s.settings.light = true;
+                s.settings.light_keyed = true;
+                changed(s);
+                return std::format("Light key at {:.2f} s: {} ({} key(s)).", timeline_seconds(s, s.playhead), here.on ? "on" : "off", s.settings.light_keys.size());
+            }
+            if (what == "switch") {
+                switch_light_key(s);
+                return s.toast;
+            }
+            if (what == "delete" || what == "remove") {
+                if (!remove_light_key(s.settings, s.playhead, 0.25)) return "No light key here.";
+                changed(s);
+                return std::format("Light key removed ({} left).", s.settings.light_keys.size());
+            }
+            return "light list | key | off | switch | delete | clear";
+        }
         if (name == "focus") {
             const auto what = words.empty() ? std::string("list") : lower(words[0]);
             if (what == "list") {
@@ -2685,7 +3037,14 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
             // The overlays folder's pictures, by name (frame.file), or the next one.
             refresh_lists(s, true);
             if (s.hood_files.empty()) return std::format("No pictures in {}.", path_text(s.overlays));
+            // (A name of several words is all of them: "Mk1 hood.png".)
             std::string pick = words[0];
+            for (std::size_t i = 1; i < words.size(); ++i) pick += " " + words[i];
+            if (lower(pick) != "next" && lower(pick) != "previous") {
+                const auto it = std::find_if(s.hood_files.begin(), s.hood_files.end(), [&](const std::string& name) { return lower(name) == lower(pick); });
+                if (it == s.hood_files.end()) return std::format("No picture called {} in {}.", pick, path_text(s.overlays));
+                pick = *it;
+            }
             if (lower(pick) == "next" || lower(pick) == "previous") {
                 const auto it = std::find(s.hood_files.begin(), s.hood_files.end(), s.settings.hood_file);
                 std::ptrdiff_t index = it == s.hood_files.end() ? -1 : it - s.hood_files.begin();
@@ -2704,7 +3063,16 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
         if (reply.changed && name == "set" && !words.empty() && s.settings.focus == Focus::keys && s.playhead_ok &&
             (lower(words[0]) == "focus.distance" || lower(words[0]) == "focus.blur")) {
             set_focus_key(s.settings, s.playhead, s.settings.focus_distance, s.settings.focus_blur);
-            reply.text += std::format(" (key at {:.2f} s)", s.playhead);
+            reply.text += std::format(" (key at {:.2f} s)", timeline_seconds(s, s.playhead));
+        }
+        // Keyed light: likewise a change of its brightness, reach, beam or colour (on, as the keys have it there).
+        if (reply.changed && name == "set" && !words.empty() && s.settings.light_keyed && s.playhead_ok &&
+            (lower(words[0]) == "light.power" || lower(words[0]) == "light.range" || lower(words[0]) == "light.cone" ||
+             lower(words[0]) == "light.warmth")) {
+            const bool on = s.settings.light_keys.empty() || light_at(s.settings, s.playhead).on;
+            set_light_key(s.settings, s.playhead,
+                          {on, s.settings.light_power, s.settings.light_range, s.settings.light_cone, s.settings.light_warmth});
+            reply.text += std::format(" (light key at {:.2f} s)", timeline_seconds(s, s.playhead));
         }
         if (reply.changed) {
             s.settings = clamped(s.settings);
@@ -2749,6 +3117,16 @@ void view_built(std::uintptr_t description, bool replayed) noexcept {
                 std::all_of(camera.begin(), camera.end(), [](float v) { return std::isfinite(v); })) {
                 for (std::size_t i = 0; i < camera.size(); ++i) s.camera[i].store(camera[i], std::memory_order_relaxed);
                 s.camera_at.store(GetTickCount64(), std::memory_order_release);
+#if defined(REPLAY_PLUS_TEST_INBOX)
+                // (Test builds: while a video is exported, each replayed view the game builds, for its first frames and
+                // then every 30th: which camera the light takes.)
+                const auto running = replay_shake::export_frames::capture();
+                if (running.running && (running.frames < 12 || running.frames % 30 == 0))
+                    logging::write(logging::Level::info, logging::Channel::graphics,
+                                   std::format("Replay Plus export view: {} ms, frame {}, camera at {:.2f} {:.2f} {:.2f}, looking {:.2f} {:.2f} {:.2f}, fov {:.3f}",
+                                               GetTickCount64(), running.frames, camera[12], camera[13], camera[14], -camera[8], -camera[9],
+                                               -camera[10], fov));
+#endif
             }
             // Its near and far planes (after the vertical field of view, its two centre offsets and another
             // angle: 0.06 and 11000 on game build 25414733), which the camera light measures the depth by.
@@ -2780,21 +3158,60 @@ void export_frame(std::uintptr_t encoder, std::uintptr_t pixels, std::uintptr_t 
         }
         s.export_session_at = now;
         ++s.export_frames;
-        // The video's size, as the H.264 setup was given it (an MP4); else from the row's length, at 16:9
-        // (every size the game exports at), rows padded to 256 bytes as a readback's are.
+        // The frame's size: its buffer's (the game's readback for the encoder is a buffer of its own that starts at the frame
+        // and holds its rows, MP4 or WebM: 10240 x 1072 at 2.39:1, 10240 x 1920 at 4:3, 2026-11-19); else the H.264 setup's,
+        // when it set this export up (an MP4); else it is not finished. Rows padded to 256 bytes as a readback's are. (A
+        // size kept from an earlier export once read and wrote 1920 rows of a 1072-row frame, a WebM export after an MP4
+        // one of another shape, and the game crashed: 2026-11-19. The submit's encoder holds no size of the frame's.)
+        const auto row_fits = [&](int w) {
+            return w > 0 && static_cast<std::uintptr_t>(w) * 4 <= pitch && pitch < static_cast<std::uintptr_t>(w) * 4 + 256;
+        };
+        int width = 0, height = 0;
+        const char* sized_by = "";
         const auto video = replay_shake::export_frames::size();
-        int width = video.width, height = video.height;
-        if (!(width > 0 && static_cast<std::uintptr_t>(width) * 4 <= pitch && pitch < static_cast<std::uintptr_t>(width) * 4 + 256)) {
+        const bool fresh_setup = replay_shake::export_frames::configured_ms() + 4000 > now && replay_shake::export_frames::configured_ms() <= now;
+        if (const auto own = own_rows(pixels, pitch); own >= 64) {
             width = static_cast<int>(pitch / 4);
-            height = width * 9 / 16;
-            for (const auto [w, h] : {std::pair{854, 480}, std::pair{640, 360}, std::pair{1280, 720}, std::pair{1920, 1080}, std::pair{2560, 1440}, std::pair{3840, 2160}})
-                if (static_cast<std::uintptr_t>(w) * 4 <= pitch && pitch < static_cast<std::uintptr_t>(w) * 4 + 256) {
-                    width = w;
-                    height = h;
-                }
+            height = static_cast<int>(own);
+            sized_by = "its buffer";
+        } else if (fresh_setup && row_fits(video.width) && video.height >= 64) {
+            width = video.width;
+            height = video.height;
+            sized_by = "its H.264 setup";
+        } else {
+            // Not known: the frame goes out as the game made it (a guess could read or write past it).
+            sized_by = "nothing (not finished)";
         }
-        const bool plausible = width >= 64 && height >= 64 && width <= 8192 && height <= 8192 && static_cast<std::uintptr_t>(width) * 4 <= pitch &&
-                               pitch <= static_cast<std::uintptr_t>(width) * 4 + 4096;
+        // And all its rows in its buffer, or it goes out as the game made it.
+        const int rows = width > 0 && height > 0 ? static_cast<int>(rows_held(pixels, pitch, static_cast<std::uint32_t>(width) * 4u,
+                                                                               static_cast<std::uint32_t>(std::clamp(height, 0, 8192))))
+                                                 : 0;
+        const bool short_buffer = rows < height;
+        const bool plausible = !short_buffer && width >= 64 && height >= 64 && width <= 8192 && height <= 8192 &&
+                               static_cast<std::uintptr_t>(width) * 4 <= pitch && pitch <= static_cast<std::uintptr_t>(width) * 4 + 4096;
+#if defined(REPLAY_PLUS_TEST_INBOX)
+        if (!s.export_logged) {
+            // (Test builds: where the frame's size might be. The encoder's ints that look like a size, and the buffer's memory
+            // region from the frame on.)
+            std::string found;
+            for (std::uintptr_t off = 0; off < 0x600; off += 4) {
+                int a{}, b{};
+                if (!memory::peek(encoder + off, a) || !memory::peek(encoder + off + 4, b)) continue;
+                if (a >= 320 && a <= 8192 && b >= 180 && b <= 8192 && (static_cast<std::uintptr_t>(a) * 4 <= pitch && pitch < static_cast<std::uintptr_t>(a) * 4 + 256))
+                    found += std::format(" +0x{:x}={}x{}", off, a, b);
+            }
+            MEMORY_BASIC_INFORMATION info{};
+            std::string region = "?";
+            if (VirtualQuery(reinterpret_cast<const void*>(pixels), &info, sizeof info) == sizeof info) {
+                const auto end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+                region = std::format("{} bytes from the frame to its region's end ({:.2f} rows), the region {} bytes from 0x{:x} (allocation 0x{:x}), type 0x{:x}",
+                                     end - pixels, static_cast<double>(end - pixels) / static_cast<double>(pitch), info.RegionSize,
+                                     reinterpret_cast<std::uintptr_t>(info.BaseAddress), reinterpret_cast<std::uintptr_t>(info.AllocationBase), info.Type);
+            }
+            logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus export research: encoder sizes{}; buffer: {}.",
+                         found.empty() ? " none" : found, region);
+        }
+#endif
         if (!s.export_logged) {
             s.export_logged = true;
             std::uintptr_t vtable{};
@@ -2804,8 +3221,11 @@ void export_frame(std::uintptr_t encoder, std::uintptr_t pixels, std::uintptr_t 
             std::string bytes;
             for (const auto b : first) bytes += std::format("{:02x} ", b);
             logging::log(logging::Level::info, logging::Channel::graphics,
-                         "Replay Plus export: encoder vtable +0x{:x}, size {}x{} (plausible {}), pitch {}, first bytes {}; finishing {}.",
-                         vtable - s.base, width, height, plausible, pitch, bytes, plausible && s.export_on.load() ? "on" : "off");
+                         "Replay Plus export: encoder vtable +0x{:x}, size {}x{} (from {}; the last H.264 setup {}x{}{}), "
+                         "pitch {}, its buffer holds {} rows{}, first bytes {}; finishing {}.",
+                         vtable - s.base, width, height, sized_by, video.width, video.height,
+                         fresh_setup ? ", this export's" : ", an earlier export's", pitch, rows, short_buffer ? " (fewer than its size: not finished)" : "",
+                         bytes, plausible && s.export_on.load() ? "on" : "off");
         }
         if (!plausible || !s.export_on.load(std::memory_order_acquire)) return;
         // The pass has been drawing under the game's UI for a few frames: this frame (read back a frame or two

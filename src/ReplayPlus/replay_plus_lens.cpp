@@ -42,18 +42,17 @@ Frame frame_for(const Settings& s, float screen_aspect, float fov, const Hole* h
     f.squeeze = std::clamp(std::isfinite(s.squeeze) ? s.squeeze : 1.0f, 0.5f, 2.0f);
     f.fit_to_lens = s.fov_mode == FovMode::automatic;
     f.ease = std::clamp(std::isfinite(s.compress) ? s.compress : 0.0f, 0.0f, 0.5f) / (pi * 0.5f);
-    // The overlay, at its size: its dark edge reaches in from the window's corner hood_size times as far as drawn
-    // (a picture drawn larger about the middle; the circle's edge moved out).
-    const float corner = std::sqrt(f.view_aspect * f.view_aspect + 1.0f);
-    const float size = std::clamp(std::isfinite(s.hood_size) ? s.hood_size : 1.0f, 0.0f, 2.0f);
-    const auto sized = [&](float drawn) { return drawn < corner ? std::max(corner - size * (corner - drawn), 0.05f) : drawn; };
-    if (s.enabled && s.hood == Hood::picture && hole && hole->known) {
-        f.hole = *hole;
-        // Along the window's diagonal (the picture's own (1, 1)), where the corner's dark edge is drawn.
-        const float drawn = picture_reach(f.hole, 1.0f, 1.0f) * corner / std::sqrt(2.0f);
-        if (drawn > 1e-3f) f.hood_scale = sized(drawn) / drawn;
+    // The overlay at its size: a plain scale about the middle, the picture keeping its shape (hood_extent), the
+    // circle's edge where the lens sees 90 degrees, that much further out.
+    const float size = std::clamp(std::isfinite(s.hood_size) ? s.hood_size : 1.0f, 0.25f, 4.0f);
+    if (s.enabled && s.hood == Hood::picture && hole) {
+        if (hole->known) f.hole = *hole;
+        f.hood_scale = size;
+        // A picture made for this window's shape (within 13%: a 3:2 hood in a 4:3 window) fills it, as it was made to.
+        const float ia = hole->aspect, va = f.view_aspect;
+        f.hood_aspect = ia > 0 && std::max(ia / va, va / ia) > 1.13f ? ia : 0.0f;
     } else if (s.enabled && s.hood == Hood::circle) {
-        f.hood_circle = sized(f.circle);
+        f.hood_circle = f.circle * size;
     }
     f.fit_to_hood = s.enabled && s.hood_fit && s.hood != Hood::none;
     // The projection, and the scale that puts 90 degrees at the image circle (equisolid: f = circle / sqrt 2,
@@ -119,9 +118,10 @@ float visible_radius(const Frame& f, float ux, float uy) noexcept {
         if (f.hood_circle > 0) {
             rb = std::min(rb, f.hood_circle);
         } else if (f.hole.known) {
-            // The picture spans the window: a point (q) is at (qx / view aspect, qy) of it, over its size.
-            const float ox = ux / f.view_aspect, oy = uy;
-            rb = std::min(rb, picture_reach(f.hole, ox, oy) * f.hood_scale / std::max(std::sqrt(ox * ox + oy * oy), 1e-6f));
+            // A point (q) r out along (ux, uy) is r (ux / half-width, uy / half-height) of the picture.
+            const auto e = hood_extent(f);
+            const float ox = ux / e[0], oy = uy / e[1];
+            rb = std::min(rb, picture_reach(f.hole, ox, oy) / std::max(std::sqrt(ox * ox + oy * oy), 1e-6f));
         }
     }
     return rb;
@@ -170,10 +170,11 @@ float fit(const Frame& f) {
         if (hc > 1.0f && hc * hc - 1.0f < va * va) consider(std::atan2(1.0f, std::sqrt(hc * hc - 1.0f)));
         if (hc > va && hc * hc - va * va < 1.0f) consider(std::atan2(std::sqrt(hc * hc - va * va), va));
     } else if (f.fit_to_hood && f.hole.known) {
-        // In the picture's own units (it spans the window hood_scale times over) the window's edges are at 1 / scale;
-        // a direction there (psi) is this one in the picture (q).
-        const float edge = 1.0f / std::max(f.hood_scale, 1e-3f);
-        const auto in_q = [&](float psi) { return std::atan2(std::sin(psi), va * std::cos(psi)); };
+        // In the picture's own units (where hood_extent puts it) the window's side is at view aspect / half-width and
+        // its top at 1 / half-height; a direction there (psi) is this one in the picture (q).
+        const auto e = hood_extent(f);
+        const float side_edge = va / std::max(e[0], 1e-3f), top_edge = 1.0f / std::max(e[1], 1e-3f);
+        const auto in_q = [&](float psi) { return std::atan2(e[1] * std::sin(psi), e[0] * std::cos(psi)); };
         constexpr float segment = pi * 0.5f / static_cast<float>(hole_steps);
         for (std::size_t k = 0; k <= hole_steps; ++k) {
             const float psi = static_cast<float>(k) * segment;
@@ -182,7 +183,7 @@ float fit(const Frame& f) {
             for (const bool top : {true, false}) {
                 // Where its edge crosses the window's top (reach sin psi = edge) or side (reach cos psi = edge).
                 const auto past = [&](float at) {
-                    return picture_reach(f.hole, std::cos(at), std::sin(at)) * (top ? std::sin(at) : std::cos(at)) > edge;
+                    return picture_reach(f.hole, std::cos(at), std::sin(at)) * (top ? std::sin(at) : std::cos(at)) > (top ? top_edge : side_edge);
                 };
                 float a = psi, b = psi + segment;
                 const bool from = past(a);
@@ -344,6 +345,7 @@ Legacy legacy_true_angles(const Settings& s, bool mk1_hood, float screen_aspect)
 
 Hole measure_hole(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) noexcept {
     Hole hole;
+    if (width && height) hole.aspect = static_cast<float>(width) / static_cast<float>(height);
     if (!rgba || width < 8 || height < 8) return hole;
     // 1 opaque (alpha half or more), 0 see-through, -1 off the picture; (u, v) its own -1..1, v up.
     const auto at = [&](float u, float v) {
@@ -361,7 +363,12 @@ Hole measure_hole(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t h
             for (const float sy : {1.0f, -1.0f})
                 for (float t = step; t < 2.0f; t += step) {
                     const int o = at(sx * t * cu, sy * t * sv);
-                    if (o < 0) break; // see-through to the picture's edge
+                    if (o < 0) {
+                        // See-through to the picture's edge: past it is black (the window can be wider or taller than
+                        // the picture, which keeps its shape), so what shows ends there.
+                        nearest = std::min(nearest, t - step * 0.5f);
+                        break;
+                    }
                     if (o > 0) {
                         nearest = std::min(nearest, t);
                         break;
@@ -389,9 +396,28 @@ std::array<float, 2> to_game(const Frame& f, float scale, float qx, float qy) {
     return {0.5f + 0.5f * qx * k / tg[0], 0.5f - 0.5f * qy * k / tg[1]};
 }
 
+std::array<float, 2> hood_extent(const Frame& f) {
+    const float s = std::max(f.hood_scale, 1e-3f), va = f.view_aspect;
+    const float ia = f.hood_aspect > 0 ? f.hood_aspect : va;
+    // As large as fits whole: the window's height, or its width for a picture wider than it.
+    const float k = std::min(1.0f, va / ia);
+    return {ia * k * s, k * s};
+}
 std::array<float, 2> hood_uv(const Frame& f, float qx, float qy) {
-    const float s = std::max(f.hood_scale, 1e-3f);
-    return {0.5f + 0.5f * qx / (f.view_aspect * s), 0.5f - 0.5f * qy / s};
+    const auto e = hood_extent(f);
+    return {0.5f + 0.5f * qx / e[0], 0.5f - 0.5f * qy / e[1]};
+}
+float scale_for_old_size(const Settings& s, float old_size) noexcept {
+    if (!std::isfinite(old_size)) return 1.0f;
+    const float size = std::clamp(old_size, 0.0f, 2.0f);
+    const float va = s.bars == Bars::four_three || s.replay_aspect == Aspect::four_three ? 4.0f / 3.0f : 16.0f / 9.0f;
+    const float corner = std::sqrt(va * va + 1.0f);
+    // Where its dark edge was drawn along the window's diagonal: the Mk1 hood's corners (its see-through middle reaching
+    // 1.279 of its own half-diagonal, measured 2026-11-19), or the circle.
+    const float drawn = s.hood == Hood::circle ? std::clamp(s.circle, 0.5f, 3.0f) : 1.279f * corner / std::sqrt(2.0f);
+    if (drawn >= corner) return 1.0f;
+    const float sized = std::max(corner - size * (corner - drawn), 0.05f);
+    return std::clamp(sized / drawn, 0.25f, 4.0f);
 }
 
 float centre_zoom(const Frame& f, float fit) {
@@ -667,7 +693,7 @@ Trace& trace() {
 bool same(const Frame& a, const Frame& b) noexcept {
     return a.fisheye == b.fisheye && a.fov == b.fov && a.source_aspect == b.source_aspect && a.view_aspect == b.view_aspect && a.zoom == b.zoom &&
            a.circle == b.circle && a.curve == b.curve && a.scale == b.scale && a.squeeze == b.squeeze && a.ease == b.ease &&
-           a.fit_to_hood == b.fit_to_hood && a.hole.known == b.hole.known && a.hole.radius == b.hole.radius && a.hood_scale == b.hood_scale &&
+           a.fit_to_hood == b.fit_to_hood && a.hole.known == b.hole.known && a.hole.radius == b.hole.radius && a.hood_scale == b.hood_scale && a.hood_aspect == b.hood_aspect &&
            a.hood_circle == b.hood_circle;
 }
 void build_trace(Trace& t, const Finish& f, std::uint32_t w, std::uint32_t h, unsigned threads) {
@@ -712,12 +738,21 @@ void build_trace(Trace& t, const Finish& f, std::uint32_t w, std::uint32_t h, un
         rows(0, h);
         return;
     }
+    // (Every thread made is joined, even when one cannot be made: a thread left running would end the game. What no
+    // thread took is done here.)
     std::vector<std::thread> pool;
     const std::uint32_t each = (h + threads - 1) / threads;
-    for (unsigned i = 0; i < threads; ++i) {
-        const std::uint32_t first = i * each, last = std::min(h, first + each);
-        if (first < last) pool.emplace_back(rows, first, last);
-    }
+    std::uint32_t handed = 0;
+    try {
+        pool.reserve(threads);
+        for (unsigned i = 0; i < threads; ++i) {
+            const std::uint32_t first = i * each, last = std::min(h, first + each);
+            if (first >= last) break;
+            pool.emplace_back(rows, first, last);
+            handed = last;
+        }
+    } catch (...) {}
+    if (handed < h) rows(handed, h);
     for (auto& thread : pool) thread.join();
 }
 
@@ -933,7 +968,9 @@ void finish(const Finish& f, Picture picture, std::vector<std::uint8_t>& scratch
                     std::array<std::uint8_t, 3> e{encode8(c[0]), encode8(c[1]), encode8(c[2])};
                     if (textured) {
                         const auto uv = hood_uv(f.frame, qx, qy);
-                        const auto o = hood_texel(f.texture, uv[0], uv[1]);
+                        // (Past its edges: black, as the shader has it.)
+                        const bool past = uv[0] < 0.0f || uv[0] > 1.0f || uv[1] < 0.0f || uv[1] > 1.0f;
+                        const auto o = past ? std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f} : hood_texel(f.texture, uv[0], uv[1]);
                         const float a = o[3] * f.hood_opacity;
                         if (a > 0) {
                             const std::array<float, 3> in_order{o[red == 0 ? 0 : 2], o[1], o[red == 0 ? 2 : 0]};
@@ -952,12 +989,20 @@ void finish(const Finish& f, Picture picture, std::vector<std::uint8_t>& scratch
             rows(0, h);
             return;
         }
+        // (Every thread made is joined, even when one cannot be made: a thread left running would end the game.)
         std::vector<std::thread> pool;
         const std::uint32_t each = (h + threads - 1) / threads;
-        for (unsigned i = 0; i < threads; ++i) {
-            const std::uint32_t first = i * each, last = std::min(h, first + each);
-            if (first < last) pool.emplace_back(rows, first, last);
-        }
+        std::uint32_t handed = 0;
+        try {
+            pool.reserve(threads);
+            for (unsigned i = 0; i < threads; ++i) {
+                const std::uint32_t first = i * each, last = std::min(h, first + each);
+                if (first >= last) break;
+                pool.emplace_back(rows, first, last);
+                handed = last;
+            }
+        } catch (...) {}
+        if (handed < h) rows(handed, h);
         for (auto& thread : pool) thread.join();
     } catch (...) { /* the frame goes out as the game made it */ }
 }

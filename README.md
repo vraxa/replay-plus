@@ -1,11 +1,13 @@
 ![replay plus](images/logo.png)
 
-![replay plus in the replay editor](images/screenshot.webp)
+![replay plus in the replay editor](images/screenshot-1.3-preview.png)
 
-![replay plus in action](images/preview.gif)
+![replay plus in action](images/preview1.gif)
+
+![the camera light at night](images/preview2.gif)
 
 a filming mod for the skate. replay editor. proper fisheye lenses, camcorder colour, real 4:3, focus you can
-keyframe, a light on the camera and handheld shake. and it all shows up in your exported clips too, not just on
+keyframe, a real light on the camera and handheld shake. and it all shows up in your exported clips too, not just on
 screen.
 
 it's a ReSkate.dll with the animator studio (2.1.5, on reskate 20261116) built in, so you keep all the studio stuff
@@ -52,27 +54,33 @@ if you'd rather do it by hand, the zip in the release has a readme that says how
 
 - lens: make your own fisheye (distortion, image circle, zoom, how much the edges get squished etc). there's a 16:9
   and a 4:3 fisheye preset to start from
-- frame: 4:3 or 2.39 bars, and you can drop in your own hood / overlay png
+- frame: 4:3 or 2.39 bars, and you can drop in your own hood / overlay (png, jpg, bmp or webp). it keeps its shape
+  and scales from the middle
 - colour: camcorder style colour plus exposure, contrast, grain, vignette and all that
 - focus: depth of field you can keyframe through the clip, or just leave on auto
-- light: a light on the camera, good for night clips
+- light: a real light on the camera, the game lights everything with it, shadows too. you can key it on and off,
+  brighter or warmer along the clip. good for night clips
 - shake: handheld shake that you can turn on and off along the clip
 - game: the game's own effects like motion blur, bloom, lens flares and fog
-- video: a real 4:3 picture that isn't stretched, a sharper middle when you're using a fisheye, and pick where your
-  exported videos go
+- video: a real 4:3 picture that isn't stretched, sharper textures in the middle when you're using a fisheye, and
+  pick where your exported videos go
 - presets: save your look with a name, export it as a file and send it to people. presets people send you go in
   the import folder and just show up
 - experimental: skater autofocus (the focus follows your skater) and keep keys (your keyframes come back when you
   open the editor again)
+- controls: change the R3 button, give any shortcut its own button or a keyboard key, and give presets a button or
+  key so you can switch looks on the fly
 
 ## using it
 
-open a replay, hold R3 and press RB (or hit F10) to open the menu. LB/RB switches tabs, the dpad changes stuff, A
-selects, X resets and B closes it. the mouse and keyboard work in it too.
+open a replay, hold R3 and press RB (or hit F10) to open the menu. it looks and works like the game's own menus:
+LB/RB switches tabs, the dpad changes stuff, A selects, X resets and B closes it. the mouse and keyboard work in it
+too.
 
 holding R3 in the editor also gives you shortcuts without opening the menu: dpad up/down and the triggers set focus
 keys, dpad left turns the shake on or off, dpad right turns the camera light on or off, LB adds a shake key and View
-deletes the keys where you are. tapping R3 still takes a photo like it normally does.
+deletes the keys where you are. tapping R3 still takes a photo like it normally does. you can change all of these
+(and add keyboard keys) in the controls tab.
 
 the [guide](GUIDE.md) has the rest.
 
@@ -82,7 +90,8 @@ the [guide](GUIDE.md) has the rest.
   the replay plus updater instead
 - if you want sharper exports, turn up Export quality in Insert > SETTINGS > REPLAYS
 - the 4:3 picture needs the game in borderless fullscreen (that's the default)
-- the R3 shortcuts need an xinput controller, so an xbox pad, or a ps pad through ds4windows or steam input
+- the R3 shortcuts need an xinput controller, so an xbox pad, or a ps pad through ds4windows or steam input. keys
+  you give them in the controls tab work without one
 
 ## why isn't this a plugin?
 

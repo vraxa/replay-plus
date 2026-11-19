@@ -1,5 +1,6 @@
 #include "replay_plus_settings.h"
 #include "replay_plus_lens.h"
+#include "Extension/ReplayShake/replay_shake_settings.h"
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -74,8 +75,8 @@ const Field all_fields[]{
      "shows: a lens hood's black corners, say), or a round black edge at the lens's image circle", t_frame, k_choice, 0, 2, 1, 1, "", hood_names,
      hood_labels,
      +[](const Settings& s) { return index_of(s.hood); }, +[](Settings& s, float v) { s.hood = enum_from<Hood>(v); }, nullptr},
-    {"frame.size", "Overlay size", "How far the overlay's dark edge reaches in from the corners: 100% as drawn, 50% half as far, 0% none", t_frame,
-     k_number, 0, 2, 0.01f, 100, "%", no_choices, no_choices, +[](const Settings& s) { return s.hood_size; },
+    {"frame.scale", "Overlay size", "How big the overlay is, about the middle: 100% as drawn, fitted whole in the picture and never stretched",
+     t_frame, k_number, 0.25f, 4, 0.01f, 100, "%", no_choices, no_choices, +[](const Settings& s) { return s.hood_size; },
      +[](Settings& s, float v) { s.hood_size = v; }, &hood_on},
     {"frame.opacity", "Overlay strength", "How dark the overlay is drawn", t_frame, k_number, 0, 1, 0.05f, 100, "%", no_choices, no_choices,
      +[](const Settings& s) { return s.hood_opacity; }, +[](Settings& s, float v) { s.hood_opacity = v; }, &hood_on},
@@ -246,7 +247,19 @@ const Field all_fields[]{
     // LIGHT
     {"light.on", "Camera light", "A light on the camera, lighting what it points at", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
      +[](const Settings& s) { return s.light ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light = v >= 0.5f; }, nullptr},
-    {"light.power", "Brightness", "", t_light, k_number, 0, 8, 0.05f, 100, "%", no_choices, no_choices,
+    {"light.real", "Real light", "On: a real light in the game's world, lighting every surface as the game's own lights do, with shadows, in videos "
+     "too. Off: drawn over the picture (the light of earlier versions)", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
+     +[](const Settings& s) { return s.light_real ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light_real = v >= 0.5f; },
+     +[](const Settings& s) { return s.light; }},
+    {"light.shadows", "Shadows", "The light casts shadows, from just above the lens: behind and under what it lights", t_light, k_toggle, 0, 1, 1, 1, "",
+     no_choices, no_choices, +[](const Settings& s) { return s.light_shadows ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light_shadows = v >= 0.5f; },
+     +[](const Settings& s) { return s.light && s.light_real; }},
+    {"light.keyed", "Light keys", "The light follows its keys along the replay: switched on and off, brighter or dimmer, wider or narrower, set at "
+     "the playhead. R3 + D-pad right switches it there", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
+     +[](const Settings& s) { return s.light_keyed ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light_keyed = v >= 0.5f; },
+     +[](const Settings& s) { return s.light; }},
+    {"light.power", "Brightness", "100% lights a skater a few metres away clearly. A real light is brighter close up and dimmer further away",
+     t_light, k_number, 0, 8, 0.05f, 100, "%", no_choices, no_choices,
      +[](const Settings& s) { return s.light_power; }, +[](Settings& s, float v) { s.light_power = v; }, +[](const Settings& s) { return s.light; }},
     {"light.range", "Reach", "How far it lights", t_light, k_number, 1, 50, 0.5f, 1, " m", no_choices, no_choices,
      +[](const Settings& s) { return s.light_range; }, +[](Settings& s, float v) { s.light_range = v; }, +[](const Settings& s) { return s.light; }},
@@ -265,6 +278,9 @@ const Field all_fields[]{
      "keeps its detail at a wide field of view. Costs frame rate in the editor, and time in exports", t_video, k_toggle, 0, 1, 1, 1, "",
      no_choices, no_choices, +[](const Settings& s) { return s.sharp_middle ? 1.0f : 0.0f; },
      +[](Settings& s, float v) { s.sharp_middle = v >= 0.5f; }, nullptr},
+    {"video.sharpen", "Sharpen middle", "With a fisheye, sharpens what the lens enlarges (the middle) so textures stay crisp. Costs no frame rate. "
+     "Sharp middle adds real detail; this brings back the crispness", t_video, k_number, 0, 1, 0.05f, 100, "%", no_choices, no_choices,
+     +[](const Settings& s) { return s.sharpen; }, +[](Settings& s, float v) { s.sharpen = v; }, nullptr},
     {"video.textures", "Bigger texture pool", "Room for more of the game's texture detail, sized from the card's memory (2.5 GB on a 16 GB card; "
      "the game's own is 1.4 GB): a big map's textures stay sharp where they turned to mush. From the next map loaded", t_video, k_toggle, 0, 1, 1,
      1, "", no_choices, no_choices, +[](const Settings& s) { return s.bigger_textures ? 1.0f : 0.0f; },
@@ -435,6 +451,15 @@ Settings clamped(Settings s) {
         key.blur = std::clamp(key.blur, 0.0f, 4.0f);
     }
     if (s.focus_keys.size() > max_focus_keys) s.focus_keys.resize(max_focus_keys);
+    std::erase_if(s.light_keys, [](const LightKey& key) { return !std::isfinite(key.time); });
+    for (auto& key : s.light_keys) {
+        key.power = std::clamp(std::isfinite(key.power) ? key.power : 1.0f, 0.0f, 8.0f);
+        key.range = std::clamp(std::isfinite(key.range) ? key.range : 10.0f, 1.0f, 50.0f);
+        key.cone = std::clamp(std::isfinite(key.cone) ? key.cone : 70.0f, 10.0f, 180.0f);
+        key.warmth = std::clamp(std::isfinite(key.warmth) ? key.warmth : 0.2f, -1.0f, 1.0f);
+    }
+    std::sort(s.light_keys.begin(), s.light_keys.end(), [](const LightKey& a, const LightKey& b) { return a.time < b.time; });
+    if (s.light_keys.size() > max_light_keys) s.light_keys.resize(max_light_keys);
     std::erase_if(s.shake_keys, [](const ShakeKey& key) { return !std::isfinite(key.time); });
     if (s.shake_keys.size() > max_shake_keys) s.shake_keys.resize(max_shake_keys);
     tidy_shake_keys(s);
@@ -508,6 +533,9 @@ void migrate(Settings& s, const Json& values) {
     }
     // The camcorder: the camera curve at its defaults.
     if (flag("grade.camcorder")) s.camera = true;
+    // Overlay size before 1.3 ("frame.size": how far its dark edge reached in from the corners): as the plain scale that
+    // draws it so.
+    if (!values.contains("frame.scale") && values.contains("frame.size")) s.hood_size = lens::scale_for_old_size(s, number("frame.size", 1.0f));
     if (!values.contains("lens.mode")) return;
     // Saved with a lens choice: the image circle's default was then the Mk1's.
     if (!values.contains("lens.circle")) s.circle = mk1_circle;
@@ -560,6 +588,27 @@ Json to_json(const Settings& settings) {
     json["enabled"] = settings.enabled;
     json["values"] = values_json(settings, true);
     json["panel_bind"] = std::format("0x{:x}", settings.panel_bind);
+    {
+        // The controls, by name (readable by hand): {"layer": "R3", "panel": {"pad": "RB", "key": "F10"}, ..., "presets": [...]}.
+        Json controls = Json::object();
+        controls["layer"] = pad_words(settings.pad_layer);
+        for (std::size_t a = 0; a < action_count; ++a) {
+            Json one = Json::object();
+            one["pad"] = pad_words(settings.binds[a].pad);
+            one["key"] = key_name(settings.binds[a].key);
+            controls[std::string(action_names[a])] = std::move(one);
+        }
+        Json presets = Json::array();
+        for (const auto& p : settings.preset_binds) {
+            Json one = Json::object();
+            one["preset"] = p.preset;
+            one["pad"] = pad_words(p.bind.pad);
+            one["key"] = key_name(p.bind.key);
+            presets.push_back(std::move(one));
+        }
+        controls["presets"] = std::move(presets);
+        json["controls"] = std::move(controls);
+    }
     json["preset"] = settings.preset;
     if (!settings.video_folder.empty()) json["video_folder"] = settings.video_folder;
     Json keys = Json::array();
@@ -579,6 +628,18 @@ Json to_json(const Settings& settings) {
         shakes.push_back(std::move(item));
     }
     json["shake_keys"] = std::move(shakes);
+    Json lights = Json::array();
+    for (const auto& key : settings.light_keys) {
+        Json item = Json::object();
+        item["time"] = std::round(key.time * 1e4) / 1e4;
+        item["on"] = key.on;
+        item["power"] = std::round(static_cast<double>(key.power) * 1e3) / 1e3;
+        item["range"] = std::round(static_cast<double>(key.range) * 1e3) / 1e3;
+        item["cone"] = std::round(static_cast<double>(key.cone) * 1e2) / 1e2;
+        item["warmth"] = std::round(static_cast<double>(key.warmth) * 1e3) / 1e3;
+        lights.push_back(std::move(item));
+    }
+    json["light_keys"] = std::move(lights);
     return json;
 }
 
@@ -596,6 +657,37 @@ Settings settings_from_json(const Json& json) {
         }
         if (json.contains("preset") && json.at("preset").is_string()) s.preset = json.at("preset").string();
         if (json.contains("video_folder") && json.at("video_folder").is_string()) s.video_folder = json.at("video_folder").string();
+        if (json.contains("controls") && json.at("controls").is_object()) {
+            const auto& controls = json.at("controls");
+            const auto pad_of = [](const Json& one) -> std::optional<std::uint32_t> {
+                if (!one.is_object() || !one.contains("pad") || !one.at("pad").is_string()) return std::nullopt;
+                const auto& text = one.at("pad").string();
+                if (lower(text) == "none" || text.empty()) return 0u;
+                return replay_shake::parse_binding(text);
+            };
+            const auto key_of = [](const Json& one) -> std::optional<std::uint32_t> {
+                if (!one.is_object() || !one.contains("key") || !one.at("key").is_string()) return std::nullopt;
+                return parse_key(one.at("key").string());
+            };
+            if (controls.contains("layer") && controls.at("layer").is_string())
+                if (const auto layer = replay_shake::parse_binding(controls.at("layer").string()); layer && layer_button(*layer)) s.pad_layer = *layer;
+            for (std::size_t a = 0; a < action_count; ++a) {
+                const std::string name(action_names[a]);
+                if (!controls.contains(name)) continue;
+                const auto& one = controls.at(name);
+                if (const auto pad = pad_of(one)) s.binds[a].pad = *pad;
+                if (const auto key = key_of(one)) s.binds[a].key = *key;
+            }
+            if (controls.contains("presets") && controls.at("presets").is_array())
+                for (const auto& one : controls.at("presets")) {
+                    if (!one.is_object() || !one.contains("preset") || !one.at("preset").is_string()) continue;
+                    PresetBind p;
+                    p.preset = one.at("preset").string();
+                    p.bind.pad = pad_of(one).value_or(0);
+                    p.bind.key = key_of(one).value_or(0);
+                    if (!p.preset.empty() && (p.bind.pad || p.bind.key)) s.preset_binds.push_back(std::move(p));
+                }
+        }
         if (json.contains("focus_keys") && json.at("focus_keys").is_array())
             for (const auto& item : json.at("focus_keys")) {
                 if (!item.is_object() || !item.contains("time") || !item.at("time").is_number()) continue;
@@ -610,6 +702,21 @@ Settings settings_from_json(const Json& json) {
                 const double time = item.at("time").get<double>();
                 const bool on = !item.contains("on") || !item.at("on").is_boolean() || item.at("on").get<bool>();
                 if (std::isfinite(time) && s.shake_keys.size() < max_shake_keys) s.shake_keys.push_back({time, on});
+            }
+        if (json.contains("light_keys") && json.at("light_keys").is_array())
+            for (const auto& item : json.at("light_keys")) {
+                if (!item.is_object() || !item.contains("time") || !item.at("time").is_number()) continue;
+                const auto number = [&](const char* key, float otherwise) {
+                    return item.contains(key) && item.at(key).is_number() ? item.at(key).get<float>() : otherwise;
+                };
+                LightKey key;
+                key.time = item.at("time").get<double>();
+                key.on = !item.contains("on") || !item.at("on").is_boolean() || item.at("on").get<bool>();
+                key.power = number("power", 1.0f);
+                key.range = number("range", 10.0f);
+                key.cone = number("cone", 70.0f);
+                key.warmth = number("warmth", 0.2f);
+                if (std::isfinite(key.time) && s.light_keys.size() < max_light_keys) s.light_keys.push_back(key);
             }
     } catch (...) { /* whatever was read stays */ }
     return clamped(s);
@@ -698,6 +805,272 @@ std::string unused_preset_name(std::string_view name, std::span<const std::strin
     return base;
 }
 
+// ---- Controls ---------------------------------------------------------------------------------------------------------
+namespace vk { // (the virtual-key codes Windows gives keys: no Windows header in the model)
+inline constexpr std::uint32_t add = 0x6b, back = 0x08, capital = 0x14, decimal = 0x6e, del = 0x2e, divide = 0x6f, down = 0x28, end = 0x23, escape = 0x1b, f1 = 0x70, f10 = 0x79, f11 = 0x7a, f24 = 0x87, home = 0x24, insert = 0x2d, left = 0x25, multiply = 0x6a, next = 0x22, numlock = 0x90, numpad0 = 0x60, numpad9 = 0x69, oem_1 = 0xba, oem_102 = 0xe2, oem_2 = 0xbf, oem_3 = 0xc0, oem_4 = 0xdb, oem_5 = 0xdc, oem_6 = 0xdd, oem_7 = 0xde, oem_comma = 0xbc, oem_minus = 0xbd, oem_period = 0xbe, oem_plus = 0xbb, pause = 0x13, prior = 0x21, enter = 0x0d, right = 0x27, scroll = 0x91, snapshot = 0x2c, space = 0x20, subtract = 0x6d, tab = 0x09, up = 0x26;
+} // namespace vk
+Binds default_binds() noexcept {
+    Binds b{};
+    b[static_cast<std::size_t>(Action::panel)] = {0x0200, vk::f10};     // RB, F10
+    b[static_cast<std::size_t>(Action::light)] = {0x0008, 0};          // Right
+    b[static_cast<std::size_t>(Action::shake)] = {0x0004, vk::f11};     // Left, F11
+    b[static_cast<std::size_t>(Action::shake_key)] = {0x0100, 0};      // LB
+    b[static_cast<std::size_t>(Action::delete_keys)] = {0x0020, 0};    // View
+    b[static_cast<std::size_t>(Action::focus_further)] = {0x0001, 0};  // Up
+    b[static_cast<std::size_t>(Action::focus_nearer)] = {0x0002, 0};   // Down
+    b[static_cast<std::size_t>(Action::blur_less)] = {0x10000, 0};     // LT
+    b[static_cast<std::size_t>(Action::blur_more)] = {0x20000, 0};     // RT
+    return b;
+}
+bool layer_button(std::uint32_t bits) noexcept {
+    constexpr std::uint32_t allowed = 0xf3ff & ~0x3000u; // every button but A and B (no triggers)
+    return bits && (bits & (bits - 1)) == 0 && (bits & allowed) == bits;
+}
+namespace {
+struct PadName {
+    std::uint32_t bit;
+    std::string_view name;
+};
+// In the order a combo is written: shoulders and triggers, sticks, face buttons, the D-pad, Start and Back.
+constexpr PadName pad_names[]{{0x100, "LB"}, {0x200, "RB"}, {0x10000, "LT"}, {0x20000, "RT"}, {0x40, "L3"}, {0x80, "R3"},
+                              {0x1000, "A"},  {0x2000, "B"},  {0x4000, "X"},    {0x8000, "Y"},    {0x1, "Up"},  {0x2, "Down"},
+                              {0x4, "Left"},  {0x8, "Right"}, {0x10, "Start"},  {0x20, "Back"}};
+struct KeyName {
+    std::uint32_t vk;
+    std::string_view name;
+};
+constexpr KeyName key_names[]{
+    {vk::back, "Backspace"}, {vk::tab, "Tab"}, {vk::enter, "Enter"}, {vk::pause, "Pause"}, {vk::capital, "CapsLock"}, {vk::escape, "Esc"},
+    {vk::space, "Space"}, {vk::prior, "PgUp"}, {vk::next, "PgDn"}, {vk::end, "End"}, {vk::home, "Home"}, {vk::left, "Left"}, {vk::up, "Up"},
+    {vk::right, "Right"}, {vk::down, "Down"}, {vk::snapshot, "PrtSc"}, {vk::insert, "Insert"}, {vk::del, "Delete"}, {vk::multiply, "Num*"},
+    {vk::add, "Num+"}, {vk::subtract, "Num-"}, {vk::decimal, "Num."}, {vk::divide, "Num/"}, {vk::numlock, "NumLock"}, {vk::scroll, "ScrollLock"},
+    {vk::oem_1, ";"}, {vk::oem_plus, "="}, {vk::oem_comma, ","}, {vk::oem_minus, "-"}, {vk::oem_period, "."}, {vk::oem_2, "/"},
+    {vk::oem_3, "`"}, {vk::oem_4, "["}, {vk::oem_5, "\\"}, {vk::oem_6, "]"}, {vk::oem_7, "'"}, {vk::oem_102, "\\2"}};
+std::string one_key_name(std::uint32_t vk) {
+    if (vk >= 'A' && vk <= 'Z') return std::string(1, static_cast<char>(vk));
+    if (vk >= '0' && vk <= '9') return std::string(1, static_cast<char>(vk));
+    if (vk >= vk::f1 && vk <= vk::f24) return std::format("F{}", vk - vk::f1 + 1);
+    if (vk >= vk::numpad0 && vk <= vk::numpad9) return std::format("Num{}", vk - vk::numpad0);
+    for (const auto& k : key_names)
+        if (k.vk == vk) return std::string(k.name);
+    return std::format("Key{}", vk);
+}
+std::optional<std::uint32_t> one_key(std::string_view text) {
+    const auto t = lower(text);
+    if (t.size() == 1 && ((t[0] >= 'a' && t[0] <= 'z') || (t[0] >= '0' && t[0] <= '9')))
+        return static_cast<std::uint32_t>(std::toupper(static_cast<unsigned char>(t[0])));
+    if (t.size() >= 2 && t[0] == 'f' && t.find_first_not_of("0123456789", 1) == std::string::npos) {
+        const int n = std::atoi(t.c_str() + 1);
+        if (n >= 1 && n <= 24) return static_cast<std::uint32_t>(vk::f1 + n - 1);
+    }
+    if (t.size() == 4 && t.starts_with("num") && t[3] >= '0' && t[3] <= '9') return static_cast<std::uint32_t>(vk::numpad0 + (t[3] - '0'));
+    if (t.starts_with("key") && t.size() > 3 && t.find_first_not_of("0123456789", 3) == std::string::npos) {
+        const int vk = std::atoi(t.c_str() + 3);
+        if (vk > 0 && vk < 256) return static_cast<std::uint32_t>(vk);
+    }
+    for (const auto& k : key_names)
+        if (lower(k.name) == t) return k.vk;
+    // Other names it goes by.
+    constexpr KeyName also[]{{vk::escape, "escape"}, {vk::enter, "return"}, {vk::prior, "pageup"}, {vk::next, "pagedown"}, {vk::del, "del"},
+                             {vk::insert, "ins"}, {vk::back, "bksp"}};
+    for (const auto& k : also)
+        if (k.name == t) return k.vk;
+    return std::nullopt;
+}
+} // namespace
+std::string pad_words(std::uint32_t bits) {
+    if (!bits) return "None";
+    std::string text;
+    for (const auto& n : pad_names)
+        if (bits & n.bit) text += (text.empty() ? "" : "+") + std::string(n.name);
+    return text.empty() ? std::format("0x{:x}", bits) : text;
+}
+std::string key_name(std::uint32_t key) {
+    if (!(key & 0xff)) return "None";
+    std::string text;
+    if (key & key_ctrl) text += "Ctrl+";
+    if (key & key_shift) text += "Shift+";
+    if (key & key_alt) text += "Alt+";
+    return text + one_key_name(key & 0xff);
+}
+std::optional<std::uint32_t> parse_key(std::string_view text) {
+    std::string t(text);
+    if (lower(t) == "none" || t.empty()) return 0u;
+    std::uint32_t mods = 0;
+    // "Ctrl+Shift+1": its modifiers, then the key (a "+" key alone is "Num+" or "=").
+    while (true) {
+        const auto plus = t.find('+');
+        if (plus == std::string::npos || plus + 1 >= t.size()) break;
+        const auto part = lower(t.substr(0, plus));
+        if (part == "ctrl" || part == "control") mods |= key_ctrl;
+        else if (part == "shift") mods |= key_shift;
+        else if (part == "alt") mods |= key_alt;
+        else break;
+        t = t.substr(plus + 1);
+    }
+    const auto key = one_key(t);
+    if (!key) return std::nullopt;
+    return *key | mods;
+}
+namespace {
+// What a bind is bound to: a shortcut, or a preset by name.
+struct Target {
+    bool layer{};
+    std::optional<std::size_t> action;
+    std::string preset;
+};
+Bind* bind_of(Settings& s, const Target& t) {
+    if (t.action) return &s.binds[*t.action];
+    for (auto& p : s.preset_binds)
+        if (lower(p.preset) == lower(t.preset)) return &p.bind;
+    return nullptr;
+}
+std::string target_text(const Target& t) {
+    if (t.layer) return "The shortcut button";
+    if (t.action) return std::string(action_labels[*t.action]);
+    return "Preset " + t.preset;
+}
+}
+// Binds shown as the console lists them.
+std::string binds_text(const Settings& s) {
+    std::string text = std::format("Shortcut button: {} (held in the replay editor; a tap of it alone stays the game's).", pad_words(s.pad_layer));
+    for (std::size_t a = 0; a < action_count; ++a)
+        text += std::format("\n  {}: {}{}{}", action_labels[a], s.binds[a].pad ? pad_words(s.pad_layer) + " + " + pad_words(s.binds[a].pad) : "no button",
+                            s.binds[a].key ? ", " : "", s.binds[a].key ? key_name(s.binds[a].key) : "");
+    for (const auto& p : s.preset_binds)
+        text += std::format("\n  Preset {}: {}{}{}", p.preset, p.bind.pad ? pad_words(s.pad_layer) + " + " + pad_words(p.bind.pad) : "no button",
+                            p.bind.key ? ", " : "", p.bind.key ? key_name(p.bind.key) : "");
+    return text;
+}
+// `bind layer <button>`, `bind <shortcut> pad <buttons> | key <key> | default | clear [pad|key]`, `bind preset <name> pad ... | key
+// ... | clear`, `bind reset`. A button or key another has already is swapped with it (the other gets this one's), so nothing
+// is lost; the menu always keeps a button.
+std::string bind_verb(Settings& s, const std::vector<std::string>& words) {
+    const auto usage = std::string("bind layer <button> | bind <shortcut> pad <button> | key <key> | default | clear [pad|key] | "
+                                   "bind preset <name> pad <button> | key <key> | clear | bind reset. Shortcuts: ") + [] {
+        std::string list;
+        for (const auto n : action_names) list += (list.empty() ? "" : ", ") + std::string(n);
+        return list;
+    }();
+    if (words.empty()) return usage;
+    const auto first = lower(words[0]);
+    if (first == "reset") {
+        s.pad_layer = default_pad_layer;
+        s.binds = default_binds();
+        s.preset_binds.clear();
+        return "The controls are back at their defaults: R3 with the buttons as they came, F10 and F11.";
+    }
+    Target target;
+    std::vector<std::string> rest;
+    if (first == "layer") {
+        target.layer = true;
+        rest.assign(words.begin() + 1, words.end());
+    } else if (first == "preset") {
+        // The name is every word up to the last one or two: "bind preset My look key F5", "bind preset My look clear".
+        if (words.size() < 3) return usage;
+        const auto last = lower(words.back());
+        const std::size_t tail = last == "clear" ? 1 : 2;
+        if (words.size() < 2 + tail) return usage;
+        for (std::size_t i = 1; i + tail < words.size(); ++i) target.preset += (target.preset.empty() ? "" : " ") + words[i];
+        rest.assign(words.end() - static_cast<std::ptrdiff_t>(tail), words.end());
+    } else {
+        const auto at = std::find(action_names.begin(), action_names.end(), first);
+        if (at == action_names.end()) return usage;
+        target.action = static_cast<std::size_t>(at - action_names.begin());
+        rest.assign(words.begin() + 1, words.end());
+    }
+    if (rest.empty()) return usage;
+    const auto how = lower(rest[0]);
+    // The shortcut button.
+    if (target.layer) {
+        const auto bits = how == "default" ? std::optional<std::uint32_t>(default_pad_layer) : replay_shake::parse_binding(rest[0]);
+        if (!bits || !layer_button(*bits)) return "The shortcut button is one of the pad's buttons (not A, B or a trigger): R3, L3, LB, RB, X, Y, Back...";
+        // A shortcut on that button gets the old shortcut button instead.
+        for (auto& b : s.binds)
+            if (b.pad == *bits) b.pad = s.pad_layer;
+        for (auto& p : s.preset_binds)
+            if (p.bind.pad == *bits) p.bind.pad = s.pad_layer;
+        s.pad_layer = *bits;
+        return std::format("The shortcut button is {} now: hold it in the replay editor with the others.", pad_words(*bits));
+    }
+    const bool is_menu = target.action == static_cast<std::size_t>(Action::panel);
+    if (how == "clear") {
+        const auto what = rest.size() > 1 ? lower(rest[1]) : std::string();
+        if (!target.preset.empty()) {
+            // Its button, its key, or both.
+            if (Bind* mine = bind_of(s, target)) {
+                if (what != "key") mine->pad = 0;
+                if (what != "pad") mine->key = 0;
+            }
+            std::erase_if(s.preset_binds, [](const PresetBind& p) { return !p.bind.pad && !p.bind.key; });
+            const Bind* left = bind_of(s, target);
+            if (!left) return std::format("Preset {} has no button or key now.", target.preset);
+            return std::format("Preset {}: {}{}.", target.preset, left->pad ? pad_words(s.pad_layer) + " + " + pad_words(left->pad) : "no button",
+                               left->key ? ", " + key_name(left->key) : std::string(", no key"));
+        }
+        auto& b = s.binds[*target.action];
+        if (what != "key" && !is_menu) b.pad = 0;
+        if (what != "pad") b.key = 0;
+        return std::format("{}: {}{}.", target_text(target), b.pad ? pad_words(s.pad_layer) + " + " + pad_words(b.pad) : "no button",
+                           b.key ? ", " + key_name(b.key) : std::string(", no key"));
+    }
+    if (how == "default") {
+        if (!target.action) return usage;
+        const auto wanted = default_binds()[*target.action];
+        // Its button, its key, or both, through the same swaps as a new one.
+        const auto what = rest.size() > 1 ? lower(rest[1]) : std::string();
+        std::string reply;
+        if (what != "key") reply = bind_verb(s, {words[0], "pad", pad_words(wanted.pad)});
+        if (what != "pad") reply = bind_verb(s, {words[0], "key", key_name(wanted.key)});
+        auto& b = s.binds[*target.action];
+        return std::format("{} is back to {} + {}{}.", target_text(target), pad_words(s.pad_layer), pad_words(b.pad), b.key ? ", " + key_name(b.key) : "");
+    }
+    if (rest.size() < 2 || (how != "pad" && how != "key")) return usage;
+    const bool pad = how == "pad";
+    std::uint32_t value{};
+    if (pad) {
+        const auto bits = lower(rest[1]) == "none" ? std::optional<std::uint32_t>(0u) : replay_shake::parse_binding(rest[1]);
+        if (!bits) return "No such button: LB, RB, LT, RT, L3, R3, A, B, X, Y, Up, Down, Left, Right, Start, Back.";
+        if (*bits == s.pad_layer || (*bits & s.pad_layer)) return std::format("{} is the shortcut button itself: pick another.", pad_words(s.pad_layer));
+        if (!*bits && is_menu) return "The menu always keeps a button.";
+        value = *bits;
+    } else {
+        const auto key = parse_key(rest[1]);
+        if (!key) return "No such key: F1..F24, A..Z, 0..9, Num0..Num9, Insert, Delete, Home, End, PgUp, PgDn, ... (Ctrl+, Shift+, Alt+ before it).";
+        value = *key;
+    }
+    // Its bind (a preset gets one).
+    Bind* mine = bind_of(s, target);
+    if (!mine) {
+        s.preset_binds.push_back({target.preset, {}});
+        mine = &s.preset_binds.back().bind;
+    }
+    const std::uint32_t old = pad ? mine->pad : mine->key;
+    // Another with it already gets this one's old one (swapped): the menu never left with no button.
+    std::string swapped;
+    if (value) {
+        const auto take = [&](Bind& other, std::string_view name) {
+            auto& slot = pad ? other.pad : other.key;
+            if (&other == mine || slot != value) return true;
+            if (pad && &other == &s.binds[static_cast<std::size_t>(Action::panel)] && !old) return false;
+            slot = old;
+            swapped = std::format(" ({} had it: it has {} now.)", name, pad ? (old ? pad_words(old) : "no button") : key_name(old));
+            return true;
+        };
+        for (std::size_t a = 0; a < action_count; ++a)
+            if (!take(s.binds[a], action_labels[a])) return "That is the menu's button, and this has none to give it: pick another.";
+        for (auto& p : s.preset_binds)
+            if (!take(p.bind, "Preset " + p.preset)) return "That is the menu's button, and this has none to give it: pick another.";
+        // (The vector may have moved: mine again.)
+        mine = bind_of(s, target);
+    }
+    (pad ? mine->pad : mine->key) = value;
+    std::erase_if(s.preset_binds, [](const PresetBind& p) { return !p.bind.pad && !p.bind.key; });
+    if (pad)
+        return std::format("{}: {}.{}", target_text(target), value ? pad_words(s.pad_layer) + " + " + pad_words(value) : "no button", swapped);
+    return std::format("{}: {}.{}", target_text(target), value ? key_name(value) : "no key", swapped);
+}
+
 Settings apply_preset(const Settings& current, const Preset& preset) {
     Settings next = preset.settings;
     next.enabled = current.enabled;
@@ -711,9 +1084,16 @@ Settings apply_preset(const Settings& current, const Preset& preset) {
     next.focus_skater = current.focus_skater;
     next.focus_keys = current.focus_keys;
     next.shake_keys = current.shake_keys;
+    // So do the light's keys (and whether it follows them).
+    next.light_keyed = current.light_keyed;
+    next.light_keys = current.light_keys;
     next.pad_shortcuts = current.pad_shortcuts;
     next.keep_keys = current.keep_keys;
     next.video_folder = current.video_folder;
+    // The player's controls go with the player, not a look.
+    next.pad_layer = current.pad_layer;
+    next.binds = current.binds;
+    next.preset_binds = current.preset_binds;
     next.preset = preset.name;
     return clamped(next);
 }
@@ -805,8 +1185,18 @@ Reply command(Settings& settings, std::string_view verb, std::span<const std::st
             fresh.enabled = settings.enabled;
             fresh.panel_bind = settings.panel_bind;
             fresh.video_folder = settings.video_folder; // where videos go is no look
+            // Nor are the player's controls (reset controls puts those back).
+            fresh.pad_layer = settings.pad_layer;
+            fresh.binds = settings.binds;
+            fresh.preset_binds = settings.preset_binds;
             settings = fresh;
             return {"Every Replay Plus value is back at its default.", !(before == settings)};
+        }
+        if (what == "controls") {
+            settings.pad_layer = default_pad_layer;
+            settings.binds = default_binds();
+            settings.preset_binds.clear();
+            return {"The controls are back at their defaults: R3 with the buttons as they came, F10 and F11.", !(before == settings)};
         }
         if (const auto* f = field(what)) {
             f->set(settings, f->get(defaults));
@@ -824,8 +1214,13 @@ Reply command(Settings& settings, std::string_view verb, std::span<const std::st
         return {"reset all, reset <tab> (lens, frame, colour, light, video) or reset <key>."};
     }
     if (v == "bind") {
-        if (words.empty()) return {settings.panel_bind ? std::format("The panel opens on 0x{:x} held.", settings.panel_bind)
-                                                       : std::string("The panel opens on RB + R3 held.")};
+        if (words.empty() || (words.size() == 1 && lower(words[0]) == "list")) return {binds_text(settings)};
+        if (const auto first = lower(words[0]); first == "layer" || first == "reset" || first == "preset" ||
+                                                 std::find(action_names.begin(), action_names.end(), first) != action_names.end()) {
+            const Settings before = settings;
+            const auto reply = bind_verb(settings, std::vector<std::string>(words.begin(), words.end()));
+            return {reply, !(before == settings)};
+        }
         const auto text = lower(words[0]);
         std::uint32_t bind{};
         if (text == "clear" || text == "default" || text == "0") bind = 0;
@@ -929,6 +1324,55 @@ bool remove_focus_key(Settings& s, double time, double tolerance) {
 }
 const FocusKey* focus_key_at(const Settings& s, double time) {
     for (const auto& key : s.focus_keys)
+        if (std::abs(key.time - time) <= 1.0 / 30.0) return &key;
+    return nullptr;
+}
+
+// ---- Light keys ------------------------------------------------------------------------------
+LightAt light_at(const Settings& s, double time) {
+    const LightAt set{s.light, s.light_power, s.light_range, s.light_cone, s.light_warmth};
+    const auto& keys = s.light_keys;
+    if (!s.light_keyed || keys.empty()) return set;
+    const auto of = [&](const LightKey& k) { return LightAt{s.light && k.on, k.power, k.range, k.cone, k.warmth}; };
+    if (!std::isfinite(time) || time <= keys.front().time) return of(keys.front());
+    if (time >= keys.back().time) return of(keys.back());
+    const auto next = std::upper_bound(keys.begin(), keys.end(), time, [](double t, const LightKey& k) { return t < k.time; });
+    const auto& b = *next;
+    const auto& a = *(next - 1);
+    const double span = b.time - a.time;
+    double u = span > 1e-9 ? (time - a.time) / span : 1.0;
+    u = u * u * (3.0 - 2.0 * u); // eased in and out
+    const auto mix = [&](float x, float y) { return static_cast<float>(x + (y - x) * u); };
+    return {s.light && a.on, mix(a.power, b.power), mix(a.range, b.range), mix(a.cone, b.cone), mix(a.warmth, b.warmth)};
+}
+void set_light_key(Settings& s, double time, const LightAt& light) {
+    if (!std::isfinite(time)) return;
+    LightKey key{time, light.on, std::clamp(light.power, 0.0f, 8.0f), std::clamp(light.range, 1.0f, 50.0f), std::clamp(light.cone, 10.0f, 180.0f),
+                 std::clamp(light.warmth, -1.0f, 1.0f)};
+    for (auto& k : s.light_keys)
+        if (std::abs(k.time - time) <= 1.0 / 30.0) {
+            key.time = k.time;
+            k = key;
+            return;
+        }
+    if (s.light_keys.size() >= max_light_keys) return;
+    s.light_keys.push_back(key);
+    std::sort(s.light_keys.begin(), s.light_keys.end(), [](const LightKey& a, const LightKey& b) { return a.time < b.time; });
+}
+bool remove_light_key(Settings& s, double time, double tolerance) {
+    auto best = s.light_keys.end();
+    double nearest = tolerance;
+    for (auto it = s.light_keys.begin(); it != s.light_keys.end(); ++it)
+        if (const double d = std::abs(it->time - time); d <= nearest) {
+            nearest = d;
+            best = it;
+        }
+    if (best == s.light_keys.end()) return false;
+    s.light_keys.erase(best);
+    return true;
+}
+const LightKey* light_key_at(const Settings& s, double time) {
+    for (const auto& key : s.light_keys)
         if (std::abs(key.time - time) <= 1.0 / 30.0) return &key;
     return nullptr;
 }

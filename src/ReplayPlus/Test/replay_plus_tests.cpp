@@ -733,6 +733,44 @@ void focus_tests() {
 }
 } // namespace
 
+// Light keys (the camera light along the replay): eased between keys, switched at them, kept with the replay.
+void light_key_tests() {
+    Settings s;
+    s.light = true;
+    s.light_power = 1.5f;
+    check(light_at(s, 5).on && near(light_at(s, 5).power, 1.5), "not keyed: the light as it is set");
+    s.light_keyed = true;
+    check(light_at(s, 5).on && near(light_at(s, 5).power, 1.5), "keyed with no keys: as it is set");
+    set_light_key(s, 4.0, {true, 3.0f, 20.0f, 120.0f, -0.5f});
+    set_light_key(s, 2.0, {true, 1.0f, 10.0f, 60.0f, 0.5f});
+    set_light_key(s, 6.0, {false, 1.0f, 10.0f, 60.0f, 0.5f});
+    check(s.light_keys.size() == 3 && s.light_keys[0].time == 2.0 && s.light_keys[2].time == 6.0, "light keys in time order");
+    check(light_at(s, 0).on && near(light_at(s, 0).power, 1), "before the first key: the first");
+    check(light_at(s, 3).on && near(light_at(s, 3).power, 2) && near(light_at(s, 3).cone, 90), "halfway: halfway (eased)");
+    check(light_at(s, 2.5).power < light_at(s, 3.5).power, "it brightens towards the brighter key");
+    check(light_at(s, 5.99).on && !light_at(s, 6.0).on && !light_at(s, 9).on, "it switches off at the off key and stays off");
+    set_light_key(s, 4.01, {false, 2.0f, 15.0f, 90.0f, 0.0f});
+    check(s.light_keys.size() == 3 && !s.light_keys[1].on && s.light_keys[1].time == 4.0, "a key within a frame is updated, not doubled");
+    s.light = false;
+    check(!light_at(s, 3).on, "the Camera light switch still turns it all off");
+    s.light = true;
+    // Saved and read back.
+    const auto back = settings_from_json(to_json(s));
+    check(back.light_keyed && back.light_keys == s.light_keys, "light keys survive saving");
+    const auto odd = settings_from_json(Json::parse(R"({"light_keys":[{"power":3},{"time":"x"},{"time":1,"power":99,"cone":2,"range":-1},5]})"));
+    check(odd.light_keys.size() == 1 && odd.light_keys[0].power == 8.0f && odd.light_keys[0].cone == 10.0f && odd.light_keys[0].range == 1.0f,
+          "odd light keys: only what makes sense, within range");
+    // A look loaded keeps the replay's light keys.
+    Preset p;
+    p.name = "Look";
+    const auto loaded = apply_preset(s, p);
+    check(loaded.light_keyed && loaded.light_keys == s.light_keys, "loading a look keeps the light's keys");
+    check(remove_light_key(s, 4.1, 0.25) && s.light_keys.size() == 2 && !light_key_at(s, 4.0), "the key in reach is taken away");
+    Settings many;
+    for (int i = 0; i < 300; ++i) set_light_key(many, i * 0.1, {true, 1, 10, 70, 0});
+    check(many.light_keys.size() == max_light_keys, "light keys are kept to so many");
+}
+
 // Shake keys (on and off along the replay) and how Replay Shake fades them (replay_shake_model.h gate_at).
 void shake_key_tests() {
     Settings s;
@@ -907,12 +945,12 @@ void compression_tests() {
             check(near(th, across, 1e-3), std::format("circles stay circles (r {:.1f}, phi {:.1f}: {:.4f} against {:.4f})", r, phi, th, across));
         }
     }
-    // The hood at full and at half size, each compressed just enough at 150 degrees: out to its corners never
-    // turning back, never stretched past about 1.3 times the lens, what shows inside the game's picture; a smaller
-    // hood needs more compression, the middle the same.
+    // The hood as drawn and a little larger (its dark corners further out: 105%), each compressed just enough at 150
+    // degrees: out to its corners never turning back, never stretched past about 1.3 times the lens, what shows
+    // inside the game's picture; a larger hood shows more, so needs more compression, the middle the same.
     float needed[2]{};
     for (const int which : {0, 1}) {
-        const float size = which == 0 ? 1.0f : 0.5f;
+        const float size = which == 0 ? 1.0f : 1.05f;
         Settings v = lens_set;
         v.hood_size = size;
         for (int i = 0; i <= 500; ++i) {
@@ -942,7 +980,7 @@ void compression_tests() {
         check(most_stretch > 1.05f && most_stretch < 1.4f, std::format("never stretched past about 1.3 times the lens ({:.2f}, hood {:.0f}%)", most_stretch,
                                                                        size * 100));
     }
-    check(needed[1] > needed[0], std::format("a smaller hood shows more, so needs more compression ({:.3f} against {:.3f})", needed[1], needed[0]));
+    check(needed[1] > needed[0], std::format("a larger hood shows more, so needs more compression ({:.3f} against {:.3f})", needed[1], needed[0]));
 }
 
 // The overlay's size and its picture's see-through middle.
@@ -955,31 +993,64 @@ void hood_tests() {
     s.hood = Hood::picture;
     s.hood_file = std::string(mk1_hood_file);
     const float corner = 5.0f / 3.0f;
-    // How far in from the window's corner the black reaches, along the diagonal (q).
-    const auto black_from_corner = [&](float size) {
+    // How far out what shows reaches along the window's diagonal (q), at a size.
+    const auto shows_to = [&](float size) {
         Settings v = s;
         v.hood_size = size;
         const auto f = lens::frame_for(v, 4.0f / 3.0f, radians(150), &hole);
-        return corner - lens::visible_radius(f, 0.8f, 0.6f);
+        return lens::visible_radius(f, 0.8f, 0.6f);
     };
-    const float drawn = black_from_corner(1.0f);
-    check(drawn > 0.1f && drawn < 0.25f, std::format("the Mk1 hood's black reaches {:.3f} in from the corner", drawn));
-    check(near(black_from_corner(0.5f), drawn * 0.5f, 1e-3), "at half size, half as far");
-    check(near(black_from_corner(2.0f), drawn * 2.0f, 1e-3), "at twice the size, twice as far");
+    const float drawn = shows_to(1.0f);
+    check(corner - drawn > 0.1f && corner - drawn < 0.25f, std::format("the Mk1 hood's black reaches {:.3f} in from the corner", corner - drawn));
+    check(near(shows_to(0.5f), drawn * 0.5f, 1e-3), "at half size, its see-through middle half as far out: a plain scale");
+    check(near(shows_to(1.05f), drawn * 1.05f, 1e-3), "at 105%, that much further out");
     {
         Settings v = s;
-        v.hood_size = 0.5f;
+        v.hood_size = 1.5f;
         const auto f = lens::frame_for(v, 4.0f / 3.0f, radians(150), &hole);
-        check(f.hood_scale > 1.0f && near(lens::hood_uv(f, 4.0f / 3.0f, 1.0f)[0], 0.5f + 0.5f / f.hood_scale, 1e-6),
-              "a smaller hood is its picture drawn larger about the middle");
+        check(near(lens::hood_uv(f, 4.0f / 3.0f, 1.0f)[0], 0.5f + 0.5f / 1.5f, 1e-6) && near(lens::hood_uv(f, 4.0f / 3.0f, 1.0f)[1], 0.5f - 0.5f / 1.5f, 1e-6),
+              "a larger overlay is its picture drawn larger about the middle, the same both ways");
     }
-    // The circle overlay at its size: its edge moved out from where the lens sees 90 degrees.
+    // Its shape kept: a square picture in a 4:3 window is a square (its round middle stays round), as high as the
+    // window, its edges carried on at the sides; a 16:9 one as wide as the window; a 3:2 hood (made for a 4:3 frame,
+    // within 13% of it) fills the window as it was made to.
+    const auto extent = [&](float aspect, float size, float window) {
+        lens::Hole h;
+        h.aspect = aspect;
+        Settings v = s;
+        v.hood_size = size;
+        v.bars = window == 4.0f / 3.0f ? Bars::four_three : Bars::none;
+        return lens::hood_extent(lens::frame_for(v, window, radians(150), &h));
+    };
+    check(near(extent(1.0f, 1.0f, 4.0f / 3.0f)[0], 1.0f, 1e-6) && near(extent(1.0f, 1.0f, 4.0f / 3.0f)[1], 1.0f, 1e-6), "a square picture stays square");
+    check(near(extent(1.0f, 1.2f, 4.0f / 3.0f)[0], 1.2f, 1e-6) && near(extent(1.0f, 1.2f, 4.0f / 3.0f)[1], 1.2f, 1e-6), "and scales evenly about the middle");
+    check(near(extent(16.0f / 9.0f, 1.0f, 4.0f / 3.0f)[0], 4.0f / 3.0f, 1e-5) && near(extent(16.0f / 9.0f, 1.0f, 4.0f / 3.0f)[1], 0.75f, 1e-5),
+          "a 16:9 picture in a 4:3 window: as wide as it, its own height");
+    check(near(extent(1.5f, 1.0f, 4.0f / 3.0f)[0], 4.0f / 3.0f, 1e-5) && near(extent(1.5f, 1.0f, 4.0f / 3.0f)[1], 1.0f, 1e-5),
+          "a 3:2 hood in a 4:3 window fills it (made for it)");
+    check(near(extent(4.0f / 3.0f, 1.0f, 16.0f / 9.0f)[0], 4.0f / 3.0f, 1e-5) && near(extent(4.0f / 3.0f, 1.0f, 16.0f / 9.0f)[1], 1.0f, 1e-5),
+          "a 4:3 picture on a 16:9 screen keeps its shape");
+    // The circle overlay at its size: its edge that much further out from where the lens sees 90 degrees.
     Settings c = s;
     c.hood = Hood::circle;
     c.circle = 1.54f;
-    c.hood_size = 0.5f;
+    c.hood_size = 1.1f;
     const auto f = lens::frame_for(c, 4.0f / 3.0f, radians(150), nullptr);
-    check(near(f.hood_circle, corner - 0.5f * (corner - 1.54f), 1e-5), "the circle's edge half as far in from the corner");
+    check(near(f.hood_circle, 1.54f * 1.1f, 1e-5), "the circle at 110%: its edge 1.1 times as far out");
+    // Overlay size saved before 1.3 (how far its dark edge reached in from the corners) is read as the scale that draws
+    // it so: the Mk1 hood in 4:3 at "50%" was about 5% larger; "100%" as drawn; the circle from its own edge.
+    {
+        const auto old = settings_from_json(Json::parse(
+            R"({"values":{"frame.hood":"picture","frame.file":"Mk1 hood.png","frame.size":0.5,"frame.bars":"4:3","video.aspect":"4:3"}})"));
+        check(near(old.hood_size, 1.0527, 2e-3), std::format("an old 50% Mk1 hood is {:.4f} now", old.hood_size));
+        const auto same = settings_from_json(Json::parse(R"({"values":{"frame.hood":"picture","frame.size":1}})"));
+        check(near(same.hood_size, 1.0, 1e-6), "an old 100% is 100%");
+        const auto circle = settings_from_json(Json::parse(R"({"values":{"frame.hood":"circle","lens.circle":1.865,"frame.size":0.33}})"));
+        const float corner16 = std::sqrt(16.0f / 9.0f * 16.0f / 9.0f + 1.0f);
+        check(near(circle.hood_size, (corner16 - 0.33f * (corner16 - 1.865f)) / 1.865f, 1e-3), "an old circle at 33% is its edge as far out");
+        const auto kept = settings_from_json(Json::parse(R"({"values":{"frame.hood":"picture","frame.size":0.5,"frame.scale":1.3}})"));
+        check(near(kept.hood_size, 1.3, 1e-6), "a size saved now is as saved");
+    }
     // The picture's hole, measured: a transparent ellipse in an opaque frame.
     const std::uint32_t w = 400, h = 300;
     std::vector<std::uint8_t> rgba(std::size_t{w} * h * 4, 255);
@@ -1000,7 +1071,9 @@ void hood_tests() {
     check(!lens::measure_hole(solid.data(), w, h).known, "no see-through middle: none");
     std::vector<std::uint8_t> clear(std::size_t{w} * h * 4, 0);
     const auto open = lens::measure_hole(clear.data(), w, h);
-    check(open.known && open.radius[0] >= 1.0f && open.radius[lens::hole_steps] >= 1.0f, "see-through to its edges");
+    check(open.known && near(open.radius[0], 1.0, 0.01) && near(open.radius[lens::hole_steps], 1.0, 0.01) &&
+              near(open.radius[lens::hole_steps / 2], std::sqrt(2.0), 0.01),
+          "see-through to its edges: as far as its edges (black past them)");
 }
 
 // The camera curve's values: at their defaults as they have always been, each one doing what it says.
@@ -1155,6 +1228,14 @@ void keep_tests() {
     check(near(link::timeline_share(chunks, 120.0, 38.0, 149.3), 0.7381f, 1e-3f), "half way through the second");
     check(link::timeline_share(chunks, 120.0, 38.0, 100.0) < 0, "between them, no place");
     check(near(link::timeline_share({}, 120.0, 38.0, 139.0), 0.5f), "no chunks known: one stretch from the start");
+    // Trimmed (seen 2026-11-19: 46.9 s of footage trimmed to its last 7.696 s): the timeline shows the trimmed part, the
+    // chunks are shares of the whole replay.
+    const std::vector<link::Chunk> whole{{32.636, 79.536, 0.0f, 1.0f}};
+    check(near(link::timeline_share(whole, 71.84, 7.696, 71.8403, 0.8359f, 1.0f), 0.0f, 2e-3f), "the trim's start is the trimmed timeline's start");
+    check(near(link::timeline_share(whole, 71.84, 7.696, 75.4236, 0.8359f, 1.0f), 0.4656f, 2e-3f), "the playhead where the editor has it");
+    check(near(link::timeline_share(whole, 71.84, 7.696, 79.536, 0.8359f, 1.0f), 1.0f, 1e-3f), "the replay's end is the trimmed timeline's end");
+    check(link::timeline_share(whole, 71.84, 7.696, 50.0, 0.8359f, 1.0f) < 0, "trimmed away, no place");
+    check(near(link::timeline_share(whole, 71.84, 7.696, 50.0), 0.3702f, 1e-3f), "the whole replay as it was before");
 }
 
 // The white of the game's picture under its UI, found from rows of the screen and of the picture they were made from.
@@ -1303,12 +1384,86 @@ void white_tests() {
     check(!track.add(0.0f) && !track.add(std::nanf("")), "nothing measured is ignored");
 }
 
+// CONTROLS: the shortcut button, each shortcut's button and key, presets' (Settings::binds, `replayplus bind`).
+void bind_tests() {
+    Settings s;
+    const auto& b = s.binds;
+    const auto at = [](Action a) { return static_cast<std::size_t>(a); };
+    check(s.pad_layer == 0x80 && b[at(Action::panel)].pad == 0x200 && b[at(Action::panel)].key == 0x79 && b[at(Action::shake)].key == 0x7a,
+          "as they came: R3, R3 + RB and F10 the menu, F11 the shake");
+    // Names both ways.
+    check(key_name(0x79) == "F10" && key_name(0x31 | key_ctrl) == "Ctrl+1" && key_name(0) == "None", "keys' names: " + key_name(0x31 | key_ctrl));
+    for (const auto* name : {"F10", "Ctrl+1", "Shift+Alt+G", "Num5", "PgUp", "Delete", "Space", "Num+", "=", "None"}) {
+        const auto key = parse_key(name);
+        check(key.has_value() && key_name(*key) == name, std::string("a key's name and back: ") + name);
+    }
+    check(!parse_key("Florp").has_value(), "no such key");
+    check(pad_words(0x200) == "RB" && pad_words(0x8) == "Right" && pad_words(0x10000) == "LT" && pad_words(0) == "None", "buttons' names");
+    check(layer_button(0x80) && layer_button(0x40) && layer_button(0x8000) && !layer_button(0x1000) && !layer_button(0x2000) &&
+              !layer_button(0x10000) && !layer_button(0x300),
+          "the shortcut button: one button, not A, B or a trigger");
+    // A shortcut's button, a key; another's taken: swapped.
+    auto reply = run(s, "bind", {"light", "pad", "Y"});
+    check(reply.changed && s.binds[at(Action::light)].pad == 0x8000, "the light on Y: " + reply.text);
+    reply = run(s, "bind", {"light", "pad", "LB"});
+    check(s.binds[at(Action::light)].pad == 0x100 && s.binds[at(Action::shake_key)].pad == 0x8000, "LB was the shake key's: it has Y now: " + reply.text);
+    reply = run(s, "bind", {"shake", "key", "F10"});
+    check(s.binds[at(Action::shake)].key == 0x79 && s.binds[at(Action::panel)].key == 0x7a, "F10 to the shake: the menu gets F11: " + reply.text);
+    reply = run(s, "bind", {"light", "key", "Ctrl+L"});
+    check(s.binds[at(Action::light)].key == (0x4cu | key_ctrl), "a key with Ctrl: " + reply.text);
+    reply = run(s, "bind", {"light", "pad", "R3"});
+    check(!reply.changed, "the shortcut button itself is no shortcut's button: " + reply.text);
+    reply = run(s, "bind", {"panel", "pad", "none"});
+    check(!reply.changed && s.binds[at(Action::panel)].pad == 0x200, "the menu always keeps a button: " + reply.text);
+    reply = run(s, "bind", {"light", "clear", "key"});
+    check(s.binds[at(Action::light)].key == 0 && s.binds[at(Action::light)].pad == 0x100, "clear key: only the key goes");
+    reply = run(s, "bind", {"light", "default"});
+    check(s.binds[at(Action::light)] == default_binds()[at(Action::light)], "default: as it came: " + reply.text);
+    // The shortcut button: one of the shortcuts on that button gets the old one.
+    reply = run(s, "bind", {"layer", "L3"});
+    check(s.pad_layer == 0x40, "L3 the shortcut button: " + reply.text);
+    reply = run(s, "bind", {"layer", "RB"});
+    check(s.pad_layer == 0x200 && s.binds[at(Action::panel)].pad == 0x40, "RB the shortcut button: the menu gets L3: " + reply.text);
+    reply = run(s, "bind", {"layer", "A"});
+    check(!reply.changed && s.pad_layer == 0x200, "not A: " + reply.text);
+    // Presets by name (several words), a button or a key; one that takes the menu's button with none to give is refused.
+    reply = run(s, "bind", {"preset", "My", "look", "key", "F5"});
+    check(s.preset_binds.size() == 1 && s.preset_binds[0].preset == "My look" && s.preset_binds[0].bind.key == 0x74, "a preset on F5: " + reply.text);
+    reply = run(s, "bind", {"preset", "My", "look", "pad", "L3"});
+    check(!reply.changed && s.binds[at(Action::panel)].pad == 0x40, "the menu's button, nothing to swap: refused: " + reply.text);
+    reply = run(s, "bind", {"preset", "My", "look", "pad", "X"});
+    check(s.preset_binds[0].bind.pad == 0x4000, "a preset on X: " + reply.text);
+    // Kept with the player: a preset loaded, reset all; saved and read back.
+    Preset look;
+    look.name = "Other";
+    const auto loaded = apply_preset(s, look);
+    check(loaded.pad_layer == s.pad_layer && loaded.binds == s.binds && loaded.preset_binds == s.preset_binds, "a preset loaded keeps the controls");
+    Settings again = s;
+    run(again, "reset", {"all"});
+    check(again.binds == s.binds && again.pad_layer == s.pad_layer, "reset all keeps the controls");
+    const auto back = settings_from_json(Json::parse(to_json(s).dump(2)));
+    check(back.pad_layer == s.pad_layer && back.binds == s.binds && back.preset_binds == s.preset_binds, "the controls saved and read back");
+    const auto old = settings_from_json(Json::parse(R"({"values":{}})"));
+    check(old.binds == default_binds() && old.pad_layer == default_pad_layer, "settings from before: the controls as they came");
+    // One side at a time (the panel's columns): a preset's key cleared keeps its button; a shortcut's key back to how it came
+    // keeps its button.
+    reply = run(s, "bind", {"preset", "My", "look", "clear", "key"});
+    check(s.preset_binds.size() == 1 && s.preset_binds[0].bind.key == 0 && s.preset_binds[0].bind.pad == 0x4000, "a preset's key cleared: " + reply.text);
+    run(s, "bind", {"shake", "pad", "Y"});
+    run(s, "bind", {"shake", "key", "G"});
+    reply = run(s, "bind", {"shake", "default", "key"});
+    check(s.binds[at(Action::shake)].pad == 0x8000 && s.binds[at(Action::shake)].key == 0x7a, "only the key back to F11: " + reply.text);
+    reply = run(s, "bind", {"preset", "My", "look", "clear"});
+    check(s.preset_binds.empty(), "a preset's cleared");
+    run(s, "reset", {"controls"});
+    check(s.binds == default_binds() && s.pad_layer == default_pad_layer, "reset controls");
+}
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> suites{
         {"fields", field_tests}, {"commands", command_tests}, {"json", json_tests}, {"presets", preset_tests},
         {"lens", lens_tests}, {"grade", grade_tests}, {"finish", finish_tests}, {"focus", focus_tests},
-        {"shake keys", shake_key_tests}, {"view", view_tests}, {"edge compression", compression_tests}, {"overlay", hood_tests},
-        {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}};
+        {"shake keys", shake_key_tests}, {"light keys", light_key_tests}, {"view", view_tests}, {"edge compression", compression_tests}, {"overlay", hood_tests},
+        {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}, {"controls", bind_tests}};
     try {
         for (const auto& [name, suite] : suites) {
             suite();

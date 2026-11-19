@@ -48,7 +48,9 @@ for your studio version, renamed to ReSkate.dll), and set `"updates"` to `false`
 
 ## the menu
 
-in the replay editor hold R3 and press RB, or press F10.
+in the replay editor hold R3 and press RB, or press F10 (you can change both in the controls tab). it looks and works
+like the replay editor's own lists, with the game's own fonts and button icons (read from your game, so they match
+whatever pad you're using).
 
 - LB / RB: tabs
 - dpad: up and down picks a row, left and right changes it (hold to go faster)
@@ -69,13 +71,19 @@ hold R3 in the replay editor and:
 - RB: open the menu
 - dpad up / down: focus further / nearer (puts a focus key where you are)
 - LT / RT: less / more blur
-- dpad right: camera light on / off
+- dpad right: camera light on / off (with light keys on, it puts a key there that switches it)
 - dpad left: shake on / off
 - LB: a shake key (turns the shake on or off from that point)
 - View: delete the keys where you are
 
 F10 opens the menu and F11 turns the shake on or off. focus keys show up blue and shake keys orange on the
-timeline. a quick tap of R3 is still the game's photo button.
+timeline, and light keys gold above them. a quick tap of R3 is still the game's photo button.
+
+all of these can be changed in the CONTROLS tab: hold another button instead of R3, give any shortcut a different
+button or a keyboard key (F10 and F11 included), and give your presets a button or key so you can switch looks on
+the fly. each row has a controller column and a keyboard column: pick the row, left / right for the column, press A
+(Enter, or click the one you want), then press the button or key. B or Esc cancels, X puts that one back how it came.
+if another shortcut already has that button or key, the two swap.
 
 ## the tabs
 
@@ -83,26 +91,33 @@ timeline. a quick tap of R3 is still the game's photo button.
 - lens: the fisheye. distortion (0% is no lens at all), image circle, edge squish, zoom and squeeze, plus fringe,
   shade, glare and softness if you want it to look like cheap glass. the field of view can be the editor's own,
   fixed, or auto
-- frame: 4:3 or 2.39 bars, and an overlay, either your own png (a lens hood or whatever) or a round edge
+- frame: 4:3 or 2.39 bars, and an overlay, either your own picture (a lens hood or whatever: png, jpg, bmp or webp,
+  see-through where the picture shows) or a round edge. an overlay keeps its own shape, it's never stretched, and
+  Overlay size just scales it from the middle
 - colour: a camcorder curve, exposure, contrast, saturation, warmth, lift / gamma / gain, split toning, grain
   and vignette
 - focus: depth of field, fixed, keyframed along the replay, or auto (whatever's in the middle). it blurs what's
   behind the focus too
-- light: a light on the camera
+- light: a real light on the camera. the game lights everything with it like its own lights, shadows too, and it
+  shows up in exported videos. light keys let you switch it on and off and change how bright, wide and warm it is
+  along the replay (between keys it eases from one to the next). turn real light off for the old one drawn over the
+  picture
 - game: the game's own effects held where you put them (motion blur, bloom, lens flares, fog, exposure and so on)
-- video: sharp middle (renders finer so a wide fisheye doesn't go soft in the middle), the editor's picture shape
+- video: sharpen middle (crisper textures where the fisheye blows the picture up, costs nothing), sharp middle (renders
+  finer so a wide fisheye doesn't go soft in the middle, costs frame rate), the editor's picture shape
   (a real 4:3 that isn't stretched), render resolutions, a bigger texture pool for big maps, and where your exported
   videos go
 - presets: your saved looks
 - experimental: newer stuff that reads the game's own replay, so a game update might break it for a bit. Skater
   autofocus (auto follows your skater wherever they are in the shot instead of whatever's in the middle) and Keep
   keys (below)
+- controls: the shortcut button, each shortcut's button and key, and buttons or keys for your presets
 
 ## keeping your keys
 
 the game wipes your camera keyframes when you leave the replay editor. with Keep keys on (experimental tab, it's on
-by default) they're saved when you leave and put back when you open the editor again, along with your focus and shake
-keys, as long as that bit of footage is still in the replay. turn it off and every visit starts clean. keys don't
+by default) they're saved when you leave and put back when you open the editor again, along with your focus, shake
+and light keys, as long as that bit of footage is still in the replay. turn it off and every visit starts clean. keys don't
 carry over a game restart, since the replay's gone by then.
 
 ## presets
@@ -122,18 +137,24 @@ there are two to start from, Fisheye 16-9 and Fisheye 4-3. if you delete them th
 | presets | `%LOCALAPPDATA%\ReSkate\Replay Plus\Presets` |
 | presets people send you | `%LOCALAPPDATA%\ReSkate\Replay Plus\Import` |
 | presets you export | `%LOCALAPPDATA%\ReSkate\Replay Plus\Export` |
-| overlay pngs | `%LOCALAPPDATA%\ReSkate\Replay Plus\Overlays` |
+| overlay pictures | `%LOCALAPPDATA%\ReSkate\Replay Plus\Overlays` |
 | exported videos | the game's own folder (`%LOCALAPPDATA%\ReSkate\Game\Skate\data\Videos`), or wherever you set Videos go to (video tab) |
 | settings | `%LOCALAPPDATA%\ReSkate\profiles\offline\replay_plus.json` |
 
 ## good to know
 
-- everything shows up in exported videos too, not just on screen
+- everything shows up in exported videos too (mp4 or webm), not just on screen, keys included, wherever the playhead
+  is when you hit export
+- the camera light gets weaker the further away things are, like a real one, so a close-up can blow out at the same
+  power that looks right from a few metres. turn it down for close-ups, or key it
+- an overlay made for another shape (a square one while you film in 4:3) stays the shape it is, with black past its
+  edges
 - for sharper exports turn up Export quality in Insert > SETTINGS > REPLAYS
 - with your own video folder set, each export gets moved there a second or two after it's done. the game's own
   "exported" popup still says your AppData folder, just ignore that
 - the 4:3 picture shape needs the game in borderless fullscreen (that's the default)
-- the R3 shortcuts need an xinput controller, so an xbox pad, or a ps pad through ds4windows or steam input
+- the R3 shortcuts need an xinput controller, so an xbox pad, or a ps pad through ds4windows or steam input. keys
+  you give them in the controls tab work without one
 - the studio's own updater is off in this dll since it would put back a studio without replay plus. use the
   replay plus updater instead
 - `replayplus help` in the console (~) lists every command

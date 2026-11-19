@@ -70,8 +70,11 @@ struct Chunk {
     bool operator==(const Chunk&) const = default;
 };
 // The timeline's share (0..1) at a time on the replay's clock: through its chunk when the chunks are known (-1 in none
-// of them), else as one stretch from the timeline's start.
-float timeline_share(const std::vector<Chunk>& chunks, double timeline_start, double timeline_length, double clock) noexcept;
+// of them, or off the timeline), else as one stretch from the timeline's start. The chunks' shares are of the whole
+// replay; the timeline shows the part of it from bar_from to bar_to (the trimmed part, once the replay is trimmed: the
+// editor's bar and its seconds are then the trimmed part's, 2026-11-19).
+float timeline_share(const std::vector<Chunk>& chunks, double timeline_start, double timeline_length, double clock, float bar_from = 0.0f,
+                     float bar_to = 1.0f) noexcept;
 
 struct ShakeView {
     bool available{}, on{};
@@ -106,11 +109,13 @@ struct View {
     bool timeline_ok{};
     double timeline_start{}, timeline_length{};
     std::vector<Chunk> chunks; // the replay's footage (none known: one stretch from timeline_start)
+    float bar_from{}, bar_to{1.0f}; // the part of the whole replay the timeline shows (timeline_share)
     // The shake at the playhead (its keys, or Replay Shake's own switch), and that switch.
     bool shake_here{}, shake_switch{};
     // R3 is held in the replay editor (its shortcuts' guide shows), and what the last shortcut did (and
     // when, now_ms()).
     bool r3_held{};
+    bool light_on_here{}; // keyed: the light's keys have it on at the playhead
     std::string toast;
     std::uint64_t toast_at{};
     // Where exported videos go (UTF-8), and whether that is a folder of the player's own (else the game's).
@@ -175,6 +180,10 @@ bool finish_export_on_gpu(std::uint8_t* pixels, std::uint32_t width, std::uint32
 // still works. ReSkate's own reads (Replay Plus's among them) see the pad as it is.
 void renew_pad_layer() noexcept;
 void inject_pad(std::uint16_t buttons, std::uint64_t ms) noexcept;
+// The shortcut button (Settings::pad_layer, R3 unless the player picked another): what pad_filter keeps from the game.
+std::atomic<std::uint16_t>& pad_layer_button() noexcept;
+// The panel waits for a button or key to bind (CONTROLS): the game thread's shortcuts and keys do nothing meanwhile.
+std::atomic<bool>& panel_capturing() noexcept;
 // The game's read of the pad, changed in place; whether anything was changed.
 bool pad_filter(std::uint16_t& buttons, std::uint8_t& left_trigger, std::uint8_t& right_trigger, std::int16_t& right_x,
                 std::int16_t& right_y) noexcept;
@@ -252,4 +261,11 @@ std::string take_white_dump() noexcept;
 inline constexpr float light_facing_metres_default = 0.25f, light_facing_weight_default = 0.0f;
 std::atomic<float>& light_facing_metres() noexcept;
 std::atomic<float>& light_facing_weight() noexcept;
+// The camera light is a light of the game's now (replay_plus_light.h, made by the game thread): the pass does not
+// draw it over the picture as well.
+std::atomic<bool>& game_light() noexcept;
+// The camera light is on now: as set, or with light keys as they have it at the playhead (the game thread's, each tick).
+// Off, the pass draws none over the picture either (2026-11-19: keyed off, the game's light went and the pass drew its
+// own in its place).
+std::atomic<bool>& light_on_now() noexcept;
 } // namespace dingosdk::replay_plus::link

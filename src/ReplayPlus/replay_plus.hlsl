@@ -25,7 +25,7 @@ cbuffer ReplayPlusPass : register(b0)
     float4 P8; // camera light: colour r, g, b; the game's near plane (m)
     float4 P9; // the game's far plane (m), the depth is there (1), one depth texel across, up (uv)
     float4 P10; // the lens's corner shade (stops), edge softness, squeeze (across, before the lens), its edge compression's ease (per radian; 0 none)
-    float4 P11; // the camera curve (1 on), the lens's veiling glare (light added before the grade), the picture overlay's scale, the camera's toe slope
+    float4 P11; // the camera curve (1 on), the lens's veiling glare (light added before the grade), the picture overlay's half-height (q), the camera's toe slope
     float4 P12; // the colour matrix's first row (hue and saturation), lift
     float4 P13; // its second row, gamma
     float4 P14; // its third row, gain
@@ -33,7 +33,7 @@ cbuffer ReplayPlusPass : register(b0)
     float4 P16; // split toning: the highlights' offset r, g, b; film grain
     float4 P17; // grain size (pixels), the frame's seed, vignette power, vignette roundness
     float4 P18; // the camera curve: gamma, knee, knee slope, black level
-    float4 P19; // the camera curve: white clip, colour level; unused, unused
+    float4 P19; // the camera curve: white clip, colour level; the enlarged middle's sharpening (0 none, 1 the most); the picture overlay's half-width (q)
     float4 P20; // the game's display mapping (transfer 3): t0, its toe's slope s1, its shoulder's slope s2, the bend x0
     float4 P21; // the bend's width w, log2 of the scale the picture is taken at; the camera light's facing smoothed over (m, 0 none), how much it counts
 };
@@ -399,7 +399,27 @@ void easu_tap(inout float3 aC, inout float aW, float2 off, float2 dir, float2 le
     aC += c * w;
     aW += w;
 }
-float3 sample_easu(float2 uv)
+// The enlarged middle's sharpening: where the fisheye enlarges the game's picture, each of its pixels is spread
+// over several of the screen's and the game's own softness (its temporal antialiasing) is enlarged with them:
+// skater textures looked like mush. Each pixel the interpolation reads is sharpened first, after AMD FidelityFX
+// FSR 1 RCAS (MIT licence): a negative lobe on its four neighbours, as strong as it can be before any channel
+// would pass black or white (no clipping, so no blocks), half as strong where the pixel stands out from all four
+// alike (noise, a sparkle), times `amount`. On perceptual values, as the interpolation works.
+float3 rcas(float3 up, float3 left, float3 e, float3 right, float3 down, float amount)
+{
+    float3 mn4 = min(min(up, left), min(right, down));
+    float3 mx4 = max(max(up, left), max(right, down));
+    float3 hit_min = min(mn4, e) / max(4.0 * mx4, 1e-5);
+    float3 hit_max = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, -1e-5);
+    float3 lobes = max(-hit_min, hit_max);
+    float lobe = max(-0.1875, min(max(lobes.r, max(lobes.g, lobes.b)), 0.0)) * amount;
+    float uL = easu_luma(up), lL = easu_luma(left), eL = easu_luma(e), rL = easu_luma(right), dL = easu_luma(down);
+    float range = max(max(max(uL, lL), max(eL, rL)), dL) - min(min(min(uL, lL), min(eL, rL)), dL);
+    float noise = saturate(abs(0.25 * (uL + lL + rL + dL) - eL) / max(range, 1e-5));
+    lobe *= 1.0 - 0.5 * noise;
+    return (lobe * (up + left + right + down) + e) / (4.0 * lobe + 1.0);
+}
+float3 sample_easu(float2 uv, float sharpen)
 {
     float2 pp = uv * P2.xy - 0.5;
     float2 fp = floor(pp);
@@ -409,8 +429,27 @@ float3 sample_easu(float2 uv)
     float3 e = easu_fetch(q + int2(-1, 0)), f = easu_fetch(q), g = easu_fetch(q + int2(1, 0)), h = easu_fetch(q + int2(2, 0));
     float3 i = easu_fetch(q + int2(-1, 1)), j = easu_fetch(q + int2(0, 1)), k = easu_fetch(q + int2(1, 1)), l = easu_fetch(q + int2(2, 1));
     float3 n = easu_fetch(q + int2(0, 2)), o = easu_fetch(q + int2(1, 2));
+    // The edges' direction and length from the pixels as the game drew them; what is filtered, sharpened.
     float bL = easu_luma(b), cL = easu_luma(c), eL = easu_luma(e), fL = easu_luma(f), gL = easu_luma(g), hL = easu_luma(h);
     float iL = easu_luma(i), jL = easu_luma(j), kL = easu_luma(k), lL = easu_luma(l), nL = easu_luma(n), oL = easu_luma(o);
+    [branch] if (sharpen > 0.0)
+    {
+        // The ring of pixels around the twelve, which their outer ones are sharpened against.
+        float3 b0 = easu_fetch(q + int2(0, -2)), c0 = easu_fetch(q + int2(1, -2));
+        float3 a1 = easu_fetch(q + int2(-1, -1)), d1 = easu_fetch(q + int2(2, -1));
+        float3 e0 = easu_fetch(q + int2(-2, 0)), h0 = easu_fetch(q + int2(3, 0));
+        float3 i0 = easu_fetch(q + int2(-2, 1)), l0 = easu_fetch(q + int2(3, 1));
+        float3 m2 = easu_fetch(q + int2(-1, 2)), p2 = easu_fetch(q + int2(2, 2));
+        float3 n3 = easu_fetch(q + int2(0, 3)), o3 = easu_fetch(q + int2(1, 3));
+        float3 sb = rcas(b0, a1, b, c, f, sharpen), sc = rcas(c0, b, c, d1, g, sharpen);
+        float3 se = rcas(a1, e0, e, f, i, sharpen), sf = rcas(b, e, f, g, j, sharpen);
+        float3 sg = rcas(c, f, g, h, k, sharpen), sh = rcas(d1, g, h, h0, l, sharpen);
+        float3 si = rcas(e, i0, i, j, m2, sharpen), sj = rcas(f, i, j, k, n, sharpen);
+        float3 sk = rcas(g, j, k, l, o, sharpen), sl = rcas(h, k, l, l0, p2, sharpen);
+        float3 sn = rcas(j, m2, n, o, n3, sharpen), so = rcas(k, n, o, p2, o3, sharpen);
+        b = sb; c = sc; e = se; f = sf; g = sg; h = sh;
+        i = si; j = sj; k = sk; l = sl; n = sn; o = so;
+    }
     float2 dir = 0.0;
     float len = 0.0;
     easu_set(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
@@ -569,8 +608,11 @@ float4 ps_main(Interpolated i) : SV_Target
                 }
                 p = to_perceptual(box * (1.0 / 12.0));
             }
+            // Sharpened as much as the lens enlarges the game's picture there: from none where it is drawn
+            // as large as it is, to all of P19.z where it is half as large again or more.
+            float sharpen = P19.z * saturate((1.0 / max(mag, 1e-3) - 1.0) * 2.0);
             [branch] if (mag < 1.5)
-                p = lerp(sample_easu(uv0), p, saturate((mag - 1.0) * 2.0));
+                p = lerp(sample_easu(uv0, sharpen), p, saturate((mag - 1.0) * 2.0));
             c = from_perceptual(p);
             // The glass (replay_plus_lens.cpp does the same on exported frames): red and blue a little
             // bigger and smaller about the middle (lateral chromatic aberration), softer towards the edges
@@ -621,7 +663,11 @@ float4 ps_main(Interpolated i) : SV_Target
         shown = source.Load(int3(int2(i.position.xy), 0)).rgb;
     if (!outside && P3.z > 0.0)
     {
-        float4 o = hood.SampleLevel(linear_clamp, float2(0.5 + 0.5 * q.x / (va * P11.z), 0.5 - 0.5 * q.y / P11.z), 0.0);
+        // Where lens::hood_extent puts it: its own shape, about the middle. Past its edges (a window wider or taller
+        // than it), black, as a frame's bars.
+        float2 hood_at = float2(0.5 + 0.5 * q.x / max(P19.w, 1e-3), 0.5 - 0.5 * q.y / max(P11.z, 1e-3));
+        float4 o = hood.SampleLevel(linear_clamp, hood_at, 0.0);
+        if (any(hood_at < 0.0) || any(hood_at > 1.0)) o = float4(0.0, 0.0, 0.0, 1.0);
         shown = lerp(shown, overlay_colour(o.rgb), o.a * P3.z);
     }
     return float4(shown, 1.0);

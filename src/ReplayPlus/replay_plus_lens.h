@@ -42,14 +42,15 @@ inline constexpr float scope_aspect = 2.39f;
 
 // An overlay picture's see-through middle, measured from its alpha (where it turns half opaque), as how far out
 // it reaches in 1025 directions from across (0) to up (90 degrees), in the picture's own half-widths and
-// half-heights (it is drawn spanning the window): the nearest of the four quarters; 4 where it is see-through to
-// the picture's edge. (Finely: where its black meets the window's edge the lens is fitted tightest, and taken as
+// half-heights (where it is drawn: hood_extent): the nearest of the four quarters; where it is see-through to
+// the picture's edge, the edge (black past it). (Finely: where its black meets the window's edge the lens is fitted tightest, and taken as
 // straight between directions its edge there is a pixel out at most: at 65 it was ten, 2026-11-17.) Not
 // `known`: the picture has no see-through middle (or was not measured).
 inline constexpr std::size_t hole_steps = 1024;
 struct Hole {
     std::array<float, hole_steps + 1> radius{};
     bool known{};
+    float aspect{}; // the picture's width over its height (0: not measured)
 };
 Hole measure_hole(const std::uint8_t* rgba, std::uint32_t width, std::uint32_t height) noexcept;
 
@@ -72,11 +73,12 @@ struct Frame {
     // same every way round (circles stay circles), exact at the middle.
     float ease{};
     // What shows: the window, and in it what the overlay leaves showing when the lens is fitted to it (the
-    // fit keeps what shows inside the game's picture): a picture's see-through hole (drawn spanning the window,
-    // hood_scale times larger) or the circle's.
+    // fit keeps what shows inside the game's picture): a picture's see-through hole (where hood_extent puts it)
+    // or the circle's.
     bool fit_to_hood{};
     Hole hole;               // Hood::picture
-    float hood_scale = 1.0f; // the overlay drawn this much larger about the middle (Settings::hood_size)
+    float hood_scale = 1.0f; // the overlay this much larger about the middle (Settings::hood_size, a plain scale)
+    float hood_aspect = 0;   // Hood::picture: its width over its height as drawn (0: the window's, which it fills)
     float hood_circle = 0;   // Hood::circle: where its black begins, half-heights (0: none)
 };
 // Where what shows ends along a direction (q, unit, x and y 0 and up), in half-heights: the window's edge, or
@@ -104,8 +106,16 @@ float theta(const Frame& frame, float r, float fit = 1.0f);
 float fit(const Frame& frame);
 // A picture position (q) to the game's picture, 0..1 (x right, y down).
 std::array<float, 2> to_game(const Frame& frame, float fit, float qx, float qy);
-// Where the overlay picture is read for a picture position (0..1): it spans the window, hood_scale times larger.
+// Where the overlay picture is in the window: its half-width and half-height, in half-heights (q). It keeps its own
+// shape (never stretched), as large as fits whole in the window, then hood_scale times that about the middle; past
+// its edges its edges carry on. (A picture within 13% of the window's shape was made for it: it fills the window.)
+std::array<float, 2> hood_extent(const Frame& frame);
+// Where the overlay picture is read for a picture position (0..1), as hood_extent puts it.
 std::array<float, 2> hood_uv(const Frame& frame, float qx, float qy);
+// Overlay size before 1.3 was how far the overlay's dark edge reached in from the window's corner (1 as drawn, 0
+// none, 2 twice as far), not a scale: the scale that draws it so, for these settings (a picture taken as a camera
+// hood whose dark corners are the Mk1's; the circle as its own). Settings saved before are read with it.
+float scale_for_old_size(const Settings& settings, float old_size) noexcept;
 // tan(half the field of view), across and up (skate. measures it vertically).
 std::array<float, 2> tangents(const Frame& frame);
 // How much the lens enlarges the middle of the game's picture (the picture's pixels per one of the

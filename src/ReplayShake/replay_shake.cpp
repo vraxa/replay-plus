@@ -78,8 +78,8 @@ struct Frame {
     std::uintptr_t base{};
 };
 // How much of the shake there is now, by Replay Plus's shake keys at the replay's clock (all of it with
-// no keys, or while the replay's clock is not up). While a video is exported the clock stands where the
-// export began: on from there by the frames encoded (export_frames::seconds_exported).
+// no keys, or while the replay's clock is not up). While a video is exported, the replay's time as
+// export_frames::replay_time has it (from where the export began on the timeline, by the frames encoded).
 float gate_now(const Frame& frame) noexcept {
     if (frame.gates.empty() || !frame.base) return 1.0f;
     std::uint8_t lane{};
@@ -87,7 +87,7 @@ float gate_now(const Frame& frame) noexcept {
     if (!memory::peek(frame.base + addr::replay_activity::playing, lane) || !lane ||
         !memory::peek(frame.base + addr::replay_activity::playhead, clock) || !std::isfinite(clock))
         return 1.0f;
-    return gate_at(frame.gates, clock + export_frames::seconds_exported());
+    return gate_at(frame.gates, export_frames::replay_time(clock));
 }
 
 struct State {

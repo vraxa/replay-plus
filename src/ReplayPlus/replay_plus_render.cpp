@@ -895,7 +895,7 @@ std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& pi
         bits(depth_copy.width ? 1.0f / static_cast<float>(depth_copy.width) : 0.0f),
         bits(depth_copy.height ? 1.0f / static_cast<float>(depth_copy.height) : 0.0f),
         bits(glass.shade), bits(glass.soft), bits(f.squeeze), bits(lens_on ? f.ease : 0.0f),
-        bits(gr.camera ? 1.0f : 0.0f), bits(lens_on ? glass.glare : 0.0f), bits(std::max(f.hood_scale, 1e-3f)),
+        bits(gr.camera ? 1.0f : 0.0f), bits(lens_on ? glass.glare : 0.0f), bits(std::max(lens::hood_extent(f)[1], 1e-3f)),
         bits(lens::camera_toe_slope(gr.camera_gamma)),
         bits(cm[0]), bits(cm[1]), bits(cm[2]), bits(gr.lift),
         bits(cm[3]), bits(cm[4]), bits(cm[5]), bits(gr.gamma),
@@ -905,7 +905,8 @@ std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& pi
         bits(std::max(gr.grain_size, 0.5f) * height / 1080.0f), bits(static_cast<float>(in.frame % 1024)),
         bits(lens::vignette_power(gr.vignette_soft)), bits(std::clamp(gr.vignette_round, 0.0f, 1.0f)),
         bits(gr.camera_gamma), bits(gr.camera_knee), bits(gr.camera_knee_slope), bits(gr.camera_black),
-        bits(gr.camera_clip), bits(gr.camera_colour), bits(0.0f), bits(0.0f)};
+        bits(gr.camera_clip), bits(gr.camera_colour), bits(lens_on ? std::clamp(s.sharpen, 0.0f, 1.0f) : 0.0f),
+        bits(std::max(lens::hood_extent(f)[0], 1e-3f))};
     // P21.z, .w: the camera light's facing, smoothed over so many metres of the surface (replay_plus.hlsl
     // smooth_facing; 0 each triangle's own), and how much it counts.
     c[86] = bits(std::clamp(link::light_facing_metres().load(std::memory_order_relaxed), 0.0f, 2.0f));
@@ -1182,7 +1183,9 @@ bool record(const Target& t) noexcept {
             return false;
         }
         const auto& s = picture->settings;
-        const bool light_on = s.light && s.light_power > 0;
+        // (Not when the camera light is a light of the game's, replay_plus_light.h, nor while its keys have it off.)
+        const bool light_on = s.light && s.light_power > 0 && link::light_on_now().load(std::memory_order_acquire) &&
+                              !link::game_light().load(std::memory_order_acquire);
         // Under the game's UI whenever its picture before the UI is found, a video being filmed too: the game
         // films its frame after its last pass, so the video gets the pass as the screen does, the camera light
         // and Sharp middle's finer picture with it, at the GPU's speed. (Finishing exported frames on the CPU,
@@ -1425,6 +1428,17 @@ bool record(const Target& t) noexcept {
     }
 }
 
+// Rows copied between an exported frame and a buffer of ours, an access violation caught (false then): the frame's
+// size was checked against its buffer before, this is the last guard.
+bool copy_rows(std::uint8_t* to, std::size_t to_pitch, const std::uint8_t* from, std::size_t from_pitch, std::size_t bytes,
+               std::uint32_t rows) noexcept {
+    __try {
+        for (std::uint32_t y = 0; y < rows; ++y) std::memcpy(to + y * to_pitch, from + y * from_pitch, bytes);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
 bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::uint32_t pitch) noexcept {
     try {
         if (!pixels || w < 16 || h < 16 || pitch < w * 4) return false;
@@ -1437,7 +1451,9 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
         const auto& s = picture->settings;
         const auto hood_image = link::hood();
         const auto finish = lens::finish_for(s, static_cast<float>(w) / static_cast<float>(h), fov_for(*picture, 2000), hood_image ? &hood_image->hole : nullptr);
-        const bool light_on = s.light && s.light_power > 0;
+        // (Not when the camera light is a light of the game's, replay_plus_light.h, nor while its keys have it off.)
+        const bool light_on = s.light && s.light_power > 0 && link::light_on_now().load(std::memory_order_acquire) &&
+                              !link::game_light().load(std::memory_order_acquire);
         if (!lens::changes(finish) && !light_on) return true; // nothing to change in it
         if (!export_setup(e, g.device) || !export_targets(e, w, h)) {
             e.failed = true;
@@ -1477,7 +1493,12 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
         const auto constants = pass_constants(*picture, finish, {static_cast<float>(w), static_cast<float>(h), 0, 1.0f, e.mips, g.hood_ready,
                                                                  depth_copy, depth_ready, e.frames++});
         std::memcpy(e.constants_cpu, constants.data(), sizeof(std::uint32_t) * constant_count);
-        for (std::uint32_t y = 0; y < h; ++y) std::memcpy(e.upload_cpu + std::size_t{y} * e.row, pixels + std::size_t{y} * pitch, std::size_t{w} * 4);
+        if (!copy_rows(e.upload_cpu, e.row, pixels, pitch, std::size_t{w} * 4, h)) {
+            e.failed = true;
+            logging::write(logging::Level::warning, logging::Channel::graphics,
+                           "Replay Plus export: an exported frame could not be read whole; the rest go out as the game made them.");
+            return true;
+        }
 
         if (FAILED(e.allocator->Reset()) || FAILED(e.list->Reset(e.allocator.Get(), nullptr))) return false;
         auto* list = e.list.Get();
@@ -1556,7 +1577,12 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
                            "Replay Plus export: an exported frame was not finished on the GPU in time; the rest are finished on the CPU.");
             return false;
         }
-        for (std::uint32_t y = 0; y < h; ++y) std::memcpy(pixels + std::size_t{y} * pitch, e.readback_cpu + std::size_t{y} * e.row, std::size_t{w} * 4);
+        if (!copy_rows(pixels, pitch, e.readback_cpu, e.row, std::size_t{w} * 4, h)) {
+            e.failed = true;
+            logging::write(logging::Level::warning, logging::Channel::graphics,
+                           "Replay Plus export: an exported frame could not be written whole; the rest go out as the game made them.");
+            return true;
+        }
         if (!e.said) {
             e.said = true;
             logging::write(logging::Level::info, logging::Channel::graphics,

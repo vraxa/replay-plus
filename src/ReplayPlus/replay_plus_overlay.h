@@ -1,7 +1,10 @@
 #pragma once
 #include <d3d12.h>
 #include <dxgi.h>
+#include <chrono>
 #include <cstdint>
+
+struct ImFontAtlas;
 
 // Replay Plus in ReSkate's overlay (Extension/UI/Overlay/overlay_render.cpp), on the render thread:
 // the picture's pass (the lens, the grade, the bars and the hood, drawn over the game's finished frame
@@ -39,4 +42,9 @@ void release() noexcept;
 bool finish_export(std::uint8_t* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch) noexcept;
 // Inside the overlay's ImGui frame: the replay editor's panel, while it is open.
 void draw_panel() noexcept;
+// The game's own faces, button glyphs and icons for the panel (replay_plus_native.h), read from the installed
+// game's data (the read starts with Replay Plus): as the overlay builds its font atlas the faces added and room made
+// before it is built (for a screen `width` x `height`, waiting up to `wait` for the read), filled after.
+void reserve_native(ImFontAtlas& atlas, float width, float height, std::chrono::milliseconds wait) noexcept;
+void fill_native(ImFontAtlas& atlas) noexcept;
 } // namespace dingosdk::replay_plus::overlay

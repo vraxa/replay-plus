@@ -151,6 +151,14 @@ PadLayer& pad_layer() {
     return *value;
 }
 } // namespace
+std::atomic<std::uint16_t>& pad_layer_button() noexcept {
+    static std::atomic<std::uint16_t> value{0x0080};
+    return value;
+}
+std::atomic<bool>& panel_capturing() noexcept {
+    static std::atomic<bool> value{false};
+    return value;
+}
 void renew_pad_layer() noexcept {
     auto& p = pad_layer();
     std::lock_guard lock(p.mutex);
@@ -164,7 +172,9 @@ void inject_pad(std::uint16_t buttons, std::uint64_t ms) noexcept {
 }
 bool pad_filter(std::uint16_t& buttons, std::uint8_t& left_trigger, std::uint8_t& right_trigger, std::int16_t& right_x,
                 std::int16_t& right_y) noexcept {
-    constexpr std::uint16_t r3 = 0x0080, every_button = 0xf3ff;
+    // (The shortcut button: R3 unless the player picked another.)
+    const std::uint16_t r3 = pad_layer_button().load(std::memory_order_relaxed);
+    constexpr std::uint16_t every_button = 0xf3ff;
     constexpr std::uint8_t pulled = 30;
     auto& p = pad_layer();
     std::lock_guard lock(p.mutex);
@@ -238,7 +248,8 @@ bool take_panel_request(bool& open, bool& from_keyboard) noexcept {
     from_keyboard = s.panel_request_keyboard;
     return true;
 }
-float timeline_share(const std::vector<Chunk>& chunks, double timeline_start, double timeline_length, double clock) noexcept {
+float timeline_share(const std::vector<Chunk>& chunks, double timeline_start, double timeline_length, double clock, float bar_from,
+                     float bar_to) noexcept {
     if (chunks.empty()) return timeline_length > 0 ? static_cast<float>((clock - timeline_start) / timeline_length) : -1.0f;
     // (Within a frame of a chunk's ends counts as in it.)
     constexpr double slack = 1.0 / 60.0;
@@ -246,7 +257,13 @@ float timeline_share(const std::vector<Chunk>& chunks, double timeline_start, do
         if (clock >= c.clock_from - slack && clock <= c.clock_to + slack) {
             const double span = c.clock_to - c.clock_from;
             const double along = span > 1e-9 ? std::clamp((clock - c.clock_from) / span, 0.0, 1.0) : 0.0;
-            return c.from + static_cast<float>(along) * (c.to - c.from);
+            const float whole = c.from + static_cast<float>(along) * (c.to - c.from);
+            // On the part the timeline shows (off it, as nowhere: trimmed away).
+            const float shown = bar_to - bar_from;
+            if (shown <= 1e-6f) return whole;
+            const float on_bar = (whole - bar_from) / shown;
+            constexpr float edge = 1e-3f;
+            return on_bar < -edge || on_bar > 1.0f + edge ? -1.0f : std::clamp(on_bar, 0.0f, 1.0f);
         }
     return -1.0f;
 }
@@ -379,6 +396,14 @@ void ask_white_dump(std::string path) noexcept {
 }
 std::atomic<float>& light_facing_metres() noexcept {
     static std::atomic<float> value{light_facing_metres_default};
+    return value;
+}
+std::atomic<bool>& game_light() noexcept {
+    static std::atomic<bool> value{false};
+    return value;
+}
+std::atomic<bool>& light_on_now() noexcept {
+    static std::atomic<bool> value{true};
     return value;
 }
 std::atomic<float>& light_facing_weight() noexcept {

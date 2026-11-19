@@ -64,12 +64,14 @@ option(DINGOSDK_REPLAY_PLUS_TEST_INBOX "Replay Plus: run console lines from a te
 set(DINGOSDK_REPLAY_PLUS_TEST_FOLDER "${CMAKE_BINARY_DIR}/replay-plus-test" CACHE PATH "Replay Plus: the test inbox's folder")
 
 if(TARGET dingosdk_runtime)
-    target_sources(dingosdk_runtime PRIVATE Extension/ReplayPlus/replay_plus.cpp Extension/ReplayPlus/replay_plus_window.cpp)
+    target_sources(dingosdk_runtime PRIVATE Extension/ReplayPlus/replay_plus.cpp Extension/ReplayPlus/replay_plus_window.cpp
+        Extension/ReplayPlus/replay_plus_light.cpp)
     set_property(SOURCE Extension/ReplayPlus/replay_plus.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(dingosdk_runtime PRIVATE dingosdk_replay_plus_model windowscodecs ole32)
     if(DINGOSDK_REPLAY_PLUS_TEST_INBOX)
         set_property(SOURCE Extension/ReplayPlus/replay_plus.cpp APPEND PROPERTY COMPILE_DEFINITIONS
             "REPLAY_PLUS_TEST_INBOX=\"${DINGOSDK_REPLAY_PLUS_TEST_FOLDER}\"")
+        set_property(SOURCE Extension/ReplayPlus/replay_plus_light.cpp APPEND PROPERTY COMPILE_DEFINITIONS REPLAY_PLUS_TEST_INBOX=1)
         # The panel reads ReSkate's scripted pad too (the test inbox's `replayplus pad`).
         set_property(SOURCE Extension/ReplayPlus/replay_plus_panel.cpp APPEND PROPERTY COMPILE_DEFINITIONS REPLAY_PLUS_TEST_PAD=1)
     endif()
@@ -78,6 +80,7 @@ if(TARGET dingosdk_overlay)
     target_sources(dingosdk_overlay PRIVATE
         Extension/ReplayPlus/replay_plus_render.cpp
         Extension/ReplayPlus/replay_plus_depth.cpp
+        Extension/ReplayPlus/replay_plus_native.cpp
         Extension/ReplayPlus/replay_plus_panel.cpp)
     target_include_directories(dingosdk_overlay PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(dingosdk_overlay PUBLIC dingosdk_replay_plus_model PRIVATE d3d12 d3dcompiler)

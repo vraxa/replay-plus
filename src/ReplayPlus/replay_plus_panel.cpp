@@ -1,6 +1,7 @@
 #include "replay_plus_overlay.h"
 #include "replay_plus_depth.h"
 #include "replay_plus_link.h"
+#include "replay_plus_native.h"
 #include "replay_plus_settings.h"
 #include "Extension/ReplayShake/replay_shake_settings.h"
 #include "Extension/UI/Overlay/input_capture.h"
@@ -14,12 +15,14 @@
 #include <chrono>
 #include <cmath>
 #include <format>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
-// The replay editor's panel: Replay Plus in the replay itself, worked with the controller, drawn in
-// the look of skate.'s own menus (ReSkate's theme: hand-cut dark tiles, the blue focus tile with its
-// halftone dots, the brushed title face, button prompts on grey plates). LB / RB change the tab, the
+// The replay editor's panel: Replay Plus in the replay itself, worked with the controller, drawn as the
+// replay editor draws its own (Advanced Edit's tabs and lists, in the game's faces and button glyphs, read
+// from its data: replay_plus_native.h). LB / RB change the tab, the
 // D-pad picks a row and changes its value (held, faster), A switches or chooses, X puts a value back,
 // Y hides the panel while held (to see the picture), B closes. The keyboard works it too: the arrow
 // keys or WASD, Enter or Space, Backspace or Esc, Q / E or Tab, R, Home / End, + / -, Shift for bigger steps.
@@ -40,7 +43,7 @@ constexpr unsigned dpad_up = 0x0001, dpad_down = 0x0002, dpad_left = 0x0004, dpa
                    lb = 0x0100, rb = 0x0200;
 
 // One row of a tab: one of Replay Plus's values, one of Replay Shake's, or an action.
-enum class RowKind { field, shake_on, shake_preset, shake_number, shake_seed, hood_file, action, preset, naming, video_folder };
+enum class RowKind { field, shake_on, shake_preset, shake_number, shake_seed, hood_file, action, preset, naming, video_folder, bind };
 struct Row {
     RowKind kind{RowKind::field};
     const Field* field{};
@@ -100,6 +103,17 @@ struct Panel {
     std::string follow_preset;
     double follow_until{};
     std::array<bool, 256> keys_was{}; // the keyboard's keys the frame before, for what is typed while naming
+    // A button or key being bound (CONTROLS): the row's ("layer", a shortcut's name, "preset:<name>"); everything let go
+    // first (the A, Enter or click that began it), then the first button or key pressed is it.
+    bool binding{};
+    std::string bind_for;
+    int bind_column{};  // the column picked on CONTROLS' rows: 0 the controller's, 1 the keyboard's
+    int bind_device{};  // the one waited on: only its button (0) or its key (1) counts
+    bool bind_armed{};
+    unsigned bind_pad_before{};
+    std::array<bool, 256> bind_keys_before{};
+    bool bind_click_before{};
+    double bind_since{};
     double erase_next{};
     // What A does on a preset's row (left / right choose): 0 load, 1 rename, 2 export, 3 delete; for this one.
     int preset_action{};
@@ -137,7 +151,7 @@ std::string shake_number(float v, float shown, int places, std::string_view unit
 // A time on the replay's clock as the editor's timeline shows it: seconds from its start (through its chunks).
 double on_timeline(const link::View& view, double clock) {
     if (!view.timeline_ok) return clock;
-    const float share = link::timeline_share(view.chunks, view.timeline_start, view.timeline_length, clock);
+    const float share = link::timeline_share(view.chunks, view.timeline_start, view.timeline_length, clock, view.bar_from, view.bar_to);
     return share >= 0 ? share * view.timeline_length : clock - view.timeline_start;
 }
 std::vector<Row> rows_for(Panel& p, const link::View& view) {
@@ -266,7 +280,8 @@ std::vector<Row> rows_for(Panel& p, const link::View& view) {
             file.kind = RowKind::hood_file;
             file.label = "Picture";
             file.value = p.local.hood_file.empty() ? std::string("(none)") : p.local.hood_file;
-            file.hint = view.hood_files.empty() ? "Put PNG pictures in " + view.overlays_folder : "Pictures in " + view.overlays_folder;
+            file.hint = view.hood_files.empty() ? "Put pictures (PNG, JPG, BMP or WebP, see-through where the picture shows) in " + view.overlays_folder
+                                                : "Pictures in " + view.overlays_folder + ". Each keeps its own shape, never stretched";
             rows.push_back(file);
         }
     }
@@ -327,6 +342,57 @@ std::vector<Row> rows_for(Panel& p, const link::View& view) {
             rows.push_back(info);
         }
     }
+    if (tab == Tab::light && p.local.light && p.local.light_keyed) {
+        // The light's keys: SET puts one at the playhead (or updates the one there), on, as the values above are; OFF one
+        // that switches it off from there; DELETE takes it away; then every key, in time order.
+        const auto* here = view.playhead_ok ? light_key_at(p.local, view.playhead) : nullptr;
+        Row key;
+        key.kind = RowKind::action;
+        key.key = "light_key";
+        key.label = view.playhead_ok ? std::format("Key at {:.2f} s", on_timeline(view, view.playhead)) : std::string("Key at the playhead");
+        key.value = here ? "UPDATE" : "SET";
+        key.hint = view.playhead_ok ? "A light key here: on, as bright, wide and warm as above. Between keys the light eases from one to the next; it "
+                                      "switches on or off at a key"
+                                    : "Open a replay to put light keys on it";
+        key.locked = !view.playhead_ok;
+        rows.push_back(key);
+        Row off;
+        off.kind = RowKind::action;
+        off.key = "light_off";
+        off.label = "Off from here";
+        off.value = "OFF";
+        off.hint = "A light key here that switches the light off (SET on a later key switches it on again)";
+        off.locked = !view.playhead_ok;
+        rows.push_back(off);
+        if (here) {
+            Row remove;
+            remove.kind = RowKind::action;
+            remove.key = "light_delete";
+            remove.label = "Delete this key";
+            remove.value = "DELETE";
+            remove.hint = "Takes the light key at the playhead away";
+            rows.push_back(remove);
+        }
+        if (!p.local.light_keys.empty()) {
+            Row clear;
+            clear.kind = RowKind::action;
+            clear.key = "light_clear";
+            clear.label = std::format("Clear {} key{}", p.local.light_keys.size(), p.local.light_keys.size() == 1 ? "" : "s");
+            clear.value = p.confirm == "light_clear" ? "SURE?" : "CLEAR";
+            clear.hint = p.confirm == "light_clear" ? "A again takes every light key away" : "Takes every light key away (A, then A again)";
+            rows.push_back(clear);
+        }
+        for (const auto& k : p.local.light_keys) {
+            Row info;
+            info.kind = RowKind::action;
+            info.key = "none";
+            const bool at = view.playhead_ok && std::abs(k.time - view.playhead) <= 1.0 / 30.0;
+            info.label = std::format("{:.2f} s{}", on_timeline(view, k.time), at ? "  (here)" : "");
+            info.value = k.on ? std::format("On, {:.0f}%, {:.0f}°", k.power * 100, k.cone) : std::string("Off");
+            info.hint = "A light key. Scrub to it to change it: between keys the light eases from one to the next";
+            rows.push_back(info);
+        }
+    }
     if (tab == Tab::focus && p.local.focus == Focus::autofocus) {
         Row now;
         now.kind = RowKind::action;
@@ -348,6 +414,46 @@ std::vector<Row> rows_for(Panel& p, const link::View& view) {
         now.value = view.fov_degrees > 0 ? std::format("{:.0f}°", view.fov_degrees) : std::string("-");
         now.hint = "What the replay camera shows now";
         rows.push_back(now);
+    }
+    if (tab == Tab::controls) {
+        // The columns' titles (no row of its own to work: the focus passes it).
+        Row titles;
+        titles.kind = RowKind::bind;
+        titles.key = "titles";
+        titles.locked = true;
+        rows.push_back(titles);
+        Row layer;
+        layer.kind = RowKind::bind;
+        layer.key = "layer";
+        layer.label = "Shortcut button";
+        layer.hint = "Hold it in the replay editor and press the buttons below. A tap of it alone stays the game's (R3: Photo). "
+                     "A (Enter, a click): press another; X: back to R3";
+        rows.push_back(layer);
+        for (std::size_t a = 0; a < action_count; ++a) {
+            Row r;
+            r.kind = RowKind::bind;
+            r.key = std::string(action_names[a]);
+            r.label = std::string(action_labels[a]);
+            r.hint = "Left / right: the controller's or the keyboard's. A (Enter, a click on it): press the new button (held with the "
+                     "shortcut button) or key. X: that one back to how it came. One another has already: the two swap";
+            rows.push_back(r);
+        }
+        for (const auto& name : view.presets) {
+            Row r;
+            r.kind = RowKind::bind;
+            r.key = "preset:" + name;
+            r.label = "Preset: " + name;
+            r.hint = "Loads this look in the replay editor. Left / right: the controller's or the keyboard's. A (Enter, a click on it): "
+                     "press a button (held with the shortcut button) or a key for it. X: none there";
+            rows.push_back(r);
+        }
+        Row reset;
+        reset.kind = RowKind::action;
+        reset.key = "binds_reset";
+        reset.label = "Reset controls";
+        reset.value = "RESET";
+        reset.hint = "Every control back to how it came: R3 with the buttons above, F10 the menu and F11 the shake; no preset shortcuts";
+        rows.push_back(reset);
     }
     if (tab == Tab::video) {
         Row now;
@@ -460,6 +566,72 @@ void finish_naming(Panel& p, const link::View& view) {
     p.changed_at = seconds_now() - 1;
 }
 // A frame while naming: the keyboard's keys, and the pad's buttons pressed and D-pad moves.
+unsigned keyboard_buttons(); // (the keys the panel reads as buttons, below)
+// The panel waiting for a button or key to bind (CONTROLS): once everything is let go, the first button pressed (B or Esc
+// cancel, as does a click) or key (with Ctrl, Shift or Alt held: with them) is the row's, given to the game thread as a bind
+// line (`replayplus bind ...`, which swaps it with another that had it).
+void bind_input(Panel& p, const ControllerInput& input) {
+    const double now = seconds_now();
+    std::array<bool, 256> keys{};
+    bool any_key = false;
+    for (int vk = 8; vk < 256; ++vk) {
+        keys[static_cast<std::size_t>(vk)] = dingosdk::overlay::key_down(vk);
+        any_key = any_key || keys[static_cast<std::size_t>(vk)];
+    }
+    const unsigned pad = input.available ? input.buttons : 0u;
+    const bool click = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const auto end = [&](std::string_view said) {
+        p.binding = false;
+        p.bind_armed = false;
+        link::panel_capturing().store(false, std::memory_order_release);
+        // What is still down is no press of the panel's.
+        p.previous = (pad & 0xffffu) | keyboard_buttons();
+        p.keys_was = keys;
+        if (!said.empty()) say(p, std::string(said));
+    };
+    if (!p.bind_armed) {
+        if (!pad && !any_key && !click) p.bind_armed = true;
+        p.bind_pad_before = pad;
+        p.bind_keys_before = keys;
+        p.bind_click_before = click;
+        if (now - p.bind_since > 10) end("Not changed.");
+        return;
+    }
+    const unsigned pressed = pad & ~p.bind_pad_before;
+    const auto key_pressed = [&](int vk) { return keys[static_cast<std::size_t>(vk)] && !p.bind_keys_before[static_cast<std::size_t>(vk)]; };
+    if ((pressed & pad_b) || key_pressed(VK_ESCAPE) || (click && !p.bind_click_before) || now - p.bind_since > 20) {
+        end("Not changed.");
+        return;
+    }
+    const std::string target = p.bind_for == "layer" ? std::string("layer")
+                               : p.bind_for.starts_with("preset:") ? "preset " + p.bind_for.substr(7)
+                                                                    : p.bind_for;
+    if (pressed && p.bind_device == 0) {
+        const unsigned bit = pressed & (~pressed + 1u); // the first newly pressed (the lowest)
+        post(p.bind_for == "layer" ? "replayplus bind layer " + pad_words(bit) : "replayplus bind " + target + " pad " + pad_words(bit));
+        p.changed_at = now - 1; // the view brings it
+        end({});
+        return;
+    }
+    if (p.bind_for != "layer" && p.bind_device == 1) {
+        for (int vk = 8; vk < 256; ++vk) {
+            if (!key_pressed(vk) || vk == VK_ESCAPE) continue;
+            // (The modifiers alone are no key: they go with the key pressed while they are held.)
+            if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || (vk >= VK_LSHIFT && vk <= VK_RMENU) || vk == VK_LWIN || vk == VK_RWIN) continue;
+            std::uint32_t key = static_cast<std::uint32_t>(vk);
+            if (keys[VK_CONTROL]) key |= key_ctrl;
+            if (keys[VK_SHIFT]) key |= key_shift;
+            if (keys[VK_MENU]) key |= key_alt;
+            post("replayplus bind " + target + " key " + key_name(key));
+            p.changed_at = now - 1;
+            end({});
+            return;
+        }
+    }
+    p.bind_pad_before = pad;
+    p.bind_keys_before = keys;
+    p.bind_click_before = click;
+}
 void naming_input(Panel& p, const link::View& view, unsigned pressed, int vertical, int horizontal) {
     type_letters(p);
     const double now = seconds_now();
@@ -605,6 +777,9 @@ void act(Panel& p, const link::View& view, const Row& row, int steps, bool press
             post("replayplus preset open export");
         } else if (row.key == "open_videos") {
             post("replayplus videofolder open");
+        } else if (row.key == "binds_reset") {
+            post("replayplus bind reset");
+            p.changed_at = now - 1;
         } else if (row.key == "save_over") {
             post("replayplus preset save " + p.local.preset);
         } else if (row.key == "focus_key") {
@@ -613,6 +788,24 @@ void act(Panel& p, const link::View& view, const Row& row, int steps, bool press
         } else if (row.key == "focus_delete") {
             post("replayplus focus delete");
             p.changed_at = now - 1;
+        } else if (row.key == "light_key") {
+            post("replayplus light key");
+            p.changed_at = now - 1;
+        } else if (row.key == "light_off") {
+            post("replayplus light off");
+            p.changed_at = now - 1;
+        } else if (row.key == "light_delete") {
+            post("replayplus light delete");
+            p.changed_at = now - 1;
+        } else if (row.key == "light_clear") {
+            if (p.confirm == "light_clear" && now - p.confirm_at < 4) {
+                post("replayplus light clear");
+                p.confirm.clear();
+                p.changed_at = now - 1;
+            } else {
+                p.confirm = "light_clear";
+                p.confirm_at = now;
+            }
         } else if (row.key == "focus_clear") {
             if (p.confirm == "focus_clear" && now - p.confirm_at < 4) {
                 post("replayplus focus clear");
@@ -664,6 +857,32 @@ void act(Panel& p, const link::View& view, const Row& row, int steps, bool press
     }
     case RowKind::naming:
         return;
+    case RowKind::bind: {
+        if (row.locked) return;
+        // Left / right: the controller's column or the keyboard's (the shortcut button has only the controller's).
+        const bool layer_row = row.key == "layer";
+        if (steps) {
+            p.bind_column = layer_row || steps < 0 ? 0 : 1;
+            return;
+        }
+        const int column = layer_row ? 0 : p.bind_column;
+        const char* which = column ? "key" : "pad";
+        if (reset) {
+            if (layer_row) post("replayplus bind layer default");
+            else if (row.key.starts_with("preset:")) post("replayplus bind preset " + row.key.substr(7) + " clear " + which);
+            else post("replayplus bind " + row.key + " default " + which);
+            p.changed_at = now - 1; // the view brings it
+            return;
+        }
+        if (!press) return;
+        p.binding = true;
+        p.bind_for = row.key;
+        p.bind_device = column;
+        p.bind_armed = false;
+        p.bind_since = now;
+        link::panel_capturing().store(true, std::memory_order_release);
+        return;
+    }
     case RowKind::video_folder:
         if (reset) post("replayplus videofolder default");
         else if (press) post("replayplus videofolder pick");
@@ -700,6 +919,13 @@ void slide(Panel& p, const link::View& view, const Row& row, float fraction) {
 }
 // One of a row's marks clicked: the switch or the choice set to it.
 void choose(Panel& p, const link::View& view, const Row& row, int segment) {
+    if (row.kind == RowKind::bind) {
+        // A click on one of its columns: that one, waiting for its button or key.
+        if (row.locked) return;
+        p.bind_column = row.key == "layer" ? 0 : std::clamp(segment, 0, 1);
+        act(p, view, row, 0, true, false);
+        return;
+    }
     if (row.locked || segment == row.segment) return;
     if (row.kind == RowKind::field && row.field) {
         if (row.field->kind == Kind::toggle) act(p, view, row, 0, true, false);
@@ -711,29 +937,82 @@ void choose(Panel& p, const link::View& view, const Row& row, int segment) {
     }
 }
 
-// ---- Drawing ----------------------------------------------------------------------------------
+// ---- Drawing: as the game's replay editor draws its own ------------------------------------------
+// Measured in Advanced Edit's own lists (its Effects, its video settings) on a 1920 x 1440 window, 2026-11-19. Sizes are
+// on a 1920 x 1080 screen, scaled as the game scales its UI (native::ui_scale). Its faces (Gilroy SemiBold for labels and
+// prompts, ExtraBold for values and the row in focus), rows on black at a third over the picture, the row in focus a
+// shade darker with a blue edge, a value over a blue bar with a white knob (a choice over blue marks), its own button
+// glyphs, and a screen's title in its marker face: read from the game's data (replay_plus_native.h), else ReSkate's
+// faces with glyphs drawn here.
+namespace look {
+constexpr ImU32 white = IM_COL32(255, 255, 255, 255);
+constexpr ImU32 blue = IM_COL32(0, 131, 255, 255);      // the game's blue (#0083FF)
+constexpr ImU32 plate = IM_COL32(0, 0, 0, 84);          // a list's black, a third over the picture
+constexpr ImU32 focus = IM_COL32(0, 0, 0, 76);          // over it, the row in focus
+constexpr ImU32 track = IM_COL32(255, 255, 255, 34);    // what a slider or the marks run along
+constexpr ImU32 dim = IM_COL32(255, 255, 255, 110);     // a row that does not apply now
+constexpr ImU32 soft = IM_COL32(255, 255, 255, 190);
+constexpr ImU32 shadow = IM_COL32(0, 0, 0, 150);        // under the prompts' words
+constexpr ImU32 gold = IM_COL32(227, 204, 114, 255);    // the game's CONFIRM plate
+constexpr ImU32 ink = IM_COL32(14, 14, 14, 255);
+constexpr ImU32 danger = IM_COL32(255, 110, 92, 255);
+} // namespace look
+
 struct Fonts {
-    ImFont *bold, *body, *heading, *title;
+    ImFont *label, *value, *title;
 };
 Fonts fonts() {
     const auto& m = d::state().menu;
-    Fonts f{m.bold ? m.bold : ImGui::GetFont(), m.body ? m.body : ImGui::GetFont(), nullptr, nullptr};
-    f.heading = m.heading ? m.heading : f.bold;
-    f.title = m.title_large ? m.title_large : m.title ? m.title : f.heading;
+    Fonts f{native::face(native::Face::label), native::face(native::Face::value), native::face(native::Face::title)};
+    if (!f.label) f.label = m.body ? m.body : ImGui::GetFont();
+    if (!f.value) f.value = m.bold ? m.bold : ImGui::GetFont();
+    if (!f.title) f.title = m.title_large ? m.title_large : m.title ? m.title : f.value;
     return f;
 }
-float width_of(ImFont* font, float size, std::string_view text) { return font->CalcTextSizeA(size, FLT_MAX, 0, text.data(), text.data() + text.size()).x; }
+// Sizes here are a face's em, as the game sets its text (Gilroy 26 is an em of 26 pixels); ImGui draws a face by its
+// line, taller by its ascent and descent: the line that makes that em, set so the em sits where it was asked.
+float line_size(ImFont* font, float size) {
+    for (const auto which : {native::Face::label, native::Face::value, native::Face::title})
+        if (font == native::face(which)) return size * native::line_per_em(which);
+    return size;
+}
+float width_of(ImFont* font, float size, std::string_view text) {
+    return font->CalcTextSizeA(line_size(font, size), FLT_MAX, 0, text.data(), text.data() + text.size()).x;
+}
 void text_at(ImDrawList* draw, ImFont* font, float size, ImVec2 at, ImU32 colour, std::string_view text, float right = FLT_MAX) {
-    if (right < FLT_MAX) draw->PushClipRect(ImVec2(at.x, at.y - size), ImVec2(right, at.y + size * 2), true);
-    draw->AddText(font, size, at, colour, text.data(), text.data() + text.size());
+    const float line = line_size(font, size);
+    at.y -= (line - size) * 0.5f;
+    if (right < FLT_MAX) draw->PushClipRect(ImVec2(at.x, at.y - line), ImVec2(right, at.y + line * 2), true);
+    draw->AddText(font, line, at, colour, text.data(), text.data() + text.size());
     if (right < FLT_MAX) draw->PopClipRect();
+}
+// Words with the soft shadow the game's prompts and titles have.
+void shadowed(ImDrawList* draw, ImFont* font, float size, ImVec2 at, ImU32 colour, std::string_view text, float s) {
+    const ImU32 under = (look::shadow & ~IM_COL32_A_MASK) | (((look::shadow >> IM_COL32_A_SHIFT) * ((colour >> IM_COL32_A_SHIFT) & 0xff) / 255) << IM_COL32_A_SHIFT);
+    text_at(draw, font, size, ImVec2(at.x + 1.5f * s, at.y + 2.0f * s), under, text);
+    text_at(draw, font, size, at, colour, text);
 }
 std::string upper(std::string text) {
     for (auto& c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return text;
 }
-// A pad button as the pad in use shows it: Xbox's coloured letters (PlayStation's shapes), a shoulder
-// button on a grey plate, or a key on a keycap. Returns the width drawn.
+// A tab's name as the game names its own under its tile: "Lens".
+std::string tab_title(std::size_t tab) {
+    std::string name(tab_names[tab]);
+    for (std::size_t i = 1; i < name.size(); ++i) name[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(name[i])));
+    return name;
+}
+// A label as the game's lists set theirs: on one line, or broken onto two at a space when it is too long.
+std::pair<std::string, std::string> label_lines(ImFont* font, float size, std::string_view text, float width) {
+    if (width_of(font, size, text) <= width) return {std::string(text), {}};
+    std::size_t best = std::string_view::npos;
+    for (auto at = text.find(' '); at != std::string_view::npos; at = text.find(' ', at + 1)) {
+        if (width_of(font, size, text.substr(0, at)) > width) break;
+        best = at;
+    }
+    if (best == std::string_view::npos) return {std::string(text), {}};
+    return {std::string(text.substr(0, best)), std::string(text.substr(best + 1))};
+}
 // The pad as ReSkate reads it for itself (the game's reads are held meanwhile); in test builds with
 // ReSkate's scripted pad's buttons too (the test inbox's `replayplus pad`).
 void read_pad(ControllerInput& input) {
@@ -745,111 +1024,335 @@ void read_pad(ControllerInput& input) {
     }
 #endif
 }
-float glyph(ImDrawList* draw, ImFont* bold, float u, ImVec2 at, std::string_view button, ControllerStyle style, bool keyboard) {
-    const float side = 44 * u;
+
+using P = native::Picture;
+// The game's picture of a pad's button, for the pad in use (an Xbox pad's, a DualShock 4's or a DualSense's).
+std::optional<P> pad_picture(std::string_view button, ControllerStyle style) {
+    const bool ps = style != ControllerStyle::xbox, five = style == ControllerStyle::dualsense;
+    if (button == "A") return ps ? P::ps_cross : P::xbox_a;
+    if (button == "B") return ps ? P::ps_circle : P::xbox_b;
+    if (button == "X") return ps ? P::ps_square : P::xbox_x;
+    if (button == "Y") return ps ? P::ps_triangle : P::xbox_y;
+    if (button == "LB") return ps ? P::ps_l1 : P::xbox_lb;
+    if (button == "RB") return ps ? P::ps_r1 : P::xbox_rb;
+    if (button == "LT") return ps ? P::ps_l2 : P::xbox_lt;
+    if (button == "RT") return ps ? P::ps_r2 : P::xbox_rt;
+    if (button == "L3") return ps ? P::ps_l3 : P::xbox_l3;
+    if (button == "R3") return ps ? P::ps_r3 : P::xbox_r3;
+    if (button == "VIEW") return ps ? (five ? P::ps5_touchpad : P::ps4_touchpad) : P::xbox_view;
+    if (button == "MENU") return ps ? (five ? P::ps5_options : P::ps4_options) : P::xbox_menu;
+    return std::nullopt;
+}
+// The game's picture of a key it draws whole (else it writes the key's name on a blank key).
+std::optional<P> key_picture(std::string_view key) {
+    if (key == "Enter") return P::key_enter;
+    if (key == "Esc") return P::key_esc;
+    if (key == "Tab") return P::key_tab;
+    if (key == "Space") return P::key_space;
+    if (key == "Up") return P::key_up;
+    if (key == "Down") return P::key_down;
+    if (key == "Left") return P::key_left;
+    if (key == "Right") return P::key_right;
+    return std::nullopt;
+}
+// A button drawn here, when the game's pictures are not loaded: Xbox's coloured letters (PlayStation's shapes), a
+// shoulder button on a grey plate, or a key on a keycap. Returns the width drawn.
+float drawn_glyph(ImDrawList* draw, const Fonts& f, float side, ImVec2 at, std::string_view button, ControllerStyle style, bool keyboard) {
     if (keyboard || button.size() > 1) {
         std::string label(button);
-        if (!keyboard && style != ControllerStyle::xbox) label = label == "LB" ? "L1" : label == "RB" ? "R1" : label;
-        const float size = 24 * u, inset = 12 * u, cap = width_of(bold, size, label) + inset * 2;
+        if (!keyboard && style != ControllerStyle::xbox) label = label == "LB" ? "L1" : label == "RB" ? "R1" : label == "LT" ? "L2" : label == "RT" ? "R2" : label;
+        const float size = side * 0.52f, inset = side * 0.26f, cap = std::max(side, width_of(f.value, size, label) + inset * 2);
         if (draw) {
-            draw->AddRectFilled(ImVec2(at.x, at.y + 2 * u), ImVec2(at.x + cap, at.y + side - 2 * u), keyboard ? theme::paper : IM_COL32(70, 71, 75, 255),
-                                6 * u);
-            draw->AddText(bold, size, ImVec2(at.x + inset, at.y + (side - size) * .5f), keyboard ? skate_theme::black : theme::paper, label.c_str());
+            draw->AddRectFilled(ImVec2(at.x, at.y + side * 0.05f), ImVec2(at.x + cap, at.y + side * 0.95f), keyboard ? look::white : IM_COL32(70, 71, 75, 255),
+                                side * 0.14f);
+            draw->AddRect(ImVec2(at.x, at.y + side * 0.05f), ImVec2(at.x + cap, at.y + side * 0.95f), look::ink, side * 0.14f, 0, side * 0.06f);
+            text_at(draw, f.value, size, ImVec2(at.x + (cap - width_of(f.value, size, label)) * .5f, at.y + (side - size) * .5f), keyboard ? look::ink : look::white,
+                    label);
         }
         return cap;
     }
     if (draw) {
         const ImVec2 centre(at.x + side * .5f, at.y + side * .5f);
         const char letter = button.empty() ? 'A' : button[0];
+        draw->AddCircleFilled(centre, side * .5f, look::ink);
+        draw->AddCircleFilled(centre, side * .44f, look::white);
         if (style == ControllerStyle::xbox) {
-            const ImU32 colour = letter == 'A' ? IM_COL32(95, 211, 106, 255) : letter == 'B' ? IM_COL32(255, 107, 107, 255)
-                               : letter == 'X' ? IM_COL32(64, 156, 255, 255) : IM_COL32(255, 205, 64, 255);
-            draw->AddCircleFilled(centre, side * .5f, colour);
             const char text[2]{letter, 0};
-            const float size = side * .58f;
-            const auto extent = bold->CalcTextSizeA(size, FLT_MAX, 0, text);
-            draw->AddText(bold, size, ImVec2(centre.x - extent.x * .5f, centre.y - extent.y * .5f), skate_theme::black, text);
+            const float size = side * .55f;
+            text_at(draw, f.value, size, ImVec2(centre.x - width_of(f.value, size, text) * .5f, centre.y - size * .5f), look::ink, text);
         } else {
-            draw->AddCircleFilled(centre, side * .5f, IM_COL32(32, 32, 34, 255));
-            const float r = side * .24f, stroke = side * .09f;
+            const float r = side * .2f, stroke = side * .08f;
             if (letter == 'A') {
-                const ImU32 c = IM_COL32(159, 185, 255, 255);
-                draw->AddLine(ImVec2(centre.x - r, centre.y - r), ImVec2(centre.x + r, centre.y + r), c, stroke);
-                draw->AddLine(ImVec2(centre.x - r, centre.y + r), ImVec2(centre.x + r, centre.y - r), c, stroke);
+                draw->AddLine(ImVec2(centre.x - r, centre.y - r), ImVec2(centre.x + r, centre.y + r), look::ink, stroke);
+                draw->AddLine(ImVec2(centre.x - r, centre.y + r), ImVec2(centre.x + r, centre.y - r), look::ink, stroke);
             } else if (letter == 'B') {
-                draw->AddCircle(centre, r, IM_COL32(255, 154, 168, 255), 0, stroke);
+                draw->AddCircle(centre, r, look::ink, 0, stroke);
             } else if (letter == 'X') {
-                draw->AddRect(ImVec2(centre.x - r, centre.y - r), ImVec2(centre.x + r, centre.y + r), IM_COL32(242, 155, 222, 255), 0, 0, stroke);
+                draw->AddRect(ImVec2(centre.x - r, centre.y - r), ImVec2(centre.x + r, centre.y + r), look::ink, 0, 0, stroke);
             } else {
-                const ImU32 c = IM_COL32(64, 226, 160, 255);
-                draw->AddTriangle(ImVec2(centre.x, centre.y - r * 1.1f), ImVec2(centre.x + r, centre.y + r * .75f), ImVec2(centre.x - r, centre.y + r * .75f), c,
+                draw->AddTriangle(ImVec2(centre.x, centre.y - r * 1.1f), ImVec2(centre.x + r, centre.y + r * .75f), ImVec2(centre.x - r, centre.y + r * .75f), look::ink,
                                   stroke);
             }
         }
     }
     return side;
 }
-float prompt(ImDrawList* draw, ImFont* bold, float u, ImVec2 at, std::string_view button, std::string_view what, ControllerStyle style, bool keyboard) {
-    const float w = glyph(draw, bold, u, at, button, style, keyboard), text = 28 * u;
-    if (draw) draw->AddText(bold, text, ImVec2(at.x + w + 12 * u, at.y + (44 * u - text) * .5f), theme::paper, what.data(), what.data() + what.size());
-    return w + 12 * u + width_of(bold, text, what);
+// A button as the game's prompts draw it, `side` tall with its top left at `at`: the pad's own glyph, or a key (its
+// name on a key, wider for a longer name). Returns the width drawn; with no draw list it only measures.
+float glyph(ImDrawList* draw, const Fonts& f, float side, ImVec2 at, std::string_view button, ControllerStyle style, bool keyboard) {
+    if (keyboard) {
+        if (const auto picture = key_picture(button); picture && native::loaded(*picture)) {
+            if (draw) native::draw(draw, *picture, at, ImVec2(at.x + side, at.y + side));
+            return side;
+        }
+        if (native::loaded(P::key)) {
+            const float size = side * (button.size() > 2 ? 0.46f : 0.58f);
+            const float w = std::max(side, width_of(f.value, size, button) + side * 0.5f);
+            if (draw) {
+                native::draw_wide_key(draw, at, ImVec2(at.x + w, at.y + side));
+                text_at(draw, f.value, size, ImVec2(at.x + (w - width_of(f.value, size, button)) * 0.5f, at.y + (side - size) * 0.5f - side * 0.03f), look::ink,
+                        button);
+            }
+            return w;
+        }
+    } else if (const auto picture = pad_picture(button, style); picture && native::loaded(*picture)) {
+        const float w = side * native::aspect(*picture);
+        if (draw) native::draw(draw, *picture, at, ImVec2(at.x + w, at.y + side));
+        return w;
+    }
+    return drawn_glyph(draw, f, side, at, button, style, keyboard);
+}
+// The "+" the game puts between two buttons held together. Returns the width.
+float plus_sign(ImDrawList* draw, const Fonts& f, float side, ImVec2 at, float s) {
+    if (native::loaded(P::plus)) {
+        const float h = side * 0.5f, w = h * native::aspect(P::plus);
+        if (draw) native::draw(draw, P::plus, ImVec2(at.x, at.y + (side - h) * 0.5f), ImVec2(at.x + w, at.y + (side + h) * 0.5f));
+        return w;
+    }
+    const float size = side * 0.62f;
+    if (draw) shadowed(draw, f.value, size, ImVec2(at.x, at.y + (side - size) * 0.5f), look::white, "+", s);
+    return width_of(f.value, size, "+");
+}
+// The D-pad as the game draws it, the arms that do something marked (1 up, 2 down, 4 left, 8 right).
+float dpad_glyph(ImDrawList* draw, float side, ImVec2 at, unsigned arms, ControllerStyle style) {
+    const bool ps = style != ControllerStyle::xbox;
+    P picture = ps ? P::ps_dpad : P::xbox_dpad;
+    if (arms == (1u | 2u)) picture = ps ? P::ps_dpad_vertical : P::xbox_dpad_vertical;
+    else if (arms == (4u | 8u)) picture = ps ? P::ps_dpad_horizontal : P::xbox_dpad_horizontal;
+    else if (arms == 1u) picture = ps ? P::ps_dpad_up : P::xbox_dpad_up;
+    else if (arms == 2u) picture = ps ? P::ps_dpad_down : P::xbox_dpad_down;
+    else if (arms == 4u) picture = ps ? P::ps_dpad_left : P::xbox_dpad_left;
+    else if (arms == 8u) picture = ps ? P::ps_dpad_right : P::xbox_dpad_right;
+    if (native::loaded(picture)) {
+        if (draw) native::draw(draw, picture, at, ImVec2(at.x + side, at.y + side));
+        return side;
+    }
+    if (draw) {
+        const ImVec2 c(at.x + side * .5f, at.y + side * .5f);
+        const float a = side * .15f, b = side * .47f, r = side * 0.04f;
+        draw->AddRectFilled(ImVec2(c.x - a, c.y - b), ImVec2(c.x + a, c.y + b), look::white, r);
+        draw->AddRectFilled(ImVec2(c.x - b, c.y - a), ImVec2(c.x + b, c.y + a), look::white, r);
+        const ImU32 lit = look::ink;
+        const float t = side * 0.09f;
+        if (arms & 1) draw->AddTriangleFilled(ImVec2(c.x, c.y - b + t * 0.6f), ImVec2(c.x - t, c.y - b + t * 2.0f), ImVec2(c.x + t, c.y - b + t * 2.0f), lit);
+        if (arms & 2) draw->AddTriangleFilled(ImVec2(c.x, c.y + b - t * 0.6f), ImVec2(c.x - t, c.y + b - t * 2.0f), ImVec2(c.x + t, c.y + b - t * 2.0f), lit);
+        if (arms & 4) draw->AddTriangleFilled(ImVec2(c.x - b + t * 0.6f, c.y), ImVec2(c.x - b + t * 2.0f, c.y - t), ImVec2(c.x - b + t * 2.0f, c.y + t), lit);
+        if (arms & 8) draw->AddTriangleFilled(ImVec2(c.x + b - t * 0.6f, c.y), ImVec2(c.x + b - t * 2.0f, c.y - t), ImVec2(c.x + b - t * 2.0f, c.y + t), lit);
+    }
+    return side;
+}
+// A single button's glyph name, as glyph() takes them (the D-pad's arms are drawn by dpad_glyph).
+std::string_view button_glyph(std::uint32_t bit) {
+    switch (bit) {
+    case 0x100: return "LB";
+    case 0x200: return "RB";
+    case 0x10000: return "LT";
+    case 0x20000: return "RT";
+    case 0x40: return "L3";
+    case 0x80: return "R3";
+    case 0x1000: return "A";
+    case 0x2000: return "B";
+    case 0x4000: return "X";
+    case 0x8000: return "Y";
+    case 0x10: return "MENU";
+    case 0x20: return "VIEW";
+    default: return "";
+    }
+}
+// Buttons as the game's prompts draw them: each its glyph, "+" between, the D-pad's arms on one D-pad. Nothing drawn
+// without a list; returns the width.
+float buttons_glyphs(ImDrawList* draw, const Fonts& f, float side, ImVec2 at, std::uint32_t bits, ControllerStyle style, float s) {
+    float x = at.x;
+    bool first = true;
+    const auto plus = [&] {
+        if (first) return;
+        x += 6 * s;
+        x += plus_sign(draw, f, side, ImVec2(x, at.y), s) + 6 * s;
+    };
+    for (std::uint32_t bit = 0x10; bit <= 0x20000; bit <<= 1) {
+        if (!(bits & bit) || button_glyph(bit).empty()) continue;
+        plus();
+        x += glyph(draw, f, side, ImVec2(x, at.y), button_glyph(bit), style, false);
+        first = false;
+    }
+    if (bits & 0xf) {
+        plus();
+        x += dpad_glyph(draw, side, ImVec2(x, at.y), bits & 0xf, style);
+    }
+    return x - at.x;
+}
+// A row's bind (CONTROLS): its buttons and its key, as the panel's settings have them.
+std::pair<std::uint32_t, std::uint32_t> bind_of_row(const Settings& v, const std::string& key) {
+    if (key == "layer") return {v.pad_layer, 0};
+    if (key.starts_with("preset:")) {
+        for (const auto& p : v.preset_binds)
+            if (p.preset == key.substr(7)) return {p.bind.pad, p.bind.key};
+        return {0, 0};
+    }
+    for (std::size_t a = 0; a < action_count; ++a)
+        if (action_names[a] == key) return {v.binds[a].pad, v.binds[a].key};
+    return {0, 0};
+}
+// A prompt as the game's: its button, then what it does, white with a soft shadow. Returns the width.
+float prompt(ImDrawList* draw, const Fonts& f, float s, ImVec2 at, std::string_view button, std::string_view what, ControllerStyle style, bool keyboard) {
+    const float side = 36 * s, size = 26 * s, gap = 11 * s;
+    const float w = glyph(draw, f, side, at, button, style, keyboard);
+    if (draw) shadowed(draw, f.label, size, ImVec2(at.x + w + gap, at.y + (side - size) * 0.5f - 1 * s), look::white, what, s);
+    return w + gap + width_of(f.label, size, what);
+}
+// The chevrons either side of the value in focus, as the game's: a thick white "<" (way -1) or ">" (way 1).
+void chevron(ImDrawList* draw, ImVec2 at, int way, float s) {
+    const float w = 7 * s * static_cast<float>(way), h = 10 * s;
+    const ImVec2 points[3]{ImVec2(at.x - w, at.y - h), ImVec2(at.x + w, at.y), ImVec2(at.x - w, at.y + h)};
+    draw->AddPolyline(points, 3, look::white, ImDrawFlags_None, 4.5f * s);
+}
+// Halftone dots in a tile's corner, as on the game's tile in use.
+void corner_dots(ImDrawList* draw, ImVec2 a, ImVec2 b, float s) {
+    const float step = 4.6f * s;
+    int row = 0;
+    for (float y = a.y + step; y < b.y - step * .4f; y += step, ++row)
+        for (float x = a.x + step + static_cast<float>(row % 2) * step * .5f; x < b.x - step * .4f; x += step) {
+            const float t = (x - a.x) / (b.x - a.x) + (y - a.y) / (b.y - a.y) - 1.15f; // past the diagonal, towards the corner
+            if (t <= 0) continue;
+            draw->AddCircleFilled(ImVec2(x, y), s * (0.35f + 1.6f * t * t), IM_COL32(70, 70, 70, 200), 6);
+        }
+}
+// A tab's icon in its tile: the game's own, else its name's first letter.
+void tab_icon(ImDrawList* draw, const Fonts& f, std::size_t tab, ImVec2 a, ImVec2 b, ImU32 tint) {
+    // (CONTROLS has none of the game's own: its D-pad, as its button prompts draw it.)
+    const auto picture = tab == static_cast<std::size_t>(Tab::controls) ? P::xbox_dpad : static_cast<P>(static_cast<std::size_t>(P::tab_shake) + tab);
+    const float side = (b.x - a.x) * 0.6f;
+    const ImVec2 c((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+    if (native::loaded(picture)) {
+        const float aspect = native::aspect(picture);
+        const float w = aspect >= 1 ? side : side * aspect, h = aspect >= 1 ? side / aspect : side;
+        native::draw(draw, picture, ImVec2(c.x - w * 0.5f, c.y - h * 0.5f), ImVec2(c.x + w * 0.5f, c.y + h * 0.5f), tint);
+        return;
+    }
+    const std::string letter(1, tab_names[tab].empty() ? '?' : tab_names[tab][0]);
+    const float size = side * 0.9f;
+    text_at(draw, f.value, size, ImVec2(c.x - width_of(f.value, size, letter) * 0.5f, c.y - size * 0.55f), tint, letter);
 }
 
 void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, ControllerStyle style, bool keyboard) {
     const Fonts f = fonts();
     p.hits.clear();
     const auto display = ImGui::GetIO().DisplaySize;
-    const float u = std::min(display.x / 3840.0f, display.y / 2160.0f);
+    const float s = native::ui_scale(display.x, display.y);
     auto* dl = ImGui::GetForegroundDrawList();
-    // Where the game's own Effects panel is (Advanced Edit, its third tab): the right half, under the
-    // top, see-through, so the replay shows beside it and through it.
-    // On the left, under the replay screens' titles: Advanced Edit keeps its own panels on the right and
-    // its tabs in the top middle, and the first screen its title in the top left.
-    const float x0 = std::floor(display.x * 0.035f), x1 = std::floor(display.x * 0.44f);
-    float y = std::floor(display.y * 0.15f);
-    // The title, as the replay screens have theirs (smaller: it is a panel, not a page), and what is loaded.
-    const float title_size = 92 * u;
-    text_at(dl, f.title, title_size, ImVec2(x0, y), theme::paper, "REPLAY PLUS", x1);
-    const std::string loaded = p.local.preset.empty() ? std::string() : upper(p.local.preset);
-    if (!loaded.empty()) {
-        const float size = 30 * u, w = width_of(f.bold, size, loaded) + 28 * u;
-        const ImVec2 at(x1 - w, y + (title_size - 50 * u) * .5f);
-        dl->AddRectFilled(at, ImVec2(at.x + w, at.y + 50 * u), IM_COL32(20, 20, 22, 240), 4 * u);
-        dl->AddRectFilled(at, ImVec2(at.x + 6 * u, at.y + 50 * u), theme::blue);
-        text_at(dl, f.bold, size, ImVec2(at.x + 16 * u, at.y + (50 * u - size) * .5f), theme::paper, loaded);
+    // On the left, as the game keeps its own lists on the right (Advanced Edit has its tabs in the top middle and its
+    // panels on the right; the first screen its title in the top left): a screen's title, the tabs, the rows.
+    const float x0 = std::floor(100 * s), x1 = std::floor(x0 + 760 * s);
+    float y = std::floor(40 * s);
+    // The title, as the game's replay screens have theirs ("INSTANT REPLAY"), and the preset loaded beside it (never
+    // as far as the game's own tabs in the top middle). On the replay editor's first screen the game's own title is
+    // there already (as tall, a little lower): the panel goes under it instead, its name on the line with the preset.
+    const float title_size = 72 * s, sub_size = 22 * s;
+    const bool game_title = view.in_replay && !view.advanced_edit && depth::ui_shown() >= 0.5f;
+    const float sub_y = game_title ? std::floor(170 * s) : y + title_size + 4 * s;
+    if (!game_title) shadowed(dl, f.title, title_size, ImVec2(x0, y), look::white, "REPLAY PLUS", s);
+    // Under it, what it is showing: the preset loaded (or, outside a replay, where it shows).
+    if (!view.in_replay) {
+        shadowed(dl, f.value, sub_size, ImVec2(x0 + 4 * s, sub_y), skate_theme::warning, "OPEN A REPLAY: THESE SHOW IN THE REPLAY EDITOR", s);
+    } else {
+        float sx = x0 + 4 * s;
+        if (game_title) {
+            shadowed(dl, f.value, sub_size, ImVec2(sx, sub_y), look::white, "REPLAY PLUS", s);
+            sx += width_of(f.value, sub_size, "REPLAY PLUS") + 16 * s;
+        }
+        if (!p.local.preset.empty()) {
+            dl->AddRectFilled(ImVec2(sx, sub_y + 3 * s), ImVec2(sx + 5 * s, sub_y + sub_size - 1 * s), look::blue);
+            shadowed(dl, f.value, sub_size, ImVec2(sx + 14 * s, sub_y), look::white, p.local.preset, s);
+        }
     }
-    if (!view.in_replay) text_at(dl, f.bold, 28 * u, ImVec2(x0, y + title_size), skate_theme::warning, "OPEN A REPLAY: THESE SHOW IN THE REPLAY EDITOR");
-    y += title_size + 30 * u;
-    // The tabs: tiles in a row with Q / E (LB / RB) either side, as Advanced Edit's are; the chosen one
-    // white with its name in the game's blue.
-    const float tab_h = 66 * u;
-    const float lb_w = glyph(nullptr, f.bold, u, {}, keyboard ? "Q" : "LB", style, keyboard);
-    glyph(dl, f.bold, u, ImVec2(x0, y + (tab_h - 44 * u) * .5f), keyboard ? "Q" : "LB", style, keyboard);
-    glyph(dl, f.bold, u, ImVec2(x1 - lb_w, y + (tab_h - 44 * u) * .5f), keyboard ? "E" : "RB", style, keyboard);
-    p.hits.push_back({HitKind::tab_back, ImVec2(x0, y), ImVec2(x0 + lb_w, y + tab_h)});
-    p.hits.push_back({HitKind::tab_next, ImVec2(x1 - lb_w, y), ImVec2(x1, y + tab_h)});
-    const float tabs_left = x0 + lb_w + 14 * u, tabs_right = x1 - lb_w - 14 * u;
-    const float each = (tabs_right - tabs_left) / static_cast<float>(tab_names.size());
-    for (std::size_t t = 0; t < tab_names.size(); ++t) {
-        const ImVec2 ta(tabs_left + each * static_cast<float>(t) + 4 * u, y), tb(tabs_left + each * static_cast<float>(t + 1) - 4 * u, y + tab_h);
-        p.hits.push_back({HitKind::tab, ta, tb, static_cast<int>(t)});
+    y = std::floor(sub_y + sub_size + 18 * s);
+    // The tabs, as Advanced Edit's: LB and RB either side of a row of tiles, black with a white icon; the one in use
+    // larger and white, its icon blue, halftone in its corner, and its name under it, blue on black.
+    const float glyph_side = 28 * s, tile = 60 * s, big = 70 * s;
+    const char* back_button = keyboard ? "Q" : "LB";
+    const char* next_button = keyboard ? "E" : "RB";
+    const float lb_w = glyph(nullptr, f, glyph_side, {}, back_button, style, keyboard);
+    const float rb_w = glyph(nullptr, f, glyph_side, {}, next_button, style, keyboard);
+    const float bar_mid = y + big * 0.5f;
+    glyph(dl, f, glyph_side, ImVec2(x0, std::floor(bar_mid - glyph_side * 0.5f)), back_button, style, keyboard);
+    glyph(dl, f, glyph_side, ImVec2(x1 - rb_w, std::floor(bar_mid - glyph_side * 0.5f)), next_button, style, keyboard);
+    p.hits.push_back({HitKind::tab_back, ImVec2(x0, y), ImVec2(x0 + lb_w, y + big)});
+    p.hits.push_back({HitKind::tab_next, ImVec2(x1 - rb_w, y), ImVec2(x1, y + big)});
+    const float tabs_left = x0 + lb_w + 14 * s, tabs_right = x1 - rb_w - 14 * s;
+    const std::size_t count = tab_names.size();
+    const float each = (tabs_right - tabs_left) / static_cast<float>(count);
+    ImVec2 chosen_a{}, chosen_b{};
+    for (std::size_t t = 0; t < count; ++t) {
+        const float cx = tabs_left + each * (static_cast<float>(t) + 0.5f);
         const bool on = static_cast<int>(t) == p.tab;
-        dl->AddRectFilled(ta, tb, on ? theme::paper : IM_COL32(16, 16, 17, 225), 3 * u);
-        const std::string name(tab_names[t]);
-        const float size = std::min(26 * u, (tb.x - ta.x - 10 * u) / std::max(1.0f, width_of(f.bold, 1, name)));
-        text_at(dl, f.bold, size, ImVec2((ta.x + tb.x - width_of(f.bold, size, name)) * .5f, ta.y + (tab_h - size) * .5f), on ? theme::blue : theme::paper, name);
+        const float side = on ? big : std::min(tile, each - 6 * s);
+        const ImVec2 ta(std::floor(cx - side * 0.5f), std::floor(bar_mid - side * 0.5f)), tb(ta.x + side, ta.y + side);
+        p.hits.push_back({HitKind::tab, ImVec2(cx - each * 0.5f, y), ImVec2(cx + each * 0.5f, y + big), static_cast<int>(t)});
+        if (on) {
+            chosen_a = ta;
+            chosen_b = tb;
+            continue; // drawn last, over its neighbours
+        }
+        skate_theme::rough_rect(dl, ta, tb, IM_COL32(26, 26, 26, 242), 0x5100 + static_cast<unsigned>(t), s);
+        tab_icon(dl, f, t, ta, tb, look::white);
     }
-    y += tab_h + 18 * u;
-    // The rows, on a see-through panel, scrolled to keep the focus in view.
-    const float row_h = 112 * u, label_size = 38 * u, value_size = 34 * u;
-    // Ending above what Advanced Edit shows over the timeline (Keyframe's Add Keyframe, on the left).
-    const float most = std::max(row_h * 3, display.y * 0.655f - y);
-    const float list_h = std::min(most, static_cast<float>(std::max<std::size_t>(rows.size(), 1)) * row_h + 16 * u);
-    const float list_top = y, list_bottom = y + list_h;
-    dl->AddRectFilled(ImVec2(x0, list_top), ImVec2(x1, list_bottom), IM_COL32(18, 18, 20, 242));
+    {
+        const auto t = static_cast<std::size_t>(std::clamp(p.tab, 0, static_cast<int>(count) - 1));
+        const float edge = 4 * s;
+        dl->AddRectFilled(chosen_a, chosen_b, IM_COL32(38, 38, 38, 255));
+        const ImVec2 ia(chosen_a.x + edge, chosen_a.y + edge), ib(chosen_b.x - edge, chosen_b.y - edge);
+        dl->AddRectFilled(ia, ib, IM_COL32(232, 232, 230, 255));
+        corner_dots(dl, ia, ib, s);
+        tab_icon(dl, f, t, chosen_a, chosen_b, look::blue);
+        const std::string name = tab_title(t);
+        const float size = 26 * s, pad = 14 * s, h = 38 * s;
+        const float w = width_of(f.label, size, name) + pad * 2;
+        ImVec2 la(std::floor((chosen_a.x + chosen_b.x) * 0.5f - w * 0.5f), std::floor(chosen_b.y + 6 * s));
+        la.x = std::clamp(la.x, x0, x1 - w);
+        dl->AddRectFilled(la, ImVec2(la.x + w, la.y + h), IM_COL32(0, 0, 0, 96));
+        text_at(dl, f.label, size, ImVec2(la.x + pad, la.y + (h - size) * 0.5f), look::blue, name);
+        y = la.y + h + 16 * s;
+    }
+    // What the row in focus does (or what the last change said), under the rows as the game's settings describe theirs;
+    // then the prompts. The rows end above them and above the game's timeline.
     auto& focus = p.focus[static_cast<std::size_t>(p.tab)];
     auto& scroll = p.scroll[static_cast<std::size_t>(p.tab)];
-    const float inner_h = list_h - 16 * u;
+    const std::string hint = focus >= 0 && static_cast<std::size_t>(focus) < rows.size() ? rows[static_cast<std::size_t>(focus)].hint : std::string();
+    const bool fresh = seconds_now() - p.feedback_at < 5;
+    const std::string under = fresh ? p.feedback : hint;
+    const float hint_size = 22 * s, hint_pad = 14 * s, hint_w = x1 - x0 - hint_pad * 2;
+    const float hint_line = line_size(f.label, hint_size);
+    const float hint_h = under.empty() ? 0.0f : f.label->CalcTextSizeA(hint_line, FLT_MAX, hint_w, under.c_str()).y + hint_pad * 2;
+    const float prompts_h = 40 * s;
+    const auto bar = depth::timeline_bar();
+    const float floor_y = (bar.found ? bar.y * display.y : display.y - 215 * s) - 64 * s;
+    const float row_h = std::floor(74 * s), label_size = 26 * s, value_size = 27 * s;
+    const float below = (hint_h > 0 ? hint_h + 10 * s : 0.0f) + 14 * s + prompts_h;
+    const float most = std::max(row_h * 3, floor_y - below - y);
+    const float list_h = std::min(most, static_cast<float>(std::max<std::size_t>(rows.size(), 1)) * row_h);
+    const float list_top = y, list_bottom = y + list_h;
+    dl->AddRectFilled(ImVec2(x0, list_top), ImVec2(x1, list_bottom), look::plate);
+    const float inner_h = list_h;
     const float focus_top = static_cast<float>(focus) * row_h;
     if (p.follow_focus) {
         if (focus_top - scroll < 0) scroll = focus_top;
@@ -861,13 +1364,17 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
     p.row_h = row_h;
     p.inner_h = inner_h;
     p.content_h = static_cast<float>(rows.size()) * row_h;
-    const float value_mid = x0 + (x1 - x0) * 0.75f, bar_w = std::min(340 * u, (x1 - x0) * 0.32f);
+    const float label_x = x0 + 44 * s, value_mid = x0 + 560 * s, bar_w = 260 * s;
+    // CONTROLS' two columns: the controller's and the keyboard's, under their titles.
+    const float pad_mid = value_mid - 72 * s, key_mid = value_mid + 108 * s, pad_half = 82 * s, key_half = 62 * s;
+    const float label_w = value_mid - bar_w * 0.5f - 48 * s - label_x;
+    const float bx0 = value_mid - bar_w * .5f, bx1 = value_mid + bar_w * .5f;
     dl->PushClipRect(ImVec2(x0, list_top), ImVec2(x1, list_bottom), true);
     for (std::size_t i = 0; i < rows.size(); ++i) {
         const auto& row = rows[i];
-        const float top = list_top + 8 * u + static_cast<float>(i) * row_h - scroll;
+        const float top = list_top + static_cast<float>(i) * row_h - scroll;
         if (top > list_bottom || top + row_h < list_top) continue;
-        // (Its parts only where the panel shows them.)
+        // (Its parts only where the list shows them.)
         const float ry0 = std::max(top, list_top), ry1 = std::min(top + row_h, list_bottom);
         const auto part = [&](HitKind kind, ImVec2 a, ImVec2 b, int index = 0, float from = 0, float to = 0) {
             a.y = std::max(a.y, ry0);
@@ -875,152 +1382,228 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
             if (b.y > a.y) p.hits.push_back({kind, a, b, index, static_cast<int>(i), from, to});
         };
         part(HitKind::row, ImVec2(x0, top), ImVec2(x1, top + row_h), static_cast<int>(i));
+        if (row.kind == RowKind::bind && row.key == "titles") {
+            const float size = 19 * s, ty = top + row_h - size - 12 * s;
+            for (const auto& [mid, title] : {std::pair{pad_mid, std::string_view("CONTROLLER")}, std::pair{key_mid, std::string_view("KEYBOARD")}})
+                text_at(dl, f.value, size, ImVec2(std::floor(mid - width_of(f.value, size, title) * .5f), ty), look::soft, title);
+            continue;
+        }
         const bool lit = static_cast<int>(i) == focus;
         const bool info = row.kind == RowKind::action && row.key == "none";
         if (lit) {
-            // The focus as the game's own panel shows it: a blue edge, the row a shade lighter.
-            dl->AddRectFilled(ImVec2(x0, top), ImVec2(x1, top + row_h), IM_COL32(255, 255, 255, 22));
-            dl->AddRectFilled(ImVec2(x0, top + 6 * u), ImVec2(x0 + 9 * u, top + row_h - 6 * u), theme::blue);
+            // The focus as the game's lists show it: the row a shade darker, a blue edge on its left.
+            dl->AddRectFilled(ImVec2(x0, top), ImVec2(x1, top + row_h), look::focus);
+            dl->AddRectFilled(ImVec2(x0, top), ImVec2(x0 + 15 * s, top + row_h), look::blue);
         }
-        const ImU32 ink = row.locked ? IM_COL32(150, 150, 152, 150) : info ? theme::muted : theme::paper;
-        const float label_y = top + (row_h - label_size) * .5f;
-        text_at(dl, lit ? f.bold : f.body, label_size, ImVec2(x0 + 44 * u, label_y), ink, row.label, value_mid - bar_w * .5f - 60 * u);
-        if (row.locked)
-            skate_theme::scribble(dl, ImVec2(x0 + 36 * u, top + 14 * u), ImVec2(x0 + 36 * u + std::min(430 * u, width_of(f.body, label_size, row.label) + 40 * u), top + row_h - 14 * u),
-                                  0x900 + static_cast<unsigned>(i), u * 1.6f);
-        // The value, and under it its slider or its marks; "< value >" on the row in focus.
-        std::string value = row.value;
-        const bool marked = row.fraction >= 0 || row.segments > 0;
-        const float value_y = marked ? top + 18 * u : top + (row_h - value_size) * .5f;
+        const ImU32 ink = row.locked ? look::dim : info ? look::soft : look::white;
+        // Its label (in the bold face in focus, as the game's), on two lines when it is long.
+        ImFont* label_face = lit && !row.locked ? f.value : f.label;
+        const auto [first, second] = label_lines(label_face, label_size, row.label, label_w);
+        const float line = std::floor(label_size * 1.08f);
+        if (second.empty()) {
+            text_at(dl, label_face, label_size, ImVec2(label_x, top + (row_h - label_size) * .5f - 1 * s), ink, first, label_x + label_w + 40 * s);
+        } else {
+            const float ty = top + (row_h - line * 2) * .5f;
+            text_at(dl, label_face, label_size, ImVec2(label_x, ty), ink, first, label_x + label_w + 40 * s);
+            text_at(dl, label_face, label_size, ImVec2(label_x, ty + line), ink, second, label_x + label_w + 40 * s);
+        }
+        if (row.locked) {
+            // Scribbled out, as the game's own rows that do not apply.
+            const float lw = std::min(label_w + 20 * s, std::max(width_of(label_face, label_size, first), width_of(label_face, label_size, second)) + 24 * s);
+            skate_theme::scribble(dl, ImVec2(label_x - 10 * s, top + 12 * s), ImVec2(label_x + lw, top + row_h - 12 * s), 0x900 + static_cast<unsigned>(i), s * 1.2f);
+        }
+        if (row.kind == RowKind::bind) {
+            // Two cells: the controller's (the shortcut button, "+", its own) and the keyboard's key, as the game's prompts draw
+            // them; the one picked outlined on the row in focus; the one waited on saying what to press.
+            const float side = 32 * s;
+            const float gy = std::floor(top + (row_h - side) * .5f);
+            const auto [bits, key] = bind_of_row(p.local, row.key);
+            const bool layer_row = row.key == "layer";
+            const int column = layer_row ? 0 : p.bind_column;
+            const bool waiting = p.binding && p.bind_for == row.key;
+            part(HitKind::segment, ImVec2(pad_mid - pad_half, top + 6 * s), ImVec2(pad_mid + pad_half, top + row_h - 6 * s), 0);
+            if (!layer_row) part(HitKind::segment, ImVec2(key_mid - key_half, top + 6 * s), ImVec2(key_mid + key_half, top + row_h - 6 * s), 1);
+            if (lit || waiting) {
+                const float mid = column ? key_mid : pad_mid, half = column ? key_half : pad_half;
+                dl->AddRect(ImVec2(mid - half, top + 9 * s), ImVec2(mid + half, top + row_h - 9 * s), waiting ? look::gold : look::blue, 6 * s, 0, 2.5f * s);
+            }
+            const auto centred_text = [&](float mid, std::string_view text, ImU32 colour, float size) {
+                text_at(dl, f.value, size, ImVec2(std::floor(mid - width_of(f.value, size, text) * .5f), top + (row_h - size) * .5f - 1 * s), colour, text);
+            };
+            // The controller's.
+            if (waiting && p.bind_device == 0) {
+                centred_text(pad_mid, "Press a button", look::gold, 20 * s);
+            } else if (bits) {
+                const auto pad_width = [&](ImDrawList* to, ImVec2 at) {
+                    float w = buttons_glyphs(to, f, side, at, p.local.pad_layer, style, s);
+                    if (layer_row) return w;
+                    w += 5 * s;
+                    w += plus_sign(to, f, side, ImVec2(at.x + w, at.y), s) + 5 * s;
+                    return w + buttons_glyphs(to, f, side, ImVec2(at.x + w, at.y), bits, style, s);
+                };
+                pad_width(dl, ImVec2(std::floor(pad_mid - pad_width(nullptr, {}) * .5f), gy));
+            } else {
+                centred_text(pad_mid, "-", look::soft, value_size);
+            }
+            // The keyboard's (the shortcut button has none).
+            if (layer_row) continue;
+            if (waiting && p.bind_device == 1) {
+                centred_text(key_mid, "Press a key", look::gold, 20 * s);
+            } else if (key) {
+                const std::string key_text = key_name(key);
+                const float wk = glyph(nullptr, f, side, {}, key_text, style, true);
+                glyph(dl, f, side, ImVec2(std::floor(key_mid - wk * .5f), gy), key_text, style, true);
+            } else {
+                centred_text(key_mid, "-", look::soft, value_size);
+            }
+            continue;
+        }
         if (row.kind == RowKind::naming) {
-            // The name, the cursor in it, on a light plate as a text field.
-            const float size = 36 * u, left = x0 + 300 * u, right = x1 - 40 * u;
-            dl->AddRectFilled(ImVec2(left, top + 22 * u), ImVec2(right, top + row_h - 22 * u), IM_COL32(236, 236, 230, 245), 4 * u);
-            text_at(dl, f.bold, size, ImVec2(left + 18 * u, top + (row_h - size) * .5f), skate_theme::black, row.value, right - 18 * u);
+            // The name, the cursor in it, on a light field.
+            const float size = 26 * s, left = bx0 - 40 * s, right = x1 - 28 * s;
+            dl->AddRectFilled(ImVec2(left, top + 15 * s), ImVec2(right, top + row_h - 15 * s), IM_COL32(240, 240, 236, 245));
+            text_at(dl, f.value, size, ImVec2(left + 14 * s, top + (row_h - size) * .5f), look::ink, row.value, right - 14 * s);
             continue;
         }
         if (row.kind == RowKind::preset && lit) {
-            // What A does to it, left / right choosing: a plate as an action's, with arrows either side.
-            static constexpr std::array<const char*, 4> what{"LOAD", "RENAME", "EXPORT", "DELETE"};
+            // What A does to it, left / right choosing, as a value is chosen: "< Load >", with A's glyph after it.
+            static constexpr std::array<const char*, 4> what{"Load", "Rename", "Export", "Delete"};
             const int chosen = p.preset_action_for == row.key ? std::clamp(p.preset_action, 0, 3) : 0;
-            const std::string label = p.confirm == row.key ? std::string("DELETE: A AGAIN") : std::string(what[static_cast<std::size_t>(chosen)]);
-            const float pw = std::max(150 * u, width_of(f.bold, 28 * u, label) + 40 * u);
-            const ImVec2 pa(x1 - 70 * u - pw, top + row_h * .5f - 26 * u), pb(x1 - 70 * u, top + row_h * .5f + 26 * u);
-            part(HitKind::left, ImVec2(pa.x - 48 * u, pa.y), ImVec2(pa.x - 6 * u, pb.y));
-            part(HitKind::right, ImVec2(pb.x + 6 * u, pa.y), ImVec2(pb.x + 48 * u, pb.y));
-            part(HitKind::plate, pa, pb);
-            dl->AddRectFilled(pa, pb, chosen == 3 || p.confirm == row.key ? IM_COL32(214, 92, 72, 255) : IM_COL32(236, 206, 92, 255), 4 * u);
-            text_at(dl, f.bold, 28 * u, ImVec2((pa.x + pb.x - width_of(f.bold, 28 * u, label)) * .5f, pa.y + 12 * u), skate_theme::black, label);
-            const float cy = top + row_h * .5f, h = 13 * u;
-            dl->AddTriangleFilled(ImVec2(pa.x - 34 * u, cy), ImVec2(pa.x - 18 * u, cy - h), ImVec2(pa.x - 18 * u, cy + h), theme::paper);
-            dl->AddTriangleFilled(ImVec2(pb.x + 34 * u, cy), ImVec2(pb.x + 18 * u, cy - h), ImVec2(pb.x + 18 * u, cy + h), theme::paper);
+            const bool confirming = p.confirm == row.key;
+            const std::string label = confirming ? std::string("Delete: again") : std::string(what[static_cast<std::size_t>(chosen)]);
+            const float ty = top + (row_h - value_size) * .5f - 1 * s;
+            const float tw = width_of(f.value, value_size, label);
+            text_at(dl, f.value, value_size, ImVec2(value_mid - tw * .5f, ty), confirming || chosen == 3 ? look::danger : look::white, label);
+            chevron(dl, ImVec2(bx0 - 22 * s, top + row_h * .5f), -1, s);
+            chevron(dl, ImVec2(bx1 + 22 * s, top + row_h * .5f), 1, s);
+            const float side = 30 * s;
+            glyph(dl, f, side, ImVec2(bx1 + 44 * s, top + (row_h - side) * .5f), keyboard ? "Enter" : "A", style, keyboard);
+            part(HitKind::left, ImVec2(bx0 - 50 * s, top), ImVec2(bx0, top + row_h));
+            part(HitKind::right, ImVec2(bx1, top), ImVec2(bx1 + 40 * s, top + row_h));
+            part(HitKind::plate, ImVec2(bx0, top), ImVec2(bx1, top + row_h));
             continue;
         }
         if (row.kind == RowKind::preset) {
             if (row.value == "Loaded") {
-                const float pw = width_of(f.bold, 24 * u, "LOADED") + 24 * u;
-                dl->AddRectFilled(ImVec2(x1 - 40 * u - pw, top + row_h * .5f - 20 * u), ImVec2(x1 - 40 * u, top + row_h * .5f + 20 * u), theme::blue, 4 * u);
-                text_at(dl, f.bold, 24 * u, ImVec2(x1 - 40 * u - pw + 12 * u, top + row_h * .5f - 12 * u), theme::paper, "LOADED");
+                const float size = 20 * s, h = 32 * s, pad = 12 * s, w = width_of(f.value, size, "LOADED") + pad * 2;
+                const ImVec2 at(std::floor(value_mid - w * .5f), std::floor(top + (row_h - h) * .5f));
+                dl->AddRectFilled(at, ImVec2(at.x + w, at.y + h), look::blue);
+                text_at(dl, f.value, size, ImVec2(at.x + pad, at.y + (h - size) * .5f), look::white, "LOADED");
             }
             continue;
         }
         if (row.kind == RowKind::action && !info) {
-            // An action: a plate with its button, as the game's CONFIRM is.
-            const float pw = 150 * u;
-            const ImVec2 pa(x1 - 40 * u - pw, top + row_h * .5f - 26 * u), pb(x1 - 40 * u, top + row_h * .5f + 26 * u);
-            if (!row.locked) part(HitKind::plate, pa, pb);
-            dl->AddRectFilled(pa, pb, row.locked ? IM_COL32(40, 40, 42, 160) : lit ? IM_COL32(236, 206, 92, 255) : IM_COL32(60, 60, 64, 220), 4 * u);
-            const std::string& label = row.value;
-            text_at(dl, f.bold, 28 * u, ImVec2((pa.x + pb.x - width_of(f.bold, 28 * u, label)) * .5f, pa.y + 12 * u),
-                    row.locked ? IM_COL32(150, 150, 152, 150) : lit ? skate_theme::black : theme::paper, label);
+            // An action: in focus, what A does as the game's prompts show it (its glyph, its name); else its name, dimmer.
+            const float side = 32 * s, size = 25 * s;
+            const char* button = keyboard ? "Enter" : "A";
+            // In the game's prompts' case ("Add Keyframe"): SAVE as Save.
+            std::string what = row.value;
+            for (std::size_t c = 1; c < what.size(); ++c)
+                if (std::isalpha(static_cast<unsigned char>(what[c])) && std::isalpha(static_cast<unsigned char>(what[c - 1])))
+                    what[c] = static_cast<char>(std::tolower(static_cast<unsigned char>(what[c])));
+            const float gw = glyph(nullptr, f, side, {}, button, style, keyboard), tw = width_of(f.value, size, what);
+            const float w = gw + 12 * s + tw, ax = std::floor(value_mid - w * .5f), ay = std::floor(top + (row_h - side) * .5f);
+            if (!row.locked) part(HitKind::plate, ImVec2(ax - 12 * s, top + 6 * s), ImVec2(ax + w + 12 * s, top + row_h - 6 * s));
+            if (lit && !row.locked) {
+                glyph(dl, f, side, ImVec2(ax, ay), button, style, keyboard);
+                text_at(dl, f.value, size, ImVec2(ax + gw + 12 * s, ay + (side - size) * .5f - 1 * s), look::white, what);
+            } else {
+                text_at(dl, f.value, size, ImVec2(value_mid - tw * .5f, top + (row_h - size) * .5f - 1 * s), row.locked ? look::dim : look::soft, what);
+            }
             continue;
         }
-        const float vw = width_of(f.bold, value_size, value);
-        text_at(dl, f.bold, value_size, ImVec2(value_mid - vw * .5f, value_y), row.locked ? ink : theme::paper, value);
-        if (lit && !row.locked && !info && row.kind != RowKind::video_folder) {
-            const float cy = value_y + value_size * .55f, h = 13 * u;
-            const float lx = value_mid - bar_w * .5f - 34 * u, rx = value_mid + bar_w * .5f + 34 * u;
-            dl->AddTriangleFilled(ImVec2(lx - 10 * u, cy), ImVec2(lx + 6 * u, cy - h), ImVec2(lx + 6 * u, cy + h), theme::paper);
-            dl->AddTriangleFilled(ImVec2(rx + 10 * u, cy), ImVec2(rx - 6 * u, cy - h), ImVec2(rx - 6 * u, cy + h), theme::paper);
+        // The value, and under it its slider or its marks; "< value >" on the row in focus.
+        const std::string& value = row.value;
+        const bool marked = row.fraction >= 0 || row.segments > 0;
+        const float value_y = marked ? top + 11 * s : top + (row_h - value_size) * .5f - 1 * s;
+        const float vw = width_of(f.value, value_size, value);
+        if (row.kind == RowKind::video_folder) {
+            // A folder: from its start, as much as fits.
+            text_at(dl, f.value, 22 * s, ImVec2(std::max(bx0 - 40 * s, std::min(value_mid - vw * .5f, x1 - 24 * s - vw)), top + (row_h - 22 * s) * .5f), ink, value,
+                    x1 - 20 * s);
+            continue;
         }
-        const float bar_y = top + row_h - 30 * u, bx0 = value_mid - bar_w * .5f, bx1 = value_mid + bar_w * .5f;
-        if (!row.locked && !info && row.kind != RowKind::video_folder) {
+        text_at(dl, f.value, value_size, ImVec2(value_mid - vw * .5f, value_y), row.locked ? look::dim : look::white, value);
+        const bool workable = !row.locked && !info;
+        if (lit && workable) {
+            const float cy = marked ? value_y + value_size * .55f : top + row_h * .5f;
+            chevron(dl, ImVec2(bx0 - 22 * s, cy), -1, s);
+            chevron(dl, ImVec2(bx1 + 22 * s, cy), 1, s);
+        }
+        const float bar_y = top + row_h - 19 * s;
+        if (workable) {
             // Either side of the value: a step down or up (held, again and again); its slider, or its marks.
-            part(HitKind::left, ImVec2(bx0 - 70 * u, top), ImVec2(bx0 - 4 * u, top + row_h));
-            part(HitKind::right, ImVec2(bx1 + 4 * u, top), ImVec2(bx1 + 70 * u, top + row_h));
-            if (row.fraction >= 0) part(HitKind::slider, ImVec2(bx0 - 8 * u, bar_y - 26 * u), ImVec2(bx1 + 8 * u, bar_y + 20 * u), 0, bx0, bx1);
+            part(HitKind::left, ImVec2(bx0 - 56 * s, top), ImVec2(bx0 - 4 * s, top + row_h));
+            part(HitKind::right, ImVec2(bx1 + 4 * s, top), ImVec2(bx1 + 56 * s, top + row_h));
+            if (row.fraction >= 0) part(HitKind::slider, ImVec2(bx0 - 8 * s, bar_y - 22 * s), ImVec2(bx1 + 8 * s, bar_y + 16 * s), 0, bx0, bx1);
             else if (row.segments > 0) {
-                const float gap = 8 * u, w = (bx1 - bx0 - gap * static_cast<float>(row.segments - 1)) / static_cast<float>(row.segments);
+                const float gap = 6 * s, w = (bar_w - gap * static_cast<float>(row.segments - 1)) / static_cast<float>(row.segments);
                 for (int k = 0; k < row.segments; ++k) {
                     const float sx = bx0 + static_cast<float>(k) * (w + gap);
-                    part(HitKind::segment, ImVec2(sx - gap * .5f, bar_y - 26 * u), ImVec2(sx + w + gap * .5f, bar_y + 20 * u), k);
+                    part(HitKind::segment, ImVec2(sx - gap * .5f, bar_y - 22 * s), ImVec2(sx + w + gap * .5f, bar_y + 16 * s), k);
                 }
             }
         }
-        const ImU32 lit_bar = row.locked ? IM_COL32(90, 110, 140, 160) : theme::blue;
+        const ImU32 fill = row.locked ? IM_COL32(120, 130, 150, 140) : look::blue;
         if (row.fraction >= 0) {
-            const float at = bx0 + (bx1 - bx0) * std::clamp(row.fraction, 0.0f, 1.0f);
-            dl->AddRectFilled(ImVec2(bx0, bar_y - 3 * u), ImVec2(bx1, bar_y + 3 * u), IM_COL32(70, 70, 74, 230), 3 * u);
-            dl->AddRectFilled(ImVec2(bx0, bar_y - 3 * u), ImVec2(at, bar_y + 3 * u), lit_bar, 3 * u);
-            dl->AddCircleFilled(ImVec2(at, bar_y), 12 * u, row.locked ? IM_COL32(170, 170, 172, 200) : theme::paper);
+            // The game's slider: a faint line, blue as far as the value, a white knob there.
+            const float at = bx0 + bar_w * std::clamp(row.fraction, 0.0f, 1.0f);
+            dl->AddRectFilled(ImVec2(bx0, bar_y - 2 * s), ImVec2(bx1, bar_y + 2 * s), look::track);
+            dl->AddRectFilled(ImVec2(bx0, bar_y - 4 * s), ImVec2(at, bar_y + 4 * s), fill);
+            dl->AddCircleFilled(ImVec2(at, bar_y), 11 * s, row.locked ? IM_COL32(190, 190, 190, 150) : look::white);
         } else if (row.segments > 0) {
-            const float gap = 8 * u, w = (bx1 - bx0 - gap * static_cast<float>(row.segments - 1)) / static_cast<float>(row.segments);
+            // A choice: a mark for each, the one chosen blue.
+            const float gap = 6 * s, w = (bar_w - gap * static_cast<float>(row.segments - 1)) / static_cast<float>(row.segments);
             for (int k = 0; k < row.segments; ++k) {
                 const float sx = bx0 + static_cast<float>(k) * (w + gap);
-                dl->AddRectFilled(ImVec2(sx, bar_y - 3 * u), ImVec2(sx + w, bar_y + 3 * u), k == row.segment ? lit_bar : IM_COL32(70, 70, 74, 230), 2 * u);
+                if (k == row.segment) dl->AddRectFilled(ImVec2(sx, bar_y - 4 * s), ImVec2(sx + w, bar_y + 4 * s), fill);
+                else dl->AddRectFilled(ImVec2(sx, bar_y - 2 * s), ImVec2(sx + w, bar_y + 2 * s), look::track);
             }
         }
     }
     dl->PopClipRect();
-    // A scroll bar, as the game's lists have one, while there is more than shows.
+    // A scroll bar beside the rows, as the game's longer lists have, while there is more than shows.
     const float content = static_cast<float>(rows.size()) * row_h;
     if (content > inner_h + 1) {
-        const float track_top = list_top + 8 * u, track_h = inner_h;
-        const float thumb_h = std::max(60 * u, track_h * inner_h / content), thumb_y = track_top + (track_h - thumb_h) * (scroll / (content - inner_h));
-        p.hits.push_back({HitKind::scroll, ImVec2(x1 + 2 * u, track_top), ImVec2(x1 + 26 * u, track_top + track_h), 0, -1, track_top, track_top + track_h});
+        const float track_top = list_top + 6 * s, track_h = inner_h - 12 * s;
+        const float thumb_h = std::max(50 * s, track_h * inner_h / content), thumb_y = track_top + (track_h - thumb_h) * (scroll / (content - inner_h));
+        p.hits.push_back({HitKind::scroll, ImVec2(x1 + 2 * s, track_top), ImVec2(x1 + 26 * s, track_top + track_h), 0, -1, track_top, track_top + track_h});
         p.track_top = track_top;
         p.track_h = track_h;
         p.thumb_h = thumb_h;
-        dl->AddRectFilled(ImVec2(x1 + 10 * u, track_top), ImVec2(x1 + 14 * u, track_top + track_h), IM_COL32(255, 255, 255, 40), 2 * u);
-        dl->AddRectFilled(ImVec2(x1 + 8 * u, thumb_y), ImVec2(x1 + 16 * u, thumb_y + thumb_h), IM_COL32(255, 255, 255, 180), 3 * u);
+        dl->AddRectFilled(ImVec2(x1 + 11 * s, track_top), ImVec2(x1 + 14 * s, track_top + track_h), IM_COL32(255, 255, 255, 60));
+        dl->AddRectFilled(ImVec2(x1 + 9 * s, thumb_y), ImVec2(x1 + 16 * s, thumb_y + thumb_h), IM_COL32(255, 255, 255, 220));
     }
-    // What the row in focus does (or what the last change said), on a strip under the panel, as the
-    // game's settings show their description.
-    const std::string hint = focus >= 0 && static_cast<std::size_t>(focus) < rows.size() ? rows[static_cast<std::size_t>(focus)].hint : std::string();
-    const bool fresh = seconds_now() - p.feedback_at < 5;
-    const std::string under = fresh ? p.feedback : hint;
+    float yy = list_bottom + 10 * s;
     if (!under.empty()) {
-        const float size = 30 * u, pad = 22 * u;
-        const float text_h = f.body->CalcTextSizeA(size, FLT_MAX, x1 - x0 - pad * 2, under.c_str()).y;
-        const ImVec2 ha(x0, list_bottom + 14 * u), hb(x1, list_bottom + 14 * u + text_h + pad * 2);
-        dl->AddRectFilled(ha, hb, IM_COL32(18, 18, 20, 210));
-        if (fresh) dl->AddRectFilled(ha, ImVec2(ha.x + 6 * u, hb.y), theme::blue);
-        dl->AddText(f.body, size, ImVec2(x0 + pad, ha.y + pad), fresh ? theme::paper : IM_COL32(205, 205, 208, 255), under.c_str(), nullptr, x1 - x0 - pad * 2);
+        dl->AddRectFilled(ImVec2(x0, yy), ImVec2(x1, yy + hint_h), IM_COL32(0, 0, 0, 118));
+        if (fresh) dl->AddRectFilled(ImVec2(x0, yy), ImVec2(x0 + 6 * s, yy + hint_h), look::blue);
+        dl->AddText(f.label, hint_line, ImVec2(x0 + hint_pad, yy + hint_pad), fresh ? look::white : IM_COL32(236, 236, 236, 255), under.c_str(), nullptr, hint_w);
+        yy += hint_h + 10 * s;
     }
-    // The controls, at the foot of the screen on the right, as the game puts its own.
+    // The prompts under it all, as the game puts the ones of its lists under them.
     std::vector<std::pair<std::string, std::string>> controls;
-    if (p.naming && keyboard) controls = {{"Enter", "Keep"}, {"Bksp", "Delete"}, {"Esc", "Back"}};
+    const bool presets_tab = p.tab == static_cast<int>(Tab::presets);
+    if (p.binding) controls = {{keyboard ? "Esc" : "B", "Cancel"}};
+    else if (p.naming && keyboard) controls = {{"Enter", "Keep"}, {"Bksp", "Delete"}, {"Esc", "Back"}};
     else if (p.naming) controls = {{"A", "Keep"}, {"X", "Delete"}, {"B", "Back"}};
-    else if (keyboard) controls = {{"Enter", "Select"}, {"R", p.tab == static_cast<int>(Tab::presets) ? "Delete" : "Reset To Default"}, {"Bksp", "Back"}};
-    else controls = {{"A", "Select"}, {"X", p.tab == static_cast<int>(Tab::presets) ? "Delete" : "Reset To Default"}, {"Y", "Hold To Hide"}, {"B", "Back"}};
-    float total = 0;
-    for (const auto& [button, what] : controls) total += prompt(nullptr, f.bold, u, {}, button, what, style, keyboard) + 40 * u;
-    float x = display.x - 72 * u - total + 40 * u;
-    const float fy = display.y - 100 * u;
+    else if (keyboard) controls = {{"Enter", "Select"}, {"R", presets_tab ? "Delete" : "Reset To Default"}, {"Bksp", "Back"}};
+    else controls = {{"A", "Select"}, {"X", presets_tab ? "Delete" : "Reset To Default"}, {"Y", "Hold To Hide"}, {"B", "Back"}};
+    float x = x0;
+    const float fy = std::floor(yy + 4 * s);
     for (const auto& [button, what] : controls) {
-        const float w = prompt(dl, f.bold, u, ImVec2(x, fy), button, what, style, keyboard);
+        const float w = prompt(dl, f, s, ImVec2(x, fy), button, what, style, keyboard);
         // Each prompt is its button for the mouse too.
         const int does = what == "Select" || what == "Keep" ? 0 : what == "Back" ? 2 : what == "Hold To Hide" ? -1 : 1;
-        if (does >= 0) p.hits.push_back({HitKind::prompt, ImVec2(x - 8 * u, fy - 8 * u), ImVec2(x + w + 8 * u, fy + 52 * u), does});
-        x += w + 40 * u;
+        if (does >= 0) p.hits.push_back({HitKind::prompt, ImVec2(x - 6 * s, fy - 6 * s), ImVec2(x + w + 6 * s, fy + 46 * s), does});
+        x += w + 28 * s;
     }
 }
 
 // The way in, as the game shows its own: "R3 + RB  Replay Plus" on a pad (R3 first: RB then stays the
-// panel's, not the game's next tab), "F10  Replay Plus" on the
-// keyboard, among the replay editor's button prompts at the foot of the screen, and only while the game's
-// UI shows there (replay_plus_depth.h ui_shown): it goes as the game hides its UI (L3 / H), or fades it
-// after a while without input.
+// panel's, not the game's next tab), "F10  Replay Plus" on the keyboard, among the replay editor's button
+// prompts at the foot of the screen, and only while the game's UI shows there (replay_plus_depth.h ui_shown):
+// it goes as the game hides its UI (L3 / H), or fades it after a while without input.
 void draw_hint(const link::View& view) {
     // In Advanced Edit only, while the game's prompts show.
     if (!view.in_replay || !view.advanced_edit || depth::ui_shown() < 0.5f) return;
@@ -1029,51 +1612,35 @@ void draw_hint(const link::View& view) {
     const bool keyboard = !input.available;
     const Fonts f = fonts();
     const auto display = ImGui::GetIO().DisplaySize;
-    // The game's prompts are larger than the panel's own (their keys about 44 pixels, their words about 36,
-    // at 1440 lines): as theirs.
-    const float u = std::min(display.x / 3840.0f, display.y / 2160.0f) * 2.1f;
+    const float s = native::ui_scale(display.x, display.y);
     auto* dl = ImGui::GetForegroundDrawList();
+    // As the game's own prompts there: their glyphs 38 tall, their words 27 (measured beside them, 2026-11-19).
+    const float side = 38 * s, size = 27 * s, gap = 8 * s;
     constexpr std::string_view what = "Replay Plus";
-    const float spacing = 10 * u, text = 28 * u;
-    float w = keyboard ? glyph(nullptr, f.bold, u, {}, "F10", input.style, true)
-                       : glyph(nullptr, f.bold, u, {}, "R3", input.style, false) + spacing + width_of(f.bold, text, "+") + spacing +
-                             glyph(nullptr, f.bold, u, {}, "RB", input.style, false);
-    w += 12 * u + width_of(f.bold, text, what);
+    // The menu's own button and key (CONTROLS): F10, and R3 + RB, as they came.
+    const auto& menu = view.settings.binds[static_cast<std::size_t>(Action::panel)];
+    if (keyboard && !menu.key) return;
+    const std::string menu_key = key_name(menu.key);
+    const auto pad_part = [&](ImDrawList* to, ImVec2 at) {
+        float x = buttons_glyphs(to, f, side, at, view.settings.pad_layer, input.style, s) + gap;
+        x += plus_sign(to, f, side, ImVec2(at.x + x, at.y), s) + gap;
+        return x + buttons_glyphs(to, f, side, ImVec2(at.x + x, at.y), menu.pad, input.style, s);
+    };
+    float w = keyboard ? glyph(nullptr, f, side, {}, menu_key, input.style, true) : pad_part(nullptr, {});
+    w += 12 * s + width_of(f.label, size, what);
     // In the widest stretch of the prompts' row with none of the game's prompts in it (each tab has its
     // own: Trim's leaves the middle free, Keyframe's the left of the middle), with room either side.
     const auto free = depth::ui_gap();
-    const float from = free.from * display.x, to = free.to * display.x, room = 40 * u;
+    const float from = free.from * display.x, to = free.to * display.x, room = 40 * s;
     if (to - from < w + room * 2) return;
     float x = std::floor((from + to) * 0.5f - w * 0.5f);
-    const float y = std::floor(display.y * 0.924f - 22 * u);
-    if (keyboard) {
-        x += glyph(dl, f.bold, u, ImVec2(x, y), "F10", input.style, true);
-    } else {
-        x += glyph(dl, f.bold, u, ImVec2(x, y), "R3", input.style, false) + spacing;
-        dl->AddText(f.bold, text, ImVec2(x, y + (44 * u - text) * .5f), theme::paper, "+");
-        x += width_of(f.bold, text, "+") + spacing;
-        x += glyph(dl, f.bold, u, ImVec2(x, y), "RB", input.style, false);
-    }
-    dl->AddText(f.bold, text, ImVec2(x + 12 * u, y + (44 * u - text) * .5f), theme::paper, what.data(), what.data() + what.size());
+    const float y = std::floor(display.y * 0.924f - side * 0.5f);
+    if (keyboard) x += glyph(dl, f, side, ImVec2(x, y), menu_key, input.style, true);
+    else x += pad_part(dl, ImVec2(x, y));
+    shadowed(dl, f.label, size, ImVec2(x + 12 * s, y + (side - size) * .5f - 1 * s), look::white, what, s);
 }
 
-// A D-pad, as the game draws its own: a cross, the arms pressed lit (1 up, 2 down, 4 left, 8 right).
-float dpad_glyph(ImDrawList* draw, float u, ImVec2 at, unsigned arms) {
-    const float side = 44 * u;
-    if (draw) {
-        const ImVec2 c(at.x + side * .5f, at.y + side * .5f);
-        const float a = side * .15f, b = side * .47f;
-        const ImU32 dim = IM_COL32(120, 121, 126, 255), lit = theme::paper;
-        draw->AddRectFilled(ImVec2(c.x - a, c.y - b), ImVec2(c.x + a, c.y + b), dim, 2 * u);
-        draw->AddRectFilled(ImVec2(c.x - b, c.y - a), ImVec2(c.x + b, c.y + a), dim, 2 * u);
-        if (arms & 1) draw->AddRectFilled(ImVec2(c.x - a, c.y - b), ImVec2(c.x + a, c.y - a), lit, 2 * u);
-        if (arms & 2) draw->AddRectFilled(ImVec2(c.x - a, c.y + a), ImVec2(c.x + a, c.y + b), lit, 2 * u);
-        if (arms & 4) draw->AddRectFilled(ImVec2(c.x - b, c.y - a), ImVec2(c.x - a, c.y + a), lit, 2 * u);
-        if (arms & 8) draw->AddRectFilled(ImVec2(c.x + a, c.y - a), ImVec2(c.x + b, c.y + a), lit, 2 * u);
-    }
-    return side;
-}
-constexpr ImU32 focus_mark = IM_COL32(64, 196, 255, 255), shake_mark = IM_COL32(255, 150, 60, 255);
+constexpr ImU32 focus_mark = IM_COL32(64, 196, 255, 255), shake_mark = IM_COL32(255, 150, 60, 255), light_mark = IM_COL32(227, 204, 114, 255);
 // The game's timeline runs from 10.16% to 90.04% of the width, the replay's start to its end (its own
 // one-second ticks sit there, at 16:9 and at 4:3 alike); its bar's height is read from the UI
 // (replay_plus_depth.h timeline_bar), else where it is on a 16:9 screen.
@@ -1084,7 +1651,7 @@ constexpr float timeline_from = 0.10156f, timeline_span = 0.79883f, timeline_y_w
 // it goes off). Only while the game's UI shows (they go with it, L3 / H).
 void draw_marks(const link::View& view) {
     if (!view.in_replay || !view.timeline_ok || view.timeline_length <= 0 || depth::ui_shown() < 0.5f) return;
-    if (view.settings.focus_keys.empty() && view.settings.shake_keys.empty()) return;
+    if (view.settings.focus_keys.empty() && view.settings.shake_keys.empty() && view.settings.light_keys.empty()) return;
     const auto display = ImGui::GetIO().DisplaySize;
     // Only where the bar shows now (not under one of the game's dialogs).
     const auto bar = depth::timeline_bar();
@@ -1096,7 +1663,7 @@ void draw_marks(const link::View& view) {
     auto* dl = ImGui::GetForegroundDrawList();
     // (Through the replay's chunks: a key on footage the replay no longer has is not drawn.)
     const auto x_of = [&](double time) {
-        const float share = link::timeline_share(view.chunks, view.timeline_start, view.timeline_length, time);
+        const float share = link::timeline_share(view.chunks, view.timeline_start, view.timeline_length, time, view.bar_from, view.bar_to);
         return share < 0 ? -1.0e6f : x0 + share * span;
     };
     const auto diamond = [&](float x, float cy, ImU32 fill, ImU32 edge) {
@@ -1115,10 +1682,20 @@ void draw_marks(const link::View& view) {
         if (x < x0 - r || x > x0 + span + r) continue;
         diamond(x, y + 9 * u, key.on ? shake_mark : IM_COL32(24, 24, 26, 235), key.on ? IM_COL32(10, 10, 12, 230) : shake_mark);
     }
+    // The light's keys above the focus's, gold (the game's CONFIRM's): filled where it comes on, hollow where it goes off;
+    // faint while Light keys is off.
+    const bool light_keyed = view.settings.light && view.settings.light_keyed;
+    for (const auto& key : view.settings.light_keys) {
+        const float x = std::floor(x_of(key.time)) + .5f;
+        if (x < x0 - r || x > x0 + span + r) continue;
+        const ImU32 gold = light_keyed ? light_mark : IM_COL32(227, 204, 114, 110);
+        diamond(x, y - 27 * u, key.on ? gold : IM_COL32(24, 24, 26, 235), key.on ? IM_COL32(10, 10, 12, 230) : gold);
+    }
 }
 
-// R3 held in the replay editor: what each button does with it, over the left of the picture above the
-// timeline; and what the last one did, for a moment after.
+// R3 held in the replay editor: what each button does with it, as the game's own Controls Helper lists its
+// controls (a heading, then each control on a plate of its own), over the left of the picture above the
+// timeline; and what the last one did, for a moment after, on the game's gold plate.
 void draw_guide(const link::View& view) {
     if (!view.in_replay) return;
     const double since = static_cast<double>(link::now_ms() - view.toast_at) / 1000.0;
@@ -1128,59 +1705,73 @@ void draw_guide(const link::View& view) {
     read_pad(input);
     const Fonts f = fonts();
     const auto display = ImGui::GetIO().DisplaySize;
-    const float u = std::min(display.x / 3840.0f, display.y / 2160.0f) * 1.6f;
+    const float s = native::ui_scale(display.x, display.y);
     auto* dl = ImGui::GetForegroundDrawList();
     const auto bar = depth::timeline_bar();
-    const float bottom = std::floor((bar.found ? bar.y : timeline_y_wide) * display.y - 70 * u);
-    const float x = std::floor(display.x * timeline_from), text = 28 * u, row = 56 * u, pad = 18 * u;
+    const float bottom = std::floor((bar.found ? bar.y : timeline_y_wide) * display.y - 50 * s);
+    const float x = std::floor(display.x * timeline_from);
+    // As the game's helper: glyphs 30 tall on plates 50 tall, 62 apart, its words 24.
+    const float side = 30 * s, size = 24 * s, row = 62 * s, pad = 10 * s, gap = 10 * s;
+    // Each line: its buttons (two for a pair: further / nearer, less / more; a D-pad pair on one D-pad), what it does.
     struct Line {
-        std::string_view button; // "RB", "LB", "LT", "RT", or "" for the D-pad
-        unsigned arms{};
+        std::uint32_t bits{}, pair{};
         std::string what;
     };
     std::vector<Line> lines;
     if (view.r3_held) {
         const auto& v = view.settings;
+        const auto pad_of = [&](Action a) { return v.binds[static_cast<std::size_t>(a)].pad; };
         const bool keyed = v.focus == Focus::keys;
-        lines.push_back({"RB", 0, "Replay Plus panel"});
-        lines.push_back({"", 1 | 2, std::format("Focus {:.2f} m (further / nearer){}", view.focus_distance_now, keyed ? "" : ": makes it keyed")});
-        lines.push_back({"LT", 0, std::format("Blur {:.0f}% (LT less, RT more)", view.focus_blur_now * 100)});
-        lines.push_back({"", 8, std::format("Camera light {}", v.light ? "off" : "on")});
-        lines.push_back({"", 4, std::format("Shake {} (the whole replay)", view.shake.on ? "off" : "on")});
-        lines.push_back({"LB", 0, std::format("Shake key: {} from here", view.shake_here ? "off" : "on")});
-        lines.push_back({"VIEW", 0, "Delete the keys here"});
+        const auto add = [&](std::uint32_t bits, std::uint32_t pair, std::string what) {
+            if (bits || pair) lines.push_back({bits, pair, std::move(what)});
+        };
+        add(pad_of(Action::panel), 0, "Open Panel");
+        add(pad_of(Action::focus_further), pad_of(Action::focus_nearer),
+            std::format("Focus {:.2f} m{}", view.focus_distance_now, keyed ? "" : " (Keys It)"));
+        add(pad_of(Action::blur_less), pad_of(Action::blur_more), std::format("Blur {:.0f}%", view.focus_blur_now * 100));
+        if (v.light && v.light_keyed) add(pad_of(Action::light), 0, std::format("Light Key: {} From Here", view.light_on_here ? "Off" : "On"));
+        else add(pad_of(Action::light), 0, std::format("Camera Light {}", v.light ? "Off" : "On"));
+        add(pad_of(Action::shake), 0, std::format("Shake {}", view.shake.on ? "Off" : "On"));
+        add(pad_of(Action::shake_key), 0, std::format("Shake Key: {} From Here", view.shake_here ? "Off" : "On"));
+        add(pad_of(Action::delete_keys), 0, "Delete Keys Here");
+        for (const auto& p : v.preset_binds)
+            if (p.bind.pad) add(p.bind.pad, 0, "Preset: " + p.preset);
     }
-    float w = 0;
-    for (const auto& line : lines) w = std::max(w, 44 * u + 14 * u + width_of(f.bold, text, line.what));
-    if (toast) w = std::max(w, width_of(f.bold, text, view.toast));
-    w = std::min(w + pad * 2, display.x * 0.6f);
-    const float title_h = view.r3_held ? row : 0, toast_h = toast ? row : 0;
-    const float h = title_h + static_cast<float>(lines.size()) * row + toast_h + pad * 2;
-    const float top = bottom - h;
-    dl->AddRectFilled(ImVec2(x, top), ImVec2(x + w, bottom), IM_COL32(16, 16, 18, 210), 6 * u);
-    float y = top + pad;
+    // Its buttons drawn (or measured): a pair of D-pad arms on one D-pad, else each its own.
+    const auto line_glyphs = [&](ImDrawList* to, ImVec2 at, const Line& line) {
+        if (line.pair && ((line.bits | line.pair) & ~0xfu) == 0) return dpad_glyph(to, side, at, line.bits | line.pair, input.style);
+        float w = line.bits ? buttons_glyphs(to, f, side, at, line.bits, input.style, s) : 0.0f;
+        if (line.pair) {
+            if (w > 0) w += 4 * s;
+            w += buttons_glyphs(to, f, side, ImVec2(at.x + w, at.y), line.pair, input.style, s);
+        }
+        return w;
+    };
+    const float head_h = view.r3_held ? row : 0.0f, toast_h = toast ? row : 0.0f;
+    const float h = head_h + static_cast<float>(lines.size()) * row + toast_h;
+    float y = bottom - h;
     if (view.r3_held) {
-        const float g = glyph(dl, f.bold, u, ImVec2(x + pad, y), "R3", input.style, false);
-        dl->AddText(f.bold, text, ImVec2(x + pad + g + 14 * u, y + (44 * u - text) * .5f), theme::paper, "Replay Plus: held, with");
+        // The heading: the shortcut button (R3), "Replay Plus", in the bold face, as "Controls Helper" heads the game's.
+        const float hs = 32 * s, g = buttons_glyphs(dl, f, hs, ImVec2(x, y), view.settings.pad_layer, input.style, s);
+        shadowed(dl, f.value, 23 * s, ImVec2(x + g + gap, y + (hs - 23 * s) * .5f - 1 * s), look::white, "Replay Plus", s);
         y += row;
     }
     for (const auto& line : lines) {
-        float gx = x + pad;
-        if (line.button.empty()) {
-            gx += dpad_glyph(dl, u, ImVec2(gx, y), line.arms);
-        } else if (line.button == "LT") {
-            gx += glyph(dl, f.bold, u, ImVec2(gx, y), "LT", input.style, false) + 6 * u;
-            gx += glyph(dl, f.bold, u, ImVec2(gx, y), "RT", input.style, false);
-        } else {
-            gx += glyph(dl, f.bold, u, ImVec2(gx, y), line.button, input.style, false);
-        }
-        dl->AddText(f.bold, text, ImVec2(gx + 14 * u, y + (44 * u - text) * .5f), theme::paper, line.what.c_str());
+        const float gw = line_glyphs(nullptr, {}, line);
+        const float w = gw + gap + width_of(f.label, size, line.what);
+        dl->AddRectFilled(ImVec2(x - pad, y - pad), ImVec2(x + w + pad * 1.4f, y + side + pad), IM_COL32(0, 0, 0, 92));
+        const float gx = x + line_glyphs(dl, ImVec2(x, y), line);
+        text_at(dl, f.label, size, ImVec2(gx + gap, y + (side - size) * .5f - 1 * s), look::white, line.what);
         y += row;
     }
     if (toast) {
-        const float fade = since < 2.0 ? 1.0f : static_cast<float>((2.5 - since) / 0.5);
-        const auto ink = IM_COL32(236, 206, 92, static_cast<int>(255 * std::clamp(fade, 0.0f, 1.0f)));
-        dl->AddText(f.bold, text, ImVec2(x + pad, y + (44 * u - text) * .5f), ink, view.toast.c_str());
+        // What it did, on the game's gold plate (as its CONFIRM), fading at the end.
+        const float fade = std::clamp(since < 2.0 ? 1.0f : static_cast<float>((2.5 - since) / 0.5), 0.0f, 1.0f);
+        const std::string text = upper(view.toast);
+        const float tsize = 22 * s, w = width_of(f.value, tsize, text) + 28 * s;
+        const auto alpha = static_cast<int>(255 * fade);
+        dl->AddRectFilled(ImVec2(x - pad, y - pad), ImVec2(x - pad + w, y + side + pad), (look::gold & ~IM_COL32_A_MASK) | (static_cast<ImU32>(alpha) << IM_COL32_A_SHIFT));
+        text_at(dl, f.value, tsize, ImVec2(x - pad + 14 * s, y + (side - tsize) * .5f - 1 * s), (look::ink & ~IM_COL32_A_MASK) | (static_cast<ImU32>(alpha) << IM_COL32_A_SHIFT), text);
     }
 }
 
@@ -1285,7 +1876,8 @@ unsigned mouse_input(Panel& p, const link::View& view, std::vector<Row>& rows) {
         focus = under->row;
         // A switch, a choice or an action works at a click on it; a number waits for its arrows or slider.
         const bool works = r->kind == RowKind::action || r->kind == RowKind::shake_on || r->kind == RowKind::shake_preset ||
-                           r->kind == RowKind::video_folder || (r->kind == RowKind::field && r->field && r->field->kind != Kind::number);
+                           r->kind == RowKind::video_folder || r->kind == RowKind::bind ||
+                           (r->kind == RowKind::field && r->field && r->field->kind != Kind::number);
         if (works) {
             act(p, view, *r, 0, true, false);
             rows = rows_for(p, view);
@@ -1331,6 +1923,11 @@ unsigned mouse_input(Panel& p, const link::View& view, std::vector<Row>& rows) {
     return presses;
 }
 } // namespace
+
+void reserve_native(ImFontAtlas& atlas, float width, float height, std::chrono::milliseconds wait) noexcept {
+    native::reserve(atlas, width, height, wait);
+}
+void fill_native(ImFontAtlas& atlas) noexcept { native::fill(atlas); }
 
 void draw_panel() noexcept {
     try {
@@ -1457,6 +2054,15 @@ void draw_panel() noexcept {
         // Shift with the keyboard's arrows: ten steps at a time.
         if (horizontal && (keys & (dpad_left | dpad_right)) && dingosdk::overlay::key_down(VK_SHIFT)) horizontal *= 10;
         if (!dirs) p.held_dir = 0;
+        if (p.binding) {
+            // Waiting for a button or key to bind: they are its alone.
+            bind_input(p, input);
+            rows = rows_for(p, *view);
+            auto& at = p.focus[static_cast<std::size_t>(p.tab)];
+            at = std::clamp(at, 0, std::max(0, static_cast<int>(rows.size()) - 1));
+            draw(p, *view, rows, input.style, keyboard);
+            return;
+        }
         if (p.naming) {
             // A name being typed has the keyboard and the pad to itself.
             p.tab = static_cast<int>(Tab::presets);

@@ -6,6 +6,7 @@
 #include <Windows.h>
 #include <array>
 #include <atomic>
+#include <mutex>
 
 namespace dingosdk::replay_shake::export_frames {
 namespace {
@@ -18,6 +19,7 @@ std::atomic<Configure> inner_configure{};
 std::atomic<int> video_width{}, video_height{};
 std::atomic<float> video_fps{};
 std::atomic<std::uintptr_t> image{};
+std::atomic<std::uint64_t> configured_at{};
 // Render thread writes, any thread reads (capture()).
 std::atomic<std::uint64_t> session{}, frames{}, last_frame_ms{};
 // A pause of a few seconds between frames is the next export. The pause is timed from the end of
@@ -56,6 +58,7 @@ std::uintptr_t configure(std::uintptr_t encoder, std::uintptr_t a, std::uintptr_
         video_height.store(height, std::memory_order_relaxed);
         video_fps.store(fps, std::memory_order_relaxed);
     }
+    configured_at.store(GetTickCount64(), std::memory_order_release);
     return inner_configure.load(std::memory_order_acquire)(encoder, a, b, c);
 }
 bool is_configure(void* target) noexcept {
@@ -71,6 +74,11 @@ bool is_submit(void* target) noexcept {
 }
 } // namespace
 
+std::uint64_t configured_ms() noexcept { return configured_at.load(std::memory_order_acquire); }
+bool busy() noexcept {
+    const auto at = configured_at.load(std::memory_order_acquire);
+    return capture().running || (at && GetTickCount64() - at < 5000);
+}
 Size size() noexcept {
     return {video_width.load(std::memory_order_relaxed), video_height.load(std::memory_order_relaxed), video_fps.load(std::memory_order_relaxed)};
 }
@@ -82,6 +90,79 @@ Capture capture() noexcept {
     result.session = session.load(std::memory_order_relaxed);
     result.frames = frames.load(std::memory_order_relaxed);
     return result;
+}
+
+namespace {
+struct Timing {
+    std::mutex mutex;
+    Timeline shown;                 // as the editor shows it now
+    std::uint64_t session{};        // the export timed below
+    Timeline exported;              // the timeline when it began
+    double clock{};                 // the clock when it began
+};
+Timing& timing() {
+    static Timing value;
+    return value;
+}
+} // namespace
+
+void set_timeline(Timeline timeline) noexcept {
+    try {
+        auto& t = timing();
+        std::lock_guard lock(t.mutex);
+        t.shown = std::move(timeline);
+    } catch (...) {}
+}
+
+double clock_at_share(const Timeline& timeline, double share) noexcept {
+    if (timeline.chunks.empty()) return timeline.start + share * timeline.length;
+    // Through its chunk; before the first, its start; past the last, its end.
+    const Timeline::Chunk* last = &timeline.chunks.front();
+    for (const auto& c : timeline.chunks) {
+        if (share < c.from) return c.clock_from;
+        if (share <= c.to) {
+            const double span = static_cast<double>(c.to) - c.from;
+            const double along = span > 1e-9 ? (share - c.from) / span : 0.0;
+            return c.clock_from + along * (c.clock_to - c.clock_from);
+        }
+        last = &c;
+    }
+    return last->clock_to;
+}
+
+double replay_time(double clock) noexcept {
+    const auto running = capture();
+    if (!running.running) return clock;
+    const float fps = size().fps;
+    const double step = 1.0 / (fps > 1.0f ? static_cast<double>(fps) : 60.0);
+    try {
+        auto& t = timing();
+        std::lock_guard lock(t.mutex);
+        if (running.session != t.session) {
+            // A new export: the timeline as the editor showed it, and the clock where it stands.
+            t.session = running.session;
+            t.exported = t.shown;
+            t.clock = clock;
+        }
+        const double along = static_cast<double>(running.frames) * step;
+        const auto& e = t.exported;
+        if (!e.known || e.length <= 1e-3) return t.clock + along;
+        if (!e.chunks.empty()) {
+            // The whole replay's seconds per share (its chunks' footage over the shares they fill), from the trim's start.
+            double footage = 0, shares = 0;
+            for (const auto& c : e.chunks) {
+                footage += c.clock_to - c.clock_from;
+                shares += static_cast<double>(c.to) - c.from;
+            }
+            if (footage > 1e-3 && shares > 1e-6) return clock_at_share(e, static_cast<double>(e.trim_from) + along * shares / footage);
+        }
+        // One stretch: the timeline's start, the trim's start on it, and on from there.
+        const double shown = static_cast<double>(e.bar_to) - e.bar_from;
+        const double trim_at = shown > 1e-6 ? (static_cast<double>(e.trim_from) - e.bar_from) / shown : 0.0;
+        return e.start + trim_at * e.length + along;
+    } catch (...) {
+        return clock;
+    }
 }
 } // namespace dingosdk::replay_shake::export_frames
 

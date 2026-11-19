@@ -71,6 +71,53 @@ struct ShakeKey {
     bool operator==(const ShakeKey&) const = default;
 };
 inline constexpr std::size_t max_shake_keys = 256;
+// A light key: from this replay time the camera light is on (or off) with these values; between keys they ease from one
+// to the next (as the game's own keyframes do), and it switches on or off at the key. Before the first key it is as the
+// first, after the last as the last.
+struct LightKey {
+    double time{};
+    bool on{true};
+    float power{1.0f};
+    float range{10.0f};
+    float cone{70.0f};
+    float warmth{0.2f};
+    bool operator==(const LightKey&) const = default;
+};
+inline constexpr std::size_t max_light_keys = 256;
+
+// ---- Controls: what the player's buttons and keys do in the replay editor -----------------------------------------
+// Each shortcut has a controller button, pressed with the shortcut button held (R3 unless the player picks another),
+// and a key of the keyboard (most none). Presets can have both too: they load the look. The player's own whatever look
+// is loaded: no preset carries them.
+enum class Action : std::uint8_t { panel, light, shake, shake_key, delete_keys, focus_further, focus_nearer, blur_less, blur_more, count };
+inline constexpr std::size_t action_count = static_cast<std::size_t>(Action::count);
+// As `replayplus bind <name> ...` and the settings file take them, and as the panel shows them.
+inline constexpr std::array<std::string_view, action_count> action_names{
+    "panel", "light", "shake", "shakekey", "deletekeys", "focusfurther", "focusnearer", "blurless", "blurmore"};
+inline constexpr std::array<std::string_view, action_count> action_labels{
+    "Open menu", "Camera light on / off", "Shake on / off", "Shake key here", "Delete keys here", "Focus further", "Focus nearer",
+    "Less blur", "More blur"};
+struct Bind {
+    std::uint32_t pad{}; // controller buttons (XInput's bits; LT 0x10000, RT 0x20000), with the shortcut button held; 0 none
+    std::uint32_t key{}; // a key: its virtual-key code, | 0x100 with Ctrl, 0x200 Shift, 0x400 Alt; 0 none
+    bool operator==(const Bind&) const = default;
+};
+struct PresetBind {
+    std::string preset; // the preset's name
+    Bind bind;
+    bool operator==(const PresetBind&) const = default;
+};
+using Binds = std::array<Bind, action_count>;
+inline constexpr std::uint32_t default_pad_layer = 0x0080; // R3
+inline constexpr std::uint32_t key_ctrl = 0x100, key_shift = 0x200, key_alt = 0x400;
+Binds default_binds() noexcept;
+// A button the shortcut button can be: one of the pad's buttons but A and B (the menus' own), not a trigger.
+bool layer_button(std::uint32_t bits) noexcept;
+// Buttons as the settings file and `bind` take them ("RB", "Right", "LT", "LB+RB"); "None" for 0.
+std::string pad_words(std::uint32_t bits);
+// A key's name ("F10", "Ctrl+1", "Num5", "None") and back; the names a single key goes by too ("Space", "PgUp").
+std::string key_name(std::uint32_t key);
+std::optional<std::uint32_t> parse_key(std::string_view text);
 
 struct Settings {
     bool enabled = true; // Replay Plus as a whole; off, nothing of it shows and the game is as it was
@@ -201,6 +248,14 @@ struct Settings {
 
     // LIGHT (a light on the camera)
     bool light = false;
+    // A real light of the game's (replay_plus_light.h: it lights the world as the game's own lights do, every surface,
+    // with shadows, in videos too); off, the light is drawn over the picture from the game's depth (as before 1.3).
+    bool light_real = true;
+    bool light_shadows = true; // the real light casts shadows
+    // Keyed: the light follows its keys along the replay (switched on and off, its brightness, reach, beam and colour,
+    // each key set at the playhead). Like the focus keys they belong to the replay in hand, not to presets.
+    bool light_keyed = false;
+    std::vector<LightKey> light_keys;
     float light_power = 1.0f;  // 0..8
     float light_range = 10.0f; // metres it reaches
     float light_cone = 70.0f;  // degrees across (180: all round, a bare bulb)
@@ -213,6 +268,9 @@ struct Settings {
     // game's picture past sharp_zoom (its enlargement at 120 degrees), up to sharp_most: the middle then
     // has as much detail as at 120 degrees (replay_plus.cpp keep_sharp_scale).
     bool sharp_middle = true;
+    // And what the lens enlarges sharpened (replay_plus.hlsl rcas): 0 none, 1 the most. Costs no frame rate;
+    // brings back crispness rather than detail the game never drew (only rendering finer does that).
+    float sharpen = 0.5f;
     bool resolution = false;
     float replay_scale = 1.5f;   // Render.ResolutionScale while the replay editor is open
     float gameplay_scale = 1.0f; // ...and while skating
@@ -226,6 +284,11 @@ struct Settings {
     // The controller combo that, held, opens the panel in the replay editor (ReSkate's binding form,
     // controller_bindings.h: XInput's button bits); 0: RB + R3.
     std::uint32_t panel_bind = 0;
+    // CONTROLS: the shortcut button (held, the controller's shortcuts work; a tap of it alone stays the game's), each
+    // shortcut's button and key, and presets loaded by a button or key. Not part of presets.
+    std::uint32_t pad_layer = default_pad_layer;
+    Binds binds = default_binds();
+    std::vector<PresetBind> preset_binds;
     std::string preset; // the preset last loaded, by name (shown in the panel)
 
     bool operator==(const Settings&) const = default;
@@ -242,9 +305,9 @@ inline bool lens_on(const Settings& s) noexcept {
 enum class Kind : std::uint8_t { number, toggle, choice };
 // EXPERIMENTAL: what reads the game's own replay (where it has the skater, its camera keyframes) and may need work
 // after a game update.
-enum class Tab : std::uint8_t { shake, lens, frame, grade, focus, light, game, video, presets, experimental, count };
+enum class Tab : std::uint8_t { shake, lens, frame, grade, focus, light, game, video, presets, experimental, controls, count };
 inline constexpr std::array<std::string_view, static_cast<std::size_t>(Tab::count)> tab_names{
-    "SHAKE", "LENS", "FRAME", "COLOUR", "FOCUS", "LIGHT", "GAME", "VIDEO", "PRESETS", "EXPERIMENTAL"};
+    "SHAKE", "LENS", "FRAME", "COLOUR", "FOCUS", "LIGHT", "GAME", "VIDEO", "PRESETS", "EXPERIMENTAL", "CONTROLS"};
 
 struct Field {
     std::string_view key;   // as `replayplus set <key> <value>` and the presets take it: "lens.zoom"
@@ -337,6 +400,20 @@ bool remove_focus_key(Settings& settings, double time, double tolerance = 1.0 / 
 // The key at `time` (within a frame), if any.
 const FocusKey* focus_key_at(const Settings& settings, double time);
 
+// ---- Light keys ------------------------------------------------------------------------------
+struct LightAt {
+    bool on{};
+    float power{}, range{}, cone{}, warmth{};
+};
+// The light at a replay time: keyed with keys, eased between them and switched at them; else as it is set.
+LightAt light_at(const Settings& settings, double time);
+// The key at `time` (within a frame) set to these, or a new one there. Keys stay in time order.
+void set_light_key(Settings& settings, double time, const LightAt& light);
+// The key within `tolerance` of `time` removed; false when there is none.
+bool remove_light_key(Settings& settings, double time, double tolerance = 1.0 / 30.0);
+// The key at `time` (within a frame), if any.
+const LightKey* light_key_at(const Settings& settings, double time);
+
 // ---- Shake keys ------------------------------------------------------------------------------
 // Whether the shake is on at a replay time: the last key at or before it says; before the first key,
 // the other way round from it. With no keys, `otherwise` (Replay Shake's own switch).
@@ -360,6 +437,9 @@ struct Reply {
 // research verbs) are the runtime's; unknown ones say so.
 Reply command(Settings& settings, std::string_view verb, std::span<const std::string> words);
 inline constexpr std::array<std::string_view, 9> settings_verbs{"set", "get", "step", "reset", "on", "off", "bind", "list", "values"};
+// The controls as the console lists them, and `bind ...` on them (Settings::binds: replay_plus_settings.cpp).
+std::string binds_text(const Settings& settings);
+std::string bind_verb(Settings& settings, const std::vector<std::string>& words);
 
 // ---- Small helpers shared with the runtime and the panel --------------------------------------
 std::string lower(std::string_view text);
