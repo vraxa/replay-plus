@@ -22,13 +22,18 @@ std::atomic<std::uintptr_t> image{};
 std::atomic<std::uint64_t> configured_at{};
 // Render thread writes, any thread reads (capture()).
 std::atomic<std::uint64_t> session{}, frames{}, last_frame_ms{};
+// When the export running now had its first frame, and when the one before it had its last (0: none).
+std::atomic<std::uint64_t> export_began_ms{}, previous_export_ended_ms{};
 // A pause of a few seconds between frames is the next export. The pause is timed from the end of
 // the last frame's encode, so a slow encode (4K) is still the same export.
 constexpr std::uint64_t new_export_ms = 3000, running_ms = 2000;
 
 void count() noexcept {
     const auto now = GetTickCount64();
-    if (now - last_frame_ms.load(std::memory_order_relaxed) > new_export_ms) {
+    const auto last = last_frame_ms.load(std::memory_order_relaxed);
+    if (now - last > new_export_ms) {
+        previous_export_ended_ms.store(last, std::memory_order_relaxed);
+        export_began_ms.store(now, std::memory_order_relaxed);
         frames.store(0, std::memory_order_relaxed);
         session.fetch_add(1, std::memory_order_relaxed);
     }
@@ -75,6 +80,12 @@ bool is_submit(void* target) noexcept {
 } // namespace
 
 std::uint64_t configured_ms() noexcept { return configured_at.load(std::memory_order_acquire); }
+Size setup_of_this_export() noexcept {
+    const auto at = configured_at.load(std::memory_order_acquire);
+    const auto began = export_began_ms.load(std::memory_order_relaxed), before = previous_export_ended_ms.load(std::memory_order_relaxed);
+    if (!at || !began || at <= before || (began > at && began - at > 10000)) return {};
+    return size();
+}
 bool busy() noexcept {
     const auto at = configured_at.load(std::memory_order_acquire);
     return capture().running || (at && GetTickCount64() - at < 5000);

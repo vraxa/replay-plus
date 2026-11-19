@@ -605,6 +605,23 @@ void keep_for_export(Shared& s, ID3D12GraphicsCommandList* list, const D3D12_RES
     k.own_frame = s.copied_epoch == s.epoch;
     ++s.kept_pushed;
 }
+// The game's video frames going to be copied out for its encoder, whatever their size (a trace of an export,
+// 2026-11-17: B8G8R8A8 at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame): their size is
+// what an exported frame is finished at (link::export_frame_size), MP4 or WebM, light or none.
+void note_video_frames(const Shared& s, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+    for (UINT i = 0; i < count; ++i) {
+        const auto& b = barriers[i];
+        if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource || (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY))
+            continue;
+        if (b.Transition.StateAfter != D3D12_RESOURCE_STATE_COPY_SOURCE || b.Transition.StateBefore == D3D12_RESOURCE_STATE_COPY_SOURCE) continue;
+        const auto d = b.Transition.pResource->GetDesc();
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Format != DXGI_FORMAT_B8G8R8A8_UNORM || d.DepthOrArraySize != 1 || d.MipLevels != 1 ||
+            d.SampleDesc.Count != 1 || d.Width < 64 || d.Height < 64 || d.Width > 16384 || d.Height > 16384)
+            continue;
+        if (swap_buffer(s, b.Transition.pResource)) continue;
+        link::note_video_frame(static_cast<std::uint32_t>(d.Width), d.Height);
+    }
+}
 // The game's video frame as it goes from being drawn to being copied out for its encoder (a trace of an
 // export, 2026-11-17: B8G8R8A8 at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame).
 void export_taps(Shared& s, ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers, BarrierFn original) {
@@ -633,6 +650,7 @@ void barriers(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_
         if (link::trace_frames().load(std::memory_order_relaxed) > 0) trace(list, count, barriers);
         std::lock_guard lock(s.mutex);
         if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+        if (list != s.own_list) note_video_frames(s, count, barriers);
         if (s.scene_wanted || s.ui_wanted) frame_taps(s, list, count, barriers, original);
         if (s.wanted && s.texture && list != s.own_list) export_taps(s, list, count, barriers, original);
         if (!s.wanted || s.copied_epoch == s.epoch) return;

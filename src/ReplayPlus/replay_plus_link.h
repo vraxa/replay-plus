@@ -170,6 +170,34 @@ std::uint32_t drawn_under_ui() noexcept;
 // 8-bit, blue first, in place). False when it could not; the frame is then as it was.
 bool finish_export_on_gpu(std::uint8_t* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch) noexcept;
 
+// ---- An exported frame's size ----------------------------------------------------------------------
+// The game's video frames as the render side sees them go to be copied out for its encoder (replay_plus_depth.cpp:
+// 8-bit BGRA at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame of an export): each size
+// seen lately, when it was last, and how many times since it was last away for more than a few seconds. Any thread.
+struct VideoFrameSeen {
+    std::uint32_t width{}, height{};
+    std::uint64_t last_ms{}; // now_ms()
+    std::uint32_t times{};
+};
+void note_video_frame(std::uint32_t width, std::uint32_t height) noexcept;
+std::vector<VideoFrameSeen> video_frames_seen() noexcept;
+// One more seen at `now` (note_video_frame's count, apart so it can be tested): four sizes at most, the oldest let go.
+void count_video_frame(std::vector<VideoFrameSeen>& seen, std::uint32_t width, std::uint32_t height, std::uint64_t now);
+// An exported frame's size (replay_plus.cpp export_frame): the game's video frame's, the one size seen more than once in
+// the last three seconds whose rows fit the frame's (`pitch` bytes apart, padded by less than 256 as a readback's are);
+// checked against this export's own H.264 setup when it had one (an MP4: `setup_width` x `setup_height`, else 0), which
+// also tells two sizes apart; and never more rows than the buffer the frame starts (`own_rows`, 0 when it does not
+// start one but is part of a larger one). 0 x 0 when it cannot be told for sure: the frame goes out as the game made it
+// then, as a guess could read and write past it. (Sized by the buffer it came in, as 1.3 did, one MP4 had every sixth
+// frame go out without the lens, and a WebM had three frames in six finished as one tall picture and written over each
+// other: the game reads its frames back into six buffers in turn and not every one is a buffer of its own, 2026-11-19.)
+struct ExportSize {
+    int width{}, height{};
+    const char* by{""}; // what told it, or why it could not be told
+};
+ExportSize export_frame_size(std::uintptr_t pitch, const std::vector<VideoFrameSeen>& seen, std::uint64_t now, int setup_width,
+                             int setup_height, std::uint32_t own_rows) noexcept;
+
 // ---- The replay editor's pad: R3 is Replay Plus's button there ----------------------------------
 // While on (renewed every tick by the game thread: the replay editor up, the panel closed, the
 // shortcuts on; it lapses 300 ms after the last renewal), the game's own pad reads go through

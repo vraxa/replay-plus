@@ -1,0 +1,418 @@
+From 9de6a4a8dd2497fef1fd05f3338e32544a833623 Mon Sep 17 00:00:00 2001
+From: vraxa <200693817+vraxa@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:30:54 +0000
+Subject: [PATCH] Replay Plus 1.3.1: exported frames sized by the game's own
+ video frame
+
+- an exported frame's size is the game's video frame's, as the render side sees it go to be copied out for the
+  encoder (B8G8R8A8, not a swap chain buffer, RENDER_TARGET -> COPY_SOURCE each frame), checked against the export's
+  own H.264 setup when it had one (an MP4: one run after the export before ended); the buffer the frame came in is
+  only a bound
+- 1.3 sized each frame by the buffer it came in, but the game reads its frames back into six buffers in turn and not
+  every one is a buffer of its own: a 1280x720 WebM had one buffer at the start of a block of three frames, finished
+  as one tall picture and written over the two after it (three frames in six broken), and an MP4 had every sixth
+  frame go out without the lens once its H.264 setup was four seconds old
+- a frame whose size cannot be told for sure goes out as the game made it, and the log says which and why
+---
+ .../ReplayPlus/Test/replay_plus_tests.cpp     | 63 +++++++++++++++-
+ Extension/ReplayPlus/replay_plus.cpp          | 73 +++++++++++--------
+ Extension/ReplayPlus/replay_plus_depth.cpp    | 18 +++++
+ Extension/ReplayPlus/replay_plus_link.cpp     | 64 ++++++++++++++++
+ Extension/ReplayPlus/replay_plus_link.h       | 28 +++++++
+ Extension/ReplayShake/replay_shake_export.cpp | 13 +++-
+ Extension/ReplayShake/replay_shake_export.h   |  4 +
+ 7 files changed, 232 insertions(+), 31 deletions(-)
+
+diff --git a/Extension/ReplayPlus/Test/replay_plus_tests.cpp b/Extension/ReplayPlus/Test/replay_plus_tests.cpp
+index 17d53cf3..8252c00b 100644
+--- a/Extension/ReplayPlus/Test/replay_plus_tests.cpp
++++ b/Extension/ReplayPlus/Test/replay_plus_tests.cpp
+@@ -1458,12 +1458,73 @@ void bind_tests() {
+     run(s, "reset", {"controls"});
+     check(s.binds == default_binds() && s.pad_layer == default_pad_layer, "reset controls");
+ }
++// An exported frame's size (link::export_frame_size): the game's video frame as the render side saw it go out,
++// checked against this export's H.264 setup; the buffer the frame came in only bounds it. (1.3 sized frames by their
++// buffer: the game's six buffers are not all buffers of their own, 2026-11-19.)
++void export_size_tests() {
++    using link::VideoFrameSeen;
++    const std::uint64_t t = 100000;
++    std::vector<VideoFrameSeen> seen;
++    link::count_video_frame(seen, 1280, 720, t);
++    check(seen.size() == 1 && seen[0].times == 1, "a video frame seen once");
++    auto sized = link::export_frame_size(5120, seen, t + 16, 0, 0, 0);
++    check(sized.width == 0, std::string("seen once is not enough: ") + sized.by);
++    for (std::uint64_t i = 1; i <= 5; ++i) link::count_video_frame(seen, 1280, 720, t + 16 * i);
++    check(seen.size() == 1 && seen[0].times == 6 && seen[0].last_ms == t + 80, "seen six times");
++    // A WebM (no H.264 setup): the video frame's size, whatever the buffer the frame came in is.
++    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 0);
++    check(sized.width == 1280 && sized.height == 720, std::string("a frame inside a larger buffer: ") + sized.by);
++    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 2160);
++    check(sized.width == 1280 && sized.height == 720, "a frame starting a buffer of three frames: its own rows only (the sent WebM)");
++    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 720);
++    check(sized.width == 1280 && sized.height == 720, "a buffer of its own");
++    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 700);
++    check(sized.width == 0, std::string("a buffer shorter than the frame: left as it is: ") + sized.by);
++    // An MP4: its setup agrees, or the frame is left as it is.
++    sized = link::export_frame_size(5120, seen, t + 100, 1280, 720, 0);
++    check(sized.width == 1280 && sized.height == 720 && std::string(sized.by).find("H.264") != std::string::npos, "an MP4's setup agrees");
++    sized = link::export_frame_size(5120, seen, t + 100, 1280, 960, 0);
++    check(sized.width == 0, std::string("a setup that disagrees: ") + sized.by);
++    // Rows of another length are not the video frame's.
++    sized = link::export_frame_size(10240, seen, t + 100, 0, 0, 0);
++    check(sized.width == 0, "1280-wide video frames for 2560-wide rows: left as it is");
++    sized = link::export_frame_size(10240, seen, t + 100, 2560, 1920, 0);
++    check(sized.width == 2560 && sized.height == 1920, std::string("the setup alone, no video frame that wide seen: ") + sized.by);
++    // Seen over three seconds ago: not this export's; and counted from nothing when it comes back.
++    sized = link::export_frame_size(5120, seen, t + 80 + 3001, 0, 0, 0);
++    check(sized.width == 0, "seen too long ago");
++    link::count_video_frame(seen, 1280, 720, t + 10000);
++    check(seen.size() == 1 && seen[0].times == 1, "back after a while: counted again");
++    // Two heights of one width lately: only the setup tells them apart.
++    std::vector<VideoFrameSeen> two;
++    for (std::uint64_t i = 0; i < 4; ++i) {
++        link::count_video_frame(two, 2560, 1440, t + 16 * i);
++        link::count_video_frame(two, 2560, 1920, t + 16 * i + 8);
++    }
++    sized = link::export_frame_size(10240, two, t + 80, 0, 0, 0);
++    check(sized.width == 0, std::string("two sizes and no setup: ") + sized.by);
++    sized = link::export_frame_size(10240, two, t + 80, 2560, 1920, 0);
++    check(sized.width == 2560 && sized.height == 1920, "the setup picks one of them");
++    sized = link::export_frame_size(10240, two, t + 80, 2560, 1072, 0);
++    check(sized.width == 0, "a setup that is neither");
++    // Rows padded to 256 bytes: 1366 pixels in 5632.
++    std::vector<VideoFrameSeen> padded;
++    for (std::uint64_t i = 0; i < 3; ++i) link::count_video_frame(padded, 1366, 768, t + 16 * i);
++    sized = link::export_frame_size(5632, padded, t + 50, 0, 0, 0);
++    check(sized.width == 1366 && sized.height == 768, "padded rows");
++    // Four sizes at most: the oldest goes.
++    std::vector<VideoFrameSeen> many;
++    for (std::uint32_t i = 0; i < 6; ++i) link::count_video_frame(many, 640 + 64 * i, 360, t + i);
++    check(many.size() == 4 && std::none_of(many.begin(), many.end(), [](const VideoFrameSeen& v) { return v.width == 640 || v.width == 704; }),
++          "four sizes kept, the oldest let go");
++}
+ int main() {
+     const std::vector<std::pair<const char*, std::function<void()>>> suites{
+         {"fields", field_tests}, {"commands", command_tests}, {"json", json_tests}, {"presets", preset_tests},
+         {"lens", lens_tests}, {"grade", grade_tests}, {"finish", finish_tests}, {"focus", focus_tests},
+         {"shake keys", shake_key_tests}, {"light keys", light_key_tests}, {"view", view_tests}, {"edge compression", compression_tests}, {"overlay", hood_tests},
+-        {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}, {"controls", bind_tests}};
++        {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}, {"controls", bind_tests},
++        {"export size", export_size_tests}};
+     try {
+         for (const auto& [name, suite] : suites) {
+             suite();
+diff --git a/Extension/ReplayPlus/replay_plus.cpp b/Extension/ReplayPlus/replay_plus.cpp
+index e813b324..7140aa4d 100644
+--- a/Extension/ReplayPlus/replay_plus.cpp
++++ b/Extension/ReplayPlus/replay_plus.cpp
+@@ -251,6 +251,7 @@ struct State {
+     std::mutex export_mutex;
+     std::uint64_t export_frames{}, export_session_at{};
+     bool export_logged{}, export_gpu_said{};
++    std::uint64_t export_unsized{}; // frames of this export that went out as the game made them, their size not known
+ #if defined(REPLAY_PLUS_TEST_INBOX)
+     std::uint64_t inbox_at{}, inbox_wait_until{};
+     std::vector<std::string> inbox;
+@@ -3155,33 +3156,23 @@ void export_frame(std::uintptr_t encoder, std::uintptr_t pixels, std::uintptr_t
+             s.export_frames = 0;
+             s.export_logged = false;
+             s.export_gpu_said = false;
++            s.export_unsized = 0;
+         }
+         s.export_session_at = now;
+         ++s.export_frames;
+-        // The frame's size: its buffer's (the game's readback for the encoder is a buffer of its own that starts at the frame
+-        // and holds its rows, MP4 or WebM: 10240 x 1072 at 2.39:1, 10240 x 1920 at 4:3, 2026-11-19); else the H.264 setup's,
+-        // when it set this export up (an MP4); else it is not finished. Rows padded to 256 bytes as a readback's are. (A
+-        // size kept from an earlier export once read and wrote 1920 rows of a 1072-row frame, a WebM export after an MP4
+-        // one of another shape, and the game crashed: 2026-11-19. The submit's encoder holds no size of the frame's.)
+-        const auto row_fits = [&](int w) {
+-            return w > 0 && static_cast<std::uintptr_t>(w) * 4 <= pitch && pitch < static_cast<std::uintptr_t>(w) * 4 + 256;
+-        };
+-        int width = 0, height = 0;
+-        const char* sized_by = "";
+-        const auto video = replay_shake::export_frames::size();
+-        const bool fresh_setup = replay_shake::export_frames::configured_ms() + 4000 > now && replay_shake::export_frames::configured_ms() <= now;
+-        if (const auto own = own_rows(pixels, pitch); own >= 64) {
+-            width = static_cast<int>(pitch / 4);
+-            height = static_cast<int>(own);
+-            sized_by = "its buffer";
+-        } else if (fresh_setup && row_fits(video.width) && video.height >= 64) {
+-            width = video.width;
+-            height = video.height;
+-            sized_by = "its H.264 setup";
+-        } else {
+-            // Not known: the frame goes out as the game made it (a guess could read or write past it).
+-            sized_by = "nothing (not finished)";
+-        }
++        // The frame's size: the game's video frame's, as the render side saw it go to be copied out for the encoder,
++        // checked against this export's H.264 setup when it had one (an MP4); the buffer the frame came in is only a
++        // bound (link::export_frame_size). Rows padded to 256 bytes as a readback's are; the submit's encoder holds no
++        // size of the frame's. (Sized by its buffer, as 1.3 did, an MP4 had every sixth frame go out without the lens and
++        // a WebM three frames in six finished as one tall picture written over each other: the game reads its frames back
++        // into six buffers in turn and not every one is a buffer of its own, 2026-11-19. A size kept from an earlier
++        // export, before that, read and wrote 1920 rows of a 1072-row frame, a WebM after an MP4 of another shape, and the
++        // game crashed.)
++        const auto setup = replay_shake::export_frames::setup_of_this_export();
++        const auto own = own_rows(pixels, pitch);
++        const auto sized = link::export_frame_size(pitch, link::video_frames_seen(), link::now_ms(), setup.width, setup.height, own);
++        const int width = sized.width, height = sized.height;
++        const char* sized_by = sized.by;
+         // And all its rows in its buffer, or it goes out as the game made it.
+         const int rows = width > 0 && height > 0 ? static_cast<int>(rows_held(pixels, pitch, static_cast<std::uint32_t>(width) * 4u,
+                                                                                static_cast<std::uint32_t>(std::clamp(height, 0, 8192))))
+@@ -3189,7 +3180,30 @@ void export_frame(std::uintptr_t encoder, std::uintptr_t pixels, std::uintptr_t
+         const bool short_buffer = rows < height;
+         const bool plausible = !short_buffer && width >= 64 && height >= 64 && width <= 8192 && height <= 8192 &&
+                                static_cast<std::uintptr_t>(width) * 4 <= pitch && pitch <= static_cast<std::uintptr_t>(width) * 4 + 4096;
++        if (!plausible && s.export_on.load(std::memory_order_acquire)) {
++            // Said for the first such frame of an export, and every 300th after: they go out without the lens.
++            if (++s.export_unsized == 1 || s.export_unsized % 300 == 0)
++                logging::log(logging::Level::info, logging::Channel::graphics,
++                             "Replay Plus export: frame {} goes out as the game made it ({} so far): its size from {}{}.", s.export_frames,
++                             s.export_unsized, sized_by, short_buffer && height > 0 ? ", but its buffer holds fewer rows" : "");
++        }
+ #if defined(REPLAY_PLUS_TEST_INBOX)
++        if (s.export_frames <= 12) {
++            // (Test builds: the buffer each of an export's first frames came in, and the size it was given.)
++            MEMORY_BASIC_INFORMATION block{};
++            std::string where = "?";
++            if (VirtualQuery(reinterpret_cast<const void*>(pixels), &block, sizeof block) == sizeof block)
++                where = std::format("{} bytes into a block at 0x{:x} (type 0x{:x}), {:.2f} rows from it to its region's end",
++                                    pixels - reinterpret_cast<std::uintptr_t>(block.AllocationBase), reinterpret_cast<std::uintptr_t>(block.AllocationBase),
++                                    block.Type,
++                                    static_cast<double>(reinterpret_cast<std::uintptr_t>(block.BaseAddress) + block.RegionSize - pixels) /
++                                        static_cast<double>(pitch));
++            std::string seen;
++            for (const auto& v : link::video_frames_seen())
++                seen += std::format(" {}x{} ({} times, {} ms ago)", v.width, v.height, v.times, link::now_ms() - v.last_ms);
++            logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus export frame {}: 0x{:x}, {}; sized {}x{} by {}; video frames seen:{}.",
++                         s.export_frames, pixels, where, width, height, sized_by, seen.empty() ? " none" : seen);
++        }
+         if (!s.export_logged) {
+             // (Test builds: where the frame's size might be. The encoder's ints that look like a size, and the buffer's memory
+             // region from the frame on.)
+@@ -3221,11 +3235,12 @@ void export_frame(std::uintptr_t encoder, std::uintptr_t pixels, std::uintptr_t
+             std::string bytes;
+             for (const auto b : first) bytes += std::format("{:02x} ", b);
+             logging::log(logging::Level::info, logging::Channel::graphics,
+-                         "Replay Plus export: encoder vtable +0x{:x}, size {}x{} (from {}; the last H.264 setup {}x{}{}), "
+-                         "pitch {}, its buffer holds {} rows{}, first bytes {}; finishing {}.",
+-                         vtable - s.base, width, height, sized_by, video.width, video.height,
+-                         fresh_setup ? ", this export's" : ", an earlier export's", pitch, rows, short_buffer ? " (fewer than its size: not finished)" : "",
+-                         bytes, plausible && s.export_on.load() ? "on" : "off");
++                         "Replay Plus export: encoder vtable +0x{:x}, size {}x{} (from {}; this export's H.264 setup {}), pitch {}, its buffer {}, "
++                         "holds {} rows{}, first bytes {}; finishing {}.",
++                         vtable - s.base, width, height, sized_by,
++                         setup.width > 0 ? std::format("{}x{}", setup.width, setup.height) : std::string("none"), pitch,
++                         own ? std::format("starts a block of {} rows", own) : std::string("does not start a block of its own"), rows,
++                         short_buffer ? " (fewer than its size: not finished)" : "", bytes, plausible && s.export_on.load() ? "on" : "off");
+         }
+         if (!plausible || !s.export_on.load(std::memory_order_acquire)) return;
+         // The pass has been drawing under the game's UI for a few frames: this frame (read back a frame or two
+diff --git a/Extension/ReplayPlus/replay_plus_depth.cpp b/Extension/ReplayPlus/replay_plus_depth.cpp
+index d13ddb32..cf848fd8 100644
+--- a/Extension/ReplayPlus/replay_plus_depth.cpp
++++ b/Extension/ReplayPlus/replay_plus_depth.cpp
+@@ -605,6 +605,23 @@ void keep_for_export(Shared& s, ID3D12GraphicsCommandList* list, const D3D12_RES
+     k.own_frame = s.copied_epoch == s.epoch;
+     ++s.kept_pushed;
+ }
++// The game's video frames going to be copied out for its encoder, whatever their size (a trace of an export,
++// 2026-11-17: B8G8R8A8 at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame): their size is
++// what an exported frame is finished at (link::export_frame_size), MP4 or WebM, light or none.
++void note_video_frames(const Shared& s, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
++    for (UINT i = 0; i < count; ++i) {
++        const auto& b = barriers[i];
++        if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource || (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY))
++            continue;
++        if (b.Transition.StateAfter != D3D12_RESOURCE_STATE_COPY_SOURCE || b.Transition.StateBefore == D3D12_RESOURCE_STATE_COPY_SOURCE) continue;
++        const auto d = b.Transition.pResource->GetDesc();
++        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Format != DXGI_FORMAT_B8G8R8A8_UNORM || d.DepthOrArraySize != 1 || d.MipLevels != 1 ||
++            d.SampleDesc.Count != 1 || d.Width < 64 || d.Height < 64 || d.Width > 16384 || d.Height > 16384)
++            continue;
++        if (swap_buffer(s, b.Transition.pResource)) continue;
++        link::note_video_frame(static_cast<std::uint32_t>(d.Width), d.Height);
++    }
++}
+ // The game's video frame as it goes from being drawn to being copied out for its encoder (a trace of an
+ // export, 2026-11-17: B8G8R8A8 at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame).
+ void export_taps(Shared& s, ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers, BarrierFn original) {
+@@ -633,6 +650,7 @@ void barriers(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_
+         if (link::trace_frames().load(std::memory_order_relaxed) > 0) trace(list, count, barriers);
+         std::lock_guard lock(s.mutex);
+         if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
++        if (list != s.own_list) note_video_frames(s, count, barriers);
+         if (s.scene_wanted || s.ui_wanted) frame_taps(s, list, count, barriers, original);
+         if (s.wanted && s.texture && list != s.own_list) export_taps(s, list, count, barriers, original);
+         if (!s.wanted || s.copied_epoch == s.epoch) return;
+diff --git a/Extension/ReplayPlus/replay_plus_link.cpp b/Extension/ReplayPlus/replay_plus_link.cpp
+index 05d99f0c..36788536 100644
+--- a/Extension/ReplayPlus/replay_plus_link.cpp
++++ b/Extension/ReplayPlus/replay_plus_link.cpp
+@@ -137,6 +137,70 @@ void note_drawn_under_ui(bool drawn) noexcept {
+ }
+ std::uint32_t drawn_under_ui() noexcept { return under_ui_run.load(std::memory_order_acquire); }
+ 
++namespace {
++constexpr std::uint64_t video_frame_lately_ms = 3000;
++std::mutex video_frames_mutex;
++std::vector<VideoFrameSeen> video_frames;
++} // namespace
++void count_video_frame(std::vector<VideoFrameSeen>& seen, std::uint32_t width, std::uint32_t height, std::uint64_t now) {
++    // Away for a while: counted from nothing again.
++    for (auto& v : seen)
++        if (now - v.last_ms > video_frame_lately_ms) v.times = 0;
++    const auto it = std::find_if(seen.begin(), seen.end(), [&](const VideoFrameSeen& v) { return v.width == width && v.height == height; });
++    if (it != seen.end()) {
++        it->last_ms = now;
++        ++it->times;
++        return;
++    }
++    if (seen.size() >= 4)
++        seen.erase(std::min_element(seen.begin(), seen.end(), [](const VideoFrameSeen& a, const VideoFrameSeen& b) { return a.last_ms < b.last_ms; }));
++    seen.push_back({width, height, now, 1});
++}
++void note_video_frame(std::uint32_t width, std::uint32_t height) noexcept {
++    try {
++        const auto now = now_ms();
++        std::lock_guard lock(video_frames_mutex);
++        count_video_frame(video_frames, width, height, now);
++    } catch (...) {}
++}
++std::vector<VideoFrameSeen> video_frames_seen() noexcept {
++    try {
++        std::lock_guard lock(video_frames_mutex);
++        return video_frames;
++    } catch (...) {
++        return {};
++    }
++}
++ExportSize export_frame_size(std::uintptr_t pitch, const std::vector<VideoFrameSeen>& seen, std::uint64_t now, int setup_width,
++                             int setup_height, std::uint32_t own_rows) noexcept {
++    try {
++        // A row of `width` pixels is the frame's: as long, padded by less than 256 bytes.
++        const auto fits = [&](std::uint64_t width) { return width >= 64 && width * 4 <= pitch && pitch < width * 4 + 256; };
++        std::vector<std::pair<int, int>> lately;
++        for (const auto& v : seen) {
++            if (v.times < 2 || now < v.last_ms || now - v.last_ms > video_frame_lately_ms || !fits(v.width) || v.height < 64 || v.height > 8192) continue;
++            const std::pair<int, int> size{static_cast<int>(v.width), static_cast<int>(v.height)};
++            if (std::find(lately.begin(), lately.end(), size) == lately.end()) lately.push_back(size);
++        }
++        const bool setup = setup_width > 0 && setup_height >= 64 && setup_height <= 8192 && fits(static_cast<std::uint64_t>(setup_width));
++        const std::pair<int, int> set_up{setup_width, setup_height};
++        ExportSize sized;
++        if (lately.size() == 1 && (!setup || lately.front() == set_up)) {
++            sized = {lately.front().first, lately.front().second, setup ? "the game's video frame and its H.264 setup" : "the game's video frame"};
++        } else if (setup && (lately.empty() || std::find(lately.begin(), lately.end(), set_up) != lately.end())) {
++            sized = {setup_width, setup_height, lately.empty() ? "its H.264 setup (no video frame of the game's seen)" : "its H.264 setup (one of the video frames seen)"};
++        } else {
++            return {0, 0, lately.empty() ? "nothing (no video frame of the game's seen)"
++                          : setup        ? "nothing (its H.264 setup and the game's video frame differ)"
++                                         : "nothing (video frames of more than one size lately)"};
++        }
++        if (own_rows > 0 && own_rows < static_cast<std::uint32_t>(sized.height)) return {0, 0, "nothing (it starts a buffer smaller than that)"};
++        return sized;
++    } catch (...) {
++        return {0, 0, "nothing"};
++    }
++}
++
+ namespace {
+ struct PadLayer {
+     std::mutex mutex;
+diff --git a/Extension/ReplayPlus/replay_plus_link.h b/Extension/ReplayPlus/replay_plus_link.h
+index b24db522..12372f25 100644
+--- a/Extension/ReplayPlus/replay_plus_link.h
++++ b/Extension/ReplayPlus/replay_plus_link.h
+@@ -170,6 +170,34 @@ std::uint32_t drawn_under_ui() noexcept;
+ // 8-bit, blue first, in place). False when it could not; the frame is then as it was.
+ bool finish_export_on_gpu(std::uint8_t* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch) noexcept;
+ 
++// ---- An exported frame's size ----------------------------------------------------------------------
++// The game's video frames as the render side sees them go to be copied out for its encoder (replay_plus_depth.cpp:
++// 8-bit BGRA at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame of an export): each size
++// seen lately, when it was last, and how many times since it was last away for more than a few seconds. Any thread.
++struct VideoFrameSeen {
++    std::uint32_t width{}, height{};
++    std::uint64_t last_ms{}; // now_ms()
++    std::uint32_t times{};
++};
++void note_video_frame(std::uint32_t width, std::uint32_t height) noexcept;
++std::vector<VideoFrameSeen> video_frames_seen() noexcept;
++// One more seen at `now` (note_video_frame's count, apart so it can be tested): four sizes at most, the oldest let go.
++void count_video_frame(std::vector<VideoFrameSeen>& seen, std::uint32_t width, std::uint32_t height, std::uint64_t now);
++// An exported frame's size (replay_plus.cpp export_frame): the game's video frame's, the one size seen more than once in
++// the last three seconds whose rows fit the frame's (`pitch` bytes apart, padded by less than 256 as a readback's are);
++// checked against this export's own H.264 setup when it had one (an MP4: `setup_width` x `setup_height`, else 0), which
++// also tells two sizes apart; and never more rows than the buffer the frame starts (`own_rows`, 0 when it does not
++// start one but is part of a larger one). 0 x 0 when it cannot be told for sure: the frame goes out as the game made it
++// then, as a guess could read and write past it. (Sized by the buffer it came in, as 1.3 did, one MP4 had every sixth
++// frame go out without the lens, and a WebM had three frames in six finished as one tall picture and written over each
++// other: the game reads its frames back into six buffers in turn and not every one is a buffer of its own, 2026-11-19.)
++struct ExportSize {
++    int width{}, height{};
++    const char* by{""}; // what told it, or why it could not be told
++};
++ExportSize export_frame_size(std::uintptr_t pitch, const std::vector<VideoFrameSeen>& seen, std::uint64_t now, int setup_width,
++                             int setup_height, std::uint32_t own_rows) noexcept;
++
+ // ---- The replay editor's pad: R3 is Replay Plus's button there ----------------------------------
+ // While on (renewed every tick by the game thread: the replay editor up, the panel closed, the
+ // shortcuts on; it lapses 300 ms after the last renewal), the game's own pad reads go through
+diff --git a/Extension/ReplayShake/replay_shake_export.cpp b/Extension/ReplayShake/replay_shake_export.cpp
+index 6dc9a323..c6acc192 100644
+--- a/Extension/ReplayShake/replay_shake_export.cpp
++++ b/Extension/ReplayShake/replay_shake_export.cpp
+@@ -22,13 +22,18 @@ std::atomic<std::uintptr_t> image{};
+ std::atomic<std::uint64_t> configured_at{};
+ // Render thread writes, any thread reads (capture()).
+ std::atomic<std::uint64_t> session{}, frames{}, last_frame_ms{};
++// When the export running now had its first frame, and when the one before it had its last (0: none).
++std::atomic<std::uint64_t> export_began_ms{}, previous_export_ended_ms{};
+ // A pause of a few seconds between frames is the next export. The pause is timed from the end of
+ // the last frame's encode, so a slow encode (4K) is still the same export.
+ constexpr std::uint64_t new_export_ms = 3000, running_ms = 2000;
+ 
+ void count() noexcept {
+     const auto now = GetTickCount64();
+-    if (now - last_frame_ms.load(std::memory_order_relaxed) > new_export_ms) {
++    const auto last = last_frame_ms.load(std::memory_order_relaxed);
++    if (now - last > new_export_ms) {
++        previous_export_ended_ms.store(last, std::memory_order_relaxed);
++        export_began_ms.store(now, std::memory_order_relaxed);
+         frames.store(0, std::memory_order_relaxed);
+         session.fetch_add(1, std::memory_order_relaxed);
+     }
+@@ -75,6 +80,12 @@ bool is_submit(void* target) noexcept {
+ } // namespace
+ 
+ std::uint64_t configured_ms() noexcept { return configured_at.load(std::memory_order_acquire); }
++Size setup_of_this_export() noexcept {
++    const auto at = configured_at.load(std::memory_order_acquire);
++    const auto began = export_began_ms.load(std::memory_order_relaxed), before = previous_export_ended_ms.load(std::memory_order_relaxed);
++    if (!at || !began || at <= before || (began > at && began - at > 10000)) return {};
++    return size();
++}
+ bool busy() noexcept {
+     const auto at = configured_at.load(std::memory_order_acquire);
+     return capture().running || (at && GetTickCount64() - at < 5000);
+diff --git a/Extension/ReplayShake/replay_shake_export.h b/Extension/ReplayShake/replay_shake_export.h
+index cfb61b16..75c2bbe9 100644
+--- a/Extension/ReplayShake/replay_shake_export.h
++++ b/Extension/ReplayShake/replay_shake_export.h
+@@ -24,6 +24,10 @@ Size size() noexcept;
+ // When the H.264 setup last ran (GetTickCount64; 0 never): an MP4 export's, just before its first frame. A WebM
+ // export has none, so size() is then an earlier MP4's.
+ std::uint64_t configured_ms() noexcept;
++// The H.264 setup of the export running now, when it had one (an MP4): run after the export before it ended, and at
++// most ten seconds before this one's first frame (an MP4 export called off before its first frame is not this one's);
++// else 0 x 0 (a WebM). Any thread.
++Size setup_of_this_export() noexcept;
+ // A video being exported, or set up to be (its H.264 setup in the last few seconds): the game's render size and
+ // window are not to change under it.
+ bool busy() noexcept;
+-- 
+2.56.0.windows.2
+

@@ -24,6 +24,10 @@ Size size() noexcept;
 // When the H.264 setup last ran (GetTickCount64; 0 never): an MP4 export's, just before its first frame. A WebM
 // export has none, so size() is then an earlier MP4's.
 std::uint64_t configured_ms() noexcept;
+// The H.264 setup of the export running now, when it had one (an MP4): run after the export before it ended, and at
+// most ten seconds before this one's first frame (an MP4 export called off before its first frame is not this one's);
+// else 0 x 0 (a WebM). Any thread.
+Size setup_of_this_export() noexcept;
 // A video being exported, or set up to be (its H.264 setup in the last few seconds): the game's render size and
 // window are not to change under it.
 bool busy() noexcept;

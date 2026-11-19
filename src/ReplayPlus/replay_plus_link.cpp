@@ -138,6 +138,70 @@ void note_drawn_under_ui(bool drawn) noexcept {
 std::uint32_t drawn_under_ui() noexcept { return under_ui_run.load(std::memory_order_acquire); }
 
 namespace {
+constexpr std::uint64_t video_frame_lately_ms = 3000;
+std::mutex video_frames_mutex;
+std::vector<VideoFrameSeen> video_frames;
+} // namespace
+void count_video_frame(std::vector<VideoFrameSeen>& seen, std::uint32_t width, std::uint32_t height, std::uint64_t now) {
+    // Away for a while: counted from nothing again.
+    for (auto& v : seen)
+        if (now - v.last_ms > video_frame_lately_ms) v.times = 0;
+    const auto it = std::find_if(seen.begin(), seen.end(), [&](const VideoFrameSeen& v) { return v.width == width && v.height == height; });
+    if (it != seen.end()) {
+        it->last_ms = now;
+        ++it->times;
+        return;
+    }
+    if (seen.size() >= 4)
+        seen.erase(std::min_element(seen.begin(), seen.end(), [](const VideoFrameSeen& a, const VideoFrameSeen& b) { return a.last_ms < b.last_ms; }));
+    seen.push_back({width, height, now, 1});
+}
+void note_video_frame(std::uint32_t width, std::uint32_t height) noexcept {
+    try {
+        const auto now = now_ms();
+        std::lock_guard lock(video_frames_mutex);
+        count_video_frame(video_frames, width, height, now);
+    } catch (...) {}
+}
+std::vector<VideoFrameSeen> video_frames_seen() noexcept {
+    try {
+        std::lock_guard lock(video_frames_mutex);
+        return video_frames;
+    } catch (...) {
+        return {};
+    }
+}
+ExportSize export_frame_size(std::uintptr_t pitch, const std::vector<VideoFrameSeen>& seen, std::uint64_t now, int setup_width,
+                             int setup_height, std::uint32_t own_rows) noexcept {
+    try {
+        // A row of `width` pixels is the frame's: as long, padded by less than 256 bytes.
+        const auto fits = [&](std::uint64_t width) { return width >= 64 && width * 4 <= pitch && pitch < width * 4 + 256; };
+        std::vector<std::pair<int, int>> lately;
+        for (const auto& v : seen) {
+            if (v.times < 2 || now < v.last_ms || now - v.last_ms > video_frame_lately_ms || !fits(v.width) || v.height < 64 || v.height > 8192) continue;
+            const std::pair<int, int> size{static_cast<int>(v.width), static_cast<int>(v.height)};
+            if (std::find(lately.begin(), lately.end(), size) == lately.end()) lately.push_back(size);
+        }
+        const bool setup = setup_width > 0 && setup_height >= 64 && setup_height <= 8192 && fits(static_cast<std::uint64_t>(setup_width));
+        const std::pair<int, int> set_up{setup_width, setup_height};
+        ExportSize sized;
+        if (lately.size() == 1 && (!setup || lately.front() == set_up)) {
+            sized = {lately.front().first, lately.front().second, setup ? "the game's video frame and its H.264 setup" : "the game's video frame"};
+        } else if (setup && (lately.empty() || std::find(lately.begin(), lately.end(), set_up) != lately.end())) {
+            sized = {setup_width, setup_height, lately.empty() ? "its H.264 setup (no video frame of the game's seen)" : "its H.264 setup (one of the video frames seen)"};
+        } else {
+            return {0, 0, lately.empty() ? "nothing (no video frame of the game's seen)"
+                          : setup        ? "nothing (its H.264 setup and the game's video frame differ)"
+                                         : "nothing (video frames of more than one size lately)"};
+        }
+        if (own_rows > 0 && own_rows < static_cast<std::uint32_t>(sized.height)) return {0, 0, "nothing (it starts a buffer smaller than that)"};
+        return sized;
+    } catch (...) {
+        return {0, 0, "nothing"};
+    }
+}
+
+namespace {
 struct PadLayer {
     std::mutex mutex;
     std::uint64_t until{};          // on until then

@@ -1458,12 +1458,73 @@ void bind_tests() {
     run(s, "reset", {"controls"});
     check(s.binds == default_binds() && s.pad_layer == default_pad_layer, "reset controls");
 }
+// An exported frame's size (link::export_frame_size): the game's video frame as the render side saw it go out,
+// checked against this export's H.264 setup; the buffer the frame came in only bounds it. (1.3 sized frames by their
+// buffer: the game's six buffers are not all buffers of their own, 2026-11-19.)
+void export_size_tests() {
+    using link::VideoFrameSeen;
+    const std::uint64_t t = 100000;
+    std::vector<VideoFrameSeen> seen;
+    link::count_video_frame(seen, 1280, 720, t);
+    check(seen.size() == 1 && seen[0].times == 1, "a video frame seen once");
+    auto sized = link::export_frame_size(5120, seen, t + 16, 0, 0, 0);
+    check(sized.width == 0, std::string("seen once is not enough: ") + sized.by);
+    for (std::uint64_t i = 1; i <= 5; ++i) link::count_video_frame(seen, 1280, 720, t + 16 * i);
+    check(seen.size() == 1 && seen[0].times == 6 && seen[0].last_ms == t + 80, "seen six times");
+    // A WebM (no H.264 setup): the video frame's size, whatever the buffer the frame came in is.
+    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 0);
+    check(sized.width == 1280 && sized.height == 720, std::string("a frame inside a larger buffer: ") + sized.by);
+    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 2160);
+    check(sized.width == 1280 && sized.height == 720, "a frame starting a buffer of three frames: its own rows only (the sent WebM)");
+    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 720);
+    check(sized.width == 1280 && sized.height == 720, "a buffer of its own");
+    sized = link::export_frame_size(5120, seen, t + 100, 0, 0, 700);
+    check(sized.width == 0, std::string("a buffer shorter than the frame: left as it is: ") + sized.by);
+    // An MP4: its setup agrees, or the frame is left as it is.
+    sized = link::export_frame_size(5120, seen, t + 100, 1280, 720, 0);
+    check(sized.width == 1280 && sized.height == 720 && std::string(sized.by).find("H.264") != std::string::npos, "an MP4's setup agrees");
+    sized = link::export_frame_size(5120, seen, t + 100, 1280, 960, 0);
+    check(sized.width == 0, std::string("a setup that disagrees: ") + sized.by);
+    // Rows of another length are not the video frame's.
+    sized = link::export_frame_size(10240, seen, t + 100, 0, 0, 0);
+    check(sized.width == 0, "1280-wide video frames for 2560-wide rows: left as it is");
+    sized = link::export_frame_size(10240, seen, t + 100, 2560, 1920, 0);
+    check(sized.width == 2560 && sized.height == 1920, std::string("the setup alone, no video frame that wide seen: ") + sized.by);
+    // Seen over three seconds ago: not this export's; and counted from nothing when it comes back.
+    sized = link::export_frame_size(5120, seen, t + 80 + 3001, 0, 0, 0);
+    check(sized.width == 0, "seen too long ago");
+    link::count_video_frame(seen, 1280, 720, t + 10000);
+    check(seen.size() == 1 && seen[0].times == 1, "back after a while: counted again");
+    // Two heights of one width lately: only the setup tells them apart.
+    std::vector<VideoFrameSeen> two;
+    for (std::uint64_t i = 0; i < 4; ++i) {
+        link::count_video_frame(two, 2560, 1440, t + 16 * i);
+        link::count_video_frame(two, 2560, 1920, t + 16 * i + 8);
+    }
+    sized = link::export_frame_size(10240, two, t + 80, 0, 0, 0);
+    check(sized.width == 0, std::string("two sizes and no setup: ") + sized.by);
+    sized = link::export_frame_size(10240, two, t + 80, 2560, 1920, 0);
+    check(sized.width == 2560 && sized.height == 1920, "the setup picks one of them");
+    sized = link::export_frame_size(10240, two, t + 80, 2560, 1072, 0);
+    check(sized.width == 0, "a setup that is neither");
+    // Rows padded to 256 bytes: 1366 pixels in 5632.
+    std::vector<VideoFrameSeen> padded;
+    for (std::uint64_t i = 0; i < 3; ++i) link::count_video_frame(padded, 1366, 768, t + 16 * i);
+    sized = link::export_frame_size(5632, padded, t + 50, 0, 0, 0);
+    check(sized.width == 1366 && sized.height == 768, "padded rows");
+    // Four sizes at most: the oldest goes.
+    std::vector<VideoFrameSeen> many;
+    for (std::uint32_t i = 0; i < 6; ++i) link::count_video_frame(many, 640 + 64 * i, 360, t + i);
+    check(many.size() == 4 && std::none_of(many.begin(), many.end(), [](const VideoFrameSeen& v) { return v.width == 640 || v.width == 704; }),
+          "four sizes kept, the oldest let go");
+}
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> suites{
         {"fields", field_tests}, {"commands", command_tests}, {"json", json_tests}, {"presets", preset_tests},
         {"lens", lens_tests}, {"grade", grade_tests}, {"finish", finish_tests}, {"focus", focus_tests},
         {"shake keys", shake_key_tests}, {"light keys", light_key_tests}, {"view", view_tests}, {"edge compression", compression_tests}, {"overlay", hood_tests},
-        {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}, {"controls", bind_tests}};
+        {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}, {"controls", bind_tests},
+        {"export size", export_size_tests}};
     try {
         for (const auto& [name, suite] : suites) {
             suite();
