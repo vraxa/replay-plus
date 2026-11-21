@@ -947,7 +947,11 @@ void choose(Panel& p, const link::View& view, const Row& row, int segment) {
 namespace look {
 constexpr ImU32 white = IM_COL32(255, 255, 255, 255);
 constexpr ImU32 blue = IM_COL32(0, 131, 255, 255);      // the game's blue (#0083FF)
-constexpr ImU32 plate = IM_COL32(0, 0, 0, 84);          // a list's black, a third over the picture
+// A list's black: darker than the game's own lists (a third, 84) since 1.3.2, as the replay editor's own prompts and
+// marks under the panel showed through it and made its rows hard to read.
+constexpr ImU32 plate = IM_COL32(0, 0, 0, 160);
+constexpr ImU32 label_plate = IM_COL32(0, 0, 0, 160);   // behind the tab's name, likewise (96 before)
+constexpr ImU32 hint_plate = IM_COL32(0, 0, 0, 176);    // behind what the row in focus does (118 before)
 constexpr ImU32 focus = IM_COL32(0, 0, 0, 76);          // over it, the row in focus
 constexpr ImU32 track = IM_COL32(255, 255, 255, 34);    // what a slider or the marks run along
 constexpr ImU32 dim = IM_COL32(255, 255, 255, 110);     // a row that does not apply now
@@ -1329,7 +1333,7 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
         const float w = width_of(f.label, size, name) + pad * 2;
         ImVec2 la(std::floor((chosen_a.x + chosen_b.x) * 0.5f - w * 0.5f), std::floor(chosen_b.y + 6 * s));
         la.x = std::clamp(la.x, x0, x1 - w);
-        dl->AddRectFilled(la, ImVec2(la.x + w, la.y + h), IM_COL32(0, 0, 0, 96));
+        dl->AddRectFilled(la, ImVec2(la.x + w, la.y + h), look::label_plate);
         text_at(dl, f.label, size, ImVec2(la.x + pad, la.y + (h - size) * 0.5f), look::blue, name);
         y = la.y + h + 16 * s;
     }
@@ -1576,7 +1580,7 @@ void draw(Panel& p, const link::View& view, const std::vector<Row>& rows, Contro
     }
     float yy = list_bottom + 10 * s;
     if (!under.empty()) {
-        dl->AddRectFilled(ImVec2(x0, yy), ImVec2(x1, yy + hint_h), IM_COL32(0, 0, 0, 118));
+        dl->AddRectFilled(ImVec2(x0, yy), ImVec2(x1, yy + hint_h), look::hint_plate);
         if (fresh) dl->AddRectFilled(ImVec2(x0, yy), ImVec2(x0 + 6 * s, yy + hint_h), look::blue);
         dl->AddText(f.label, hint_line, ImVec2(x0 + hint_pad, yy + hint_pad), fresh ? look::white : IM_COL32(236, 236, 236, 255), under.c_str(), nullptr, hint_w);
         yy += hint_h + 10 * s;

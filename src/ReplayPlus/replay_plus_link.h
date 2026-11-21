@@ -134,9 +134,6 @@ std::atomic<bool>& panel_keyboard() noexcept;
 // Research (`replayplus trace <frames>`): the render side logs the game's texture transitions for that
 // many frames, to find where its picture is finished before its UI is drawn.
 std::atomic<int>& trace_frames() noexcept;
-// Research (test builds, `replayplus exportdepth latest|matched`): exported frames lit from the latest depth,
-// as before 2026-11-17, rather than the depth of the frame each was drawn in; to compare the two.
-std::atomic<bool>& export_depth_latest() noexcept;
 // The pad's buttons Replay Plus keeps from the game for `ms` from now (the panel open on a pad: only
 // its buttons, so the sticks and triggers still work the replay; and after it closes, until what
 // closed it is let go). ReSkate's input capture ORs hidden_pad_buttons into what it hides from the
@@ -197,6 +194,36 @@ struct ExportSize {
 };
 ExportSize export_frame_size(std::uintptr_t pitch, const std::vector<VideoFrameSeen>& seen, std::uint64_t now, int setup_width,
                              int setup_height, std::uint32_t own_rows) noexcept;
+
+// ---- The render scale's room in memory (replay_plus.cpp keep_memory_guard) --------------------------
+// A render scale above 100% takes video memory for the game's larger render targets, and leaving the replay editor the
+// game takes several GB more for a moment. Past the video memory Windows gives it (its DXGI budget) the rest spills into
+// the PC's own memory, against its commit limit (RAM and page file): on a laptop with a 12 GB card the game reached
+// 13.4 GB of its 10.9 GB, and the PC came within 0.3 GB of its commit limit, as the editor closed with a 4:3 picture
+// at 175% (a log sent in, 2026-11-19). So cards with less memory get a lower ceiling and a wider margin, and the PC's
+// commit left counts too. The budget and what is available are in bytes; 0: not known (as if large).
+// The highest render scale on a card with this budget: 200% (sharp_most) above 12.5 GB, 150% up to it, 125% up to 8.5 GB.
+float scale_ceiling(std::uint64_t budget) noexcept;
+// What is kept free under the budget: 1.5 GB or 12% of it, and on cards of 12.5 GB or less 2.5 GB or a fifth of it.
+double memory_margin(std::uint64_t budget) noexcept;
+// The PC's commit left: plenty (5 GB or more), only enough not to raise the scale (3 to 5 GB), or too little for
+// any (under 3 GB: the game's own scale).
+enum class CommitRoom : std::uint8_t { plenty, no_raise, none };
+CommitRoom commit_room(std::uint64_t available) noexcept;
+
+// ---- The picture shape on a scaled screen ----------------------------------------------------------
+// With Windows' display scaling above 100%, the game's threads see the screen in its scaled units: a 2560x1440 screen at
+// 200% is 1280x720 to them. The window is placed and sized in those (replay_plus_window.cpp keep), and comes out the
+// right size on screen; but the game renders its picture in pixels, at its swap chain's size (RenderDevice.FullscreenWidth
+// / Height), so that is the window's size in the screen's own pixels: each side scaled by the monitor's pixels over its
+// size as seen, to even numbers, at most the monitor's. Unscaled, or with either monitor size not known: the window's
+// size as it is. (Given the window's size as seen, a 4:3 picture on a 200% laptop screen was rendered 960x720 and
+// stretched to 1920x1440, 2026-11-20.)
+struct PixelSize {
+    int width{}, height{};
+    bool operator==(const PixelSize&) const = default;
+};
+PixelSize shape_pixels(PixelSize window, PixelSize monitor_seen, PixelSize monitor_pixels) noexcept;
 
 // ---- The replay editor's pad: R3 is Replay Plus's button there ----------------------------------
 // While on (renewed every tick by the game thread: the replay editor up, the panel closed, the
@@ -281,19 +308,7 @@ std::atomic<float>& white_fixed() noexcept;
 // `replayplus white dump <name>`: the next measurement's blocks go to a CSV file (research).
 void ask_white_dump(std::string path) noexcept;
 std::string take_white_dump() noexcept;
-// The camera light's facing: smoothed over so many metres of the surface (0: each triangle's own), and how much it
-// counts (1 fully, 0 not at all). `replayplus lightfacing` sets them (to compare and tune). Any thread.
-// The facing is not taken into the light as it comes (replay_plus.hlsl camera_light): smoothed over 25 cm and
-// counting 80% (tried on a close-up of a skater's shorts at night, 2026-11-18) a leg still showed its triangles
-// and the textures went flat. `replayplus lightfacing smooth` brings that back to compare.
-inline constexpr float light_facing_metres_default = 0.25f, light_facing_weight_default = 0.0f;
-std::atomic<float>& light_facing_metres() noexcept;
-std::atomic<float>& light_facing_weight() noexcept;
-// The camera light is a light of the game's now (replay_plus_light.h, made by the game thread): the pass does not
-// draw it over the picture as well.
-std::atomic<bool>& game_light() noexcept;
-// The camera light is on now: as set, or with light keys as they have it at the playhead (the game thread's, each tick).
-// Off, the pass draws none over the picture either (2026-11-19: keyed off, the game's light went and the pass drew its
-// own in its place).
-std::atomic<bool>& light_on_now() noexcept;
+// (Test builds, `replayplus dmprobe <set>`: under the game's UI the pass writes known picture values into the
+// measured blocks instead of the picture, set 1 and on; 0 none. Research on the game's display mapping.)
+std::atomic<int>& display_probe() noexcept;
 } // namespace dingosdk::replay_plus::link

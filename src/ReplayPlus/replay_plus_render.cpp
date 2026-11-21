@@ -1,5 +1,6 @@
 #include "replay_plus_overlay.h"
 #include "replay_plus_depth.h"
+#include "replay_plus_display_table.h" // the game's display mapping, measured (replay_plus.hlsl dm_shown)
 #include "replay_plus_hlsl.h" // generated from replay_plus.hlsl (ReplayPlus.cmake)
 #include "replay_plus_lens.h"
 #include "replay_plus_link.h"
@@ -31,8 +32,10 @@ constexpr unsigned constant_slot_bytes = 512, constant_slots = 16;
 static_assert(constant_count * 4 <= constant_slot_bytes);
 // The shader-visible heap: the frame's copy, the linear chain (all mips), the depth, the hood, then
 // each mip on its own (the mip passes read the one above).
-// The game's picture before its UI has a slot of its own (it is drawn into from there when it can be).
-constexpr unsigned slot_copy = 0, slot_chain = 1, slot_depth = 2, slot_hood = 3, slot_scene = 4, slot_mips = 5, slot_count = slot_mips + most_mips;
+// The game's picture before its UI has a slot of its own (it is drawn into from there when it can be), and the game's
+// display mapping two (its table and the inverse's, t4 and t5: one descriptor table).
+constexpr unsigned slot_copy = 0, slot_chain = 1, slot_depth = 2, slot_hood = 3, slot_scene = 4, slot_display = 5, slot_mips = 7,
+                   slot_count = slot_mips + most_mips;
 // The render target views: each mip of the chain, then the picture Replay Plus draws for the game.
 constexpr unsigned target_scene = most_mips, target_count = most_mips + 1;
 
@@ -76,10 +79,10 @@ struct Graphics {
     unsigned mips{};
     // The hood's picture on the GPU, and what is uploading it.
     ComPtr<ID3D12Resource> hood, hood_upload;
+    // The game's display mapping's tables (3D), and what uploaded them: once.
+    ComPtr<ID3D12Resource> display_forward, display_inverse, display_upload;
     std::uint64_t hood_serial{~std::uint64_t{0}};
     bool hood_ready{};
-    // The view of the game's depth (the camera light), for the depth copy it was made for.
-    std::uint64_t depth_serial{~std::uint64_t{0}};
     // Autofocus: the middle of the depth copy, read back a few frames later (four slots in turn).
     ComPtr<ID3D12Resource> focus_readback;
     std::uint64_t focus_frame{};
@@ -163,18 +166,28 @@ void null_view(unsigned slot) {
     view.Texture2D.MipLevels = 1;
     graphics().device->CreateShaderResourceView(nullptr, &view, cpu_view(slot));
 }
+// The same for a 3D table.
+void null_volume(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE where) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture3D.MipLevels = 1;
+    device->CreateShaderResourceView(nullptr, &view, where);
+}
 
 bool build_root(ID3D12Device* device) {
     auto& g = graphics();
     if (g.root) return true;
-    std::array<D3D12_DESCRIPTOR_RANGE, 4> ranges{};
+    // t0 .. t3 a table each; t4 and t5 (the display mapping's tables) one.
+    std::array<D3D12_DESCRIPTOR_RANGE, 5> ranges{};
     for (UINT i = 0; i < ranges.size(); ++i) {
         ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[i].NumDescriptors = 1;
+        ranges[i].NumDescriptors = i == 4 ? 2 : 1;
         ranges[i].BaseShaderRegister = i;
         ranges[i].OffsetInDescriptorsFromTableStart = 0;
     }
-    std::array<D3D12_ROOT_PARAMETER, 5> parameters{};
+    std::array<D3D12_ROOT_PARAMETER, 6> parameters{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.ShaderRegister = 0;
     parameters[0].Descriptor.RegisterSpace = 0;
@@ -327,6 +340,11 @@ bool ensure_heaps(ID3D12Device* device) {
         return false;
     }
     for (unsigned slot = 0; slot < slot_count; ++slot) null_view(slot);
+    null_volume(device, cpu_view(slot_display));
+    null_volume(device, cpu_view(slot_display + 1));
+    // A new heap has no views of the display mapping's tables: they are made (and their views) again.
+    g.display_forward.Reset();
+    g.display_inverse.Reset();
     return true;
 }
 
@@ -507,6 +525,101 @@ void ensure_hood(const Target& t, const std::shared_ptr<const link::HoodImage>& 
     view.Texture2D.MipLevels = 1;
     t.device->CreateShaderResourceView(g.hood.Get(), &view, cpu_view(slot_hood));
     g.hood_ready = true;
+}
+
+// The game's display mapping's tables (replay_plus_display_table.h), uploaded once on this frame's list.
+void ensure_display(const Target& t) {
+    auto& g = graphics();
+    if (g.display_forward && g.display_inverse) return;
+    namespace table = display_table;
+    // replay_plus.hlsl's dm_shown and dm_encode take these as they are.
+    static_assert(table::forward_size == 27 && table::forward_from == -6.0f && table::forward_step == 0.5f);
+    static_assert(table::inverse_size == 33 && table::inverse_from == -9.0f && table::inverse_to == 7.5f && table::inverse_offset == 16.0f &&
+                  table::inverse_range == 32.0f);
+    const auto make = [&](int size, ComPtr<ID3D12Resource>& out) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        desc.Width = static_cast<UINT64>(size);
+        desc.Height = static_cast<UINT>(size);
+        desc.DepthOrArraySize = static_cast<UINT16>(size);
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        desc.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(t.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out))))
+            out.Reset();
+        return desc;
+    };
+    ComPtr<ID3D12Resource> forward, inverse;
+    const auto forward_desc = make(table::forward_size, forward);
+    const auto inverse_desc = make(table::inverse_size, inverse);
+    if (!forward || !inverse) {
+        say_failed("its display mapping tables could not be made.");
+        return;
+    }
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> layouts{};
+    std::array<UINT, 2> rows{};
+    std::array<UINT64, 2> row_bytes{}, sizes{};
+    t.device->GetCopyableFootprints(&forward_desc, 0, 1, 0, &layouts[0], &rows[0], &row_bytes[0], &sizes[0]);
+    const UINT64 second = (sizes[0] + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~UINT64{D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1};
+    t.device->GetCopyableFootprints(&inverse_desc, 0, 1, second, &layouts[1], &rows[1], &row_bytes[1], &sizes[1]);
+    D3D12_HEAP_PROPERTIES upload_heap{};
+    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = second + sizes[1];
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> upload;
+    void* mapped{};
+    if (FAILED(t.device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                 IID_PPV_ARGS(&upload))) ||
+        FAILED(upload->Map(0, nullptr, &mapped)) || !mapped) {
+        say_failed("its display mapping tables could not be uploaded.");
+        return;
+    }
+    const std::array<const std::uint16_t*, 2> sources{table::forward, table::inverse};
+    const std::array<std::size_t, 2> sides{static_cast<std::size_t>(table::forward_size), static_cast<std::size_t>(table::inverse_size)};
+    const std::array<ID3D12Resource*, 2> targets{forward.Get(), inverse.Get()};
+    for (std::size_t i = 0; i < 2; ++i) {
+        const std::size_t side = sides[i], row = side * 4; // RGBA16: four values a texel
+        // (Each slice is Footprint.Height = side rows of RowPitch bytes.)
+        for (std::size_t z = 0; z < side; ++z)
+            for (std::size_t y = 0; y < rows[i]; ++y)
+                std::memcpy(static_cast<std::uint8_t*>(mapped) + layouts[i].Offset + (z * side + y) * layouts[i].Footprint.RowPitch,
+                            sources[i] + (z * side + y) * row, row * sizeof(std::uint16_t));
+    }
+    upload->Unmap(0, nullptr);
+    for (std::size_t i = 0; i < 2; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+        to.pResource = targets[i];
+        to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        from.pResource = upload.Get();
+        from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint = layouts[i];
+        t.commands->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        transition(t.commands, targets[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture3D.MipLevels = 1;
+        t.device->CreateShaderResourceView(targets[i], &view, cpu_view(slot_display + static_cast<unsigned>(i)));
+    }
+    forward->SetName(L"Replay Plus display mapping");
+    inverse->SetName(L"Replay Plus display mapping, inverse");
+    g.display_forward = forward;
+    g.display_inverse = inverse;
+    g.display_upload = upload; // (kept: the copies may still be on the GPU)
+    logging::write(logging::Level::info, logging::Channel::graphics,
+                   std::format("Replay Plus: the game's display mapping, measured, is on the GPU ({0}x{0}x{0} and its inverse {1}x{1}x{1}; rows {2} and {3} "
+                               "of {4} and {5} bytes, at {6} and {7}).",
+                               table::forward_size, table::inverse_size, rows[0], rows[1], layouts[0].Footprint.RowPitch,
+                               layouts[1].Footprint.RowPitch, layouts[0].Offset, layouts[1].Offset));
 }
 
 // ---- Captures --------------------------------------------------------------------------------
@@ -849,8 +962,6 @@ struct PassInputs {
     float white{1};
     unsigned mips{1};
     bool hood_ready{};
-    depth::Copy depth_copy;
-    bool depth_ready{};
     std::uint64_t frame{};
 };
 std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& picture, const lens::Finish& finish, const PassInputs& in) {
@@ -862,24 +973,14 @@ std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& pi
     const bool lens_on = f.fisheye;
     const bool textured = s.hood == Hood::picture && in.hood_ready && s.hood_opacity > 0;
     const float width = in.width, height = in.height;
-    const auto& depth_copy = in.depth_copy;
-    const bool depth_ready = in.depth_ready;
     const auto& gr = finish.grade;
     const auto wb = lens::filter_gains(gr); // white balance and the colour filter
     const auto cm = lens::colour_matrix(gr);
     const auto low = lens::split_offset(gr.split_shadows_hue, gr.split_shadows), high = lens::split_offset(gr.split_highlights_hue, gr.split_highlights);
-    const bool passthrough = !lens_on && finish.grade.identity() && s.hood != Hood::circle && !depth_ready;
+    const bool passthrough = !lens_on && finish.grade.identity() && s.hood != Hood::circle;
     const auto& glass = finish.glass;
-    // The light: its beam's half angle and the bright core inside it, its colour (a cold LED to a warm
-    // bulb, kept as bright), and where the game's depth puts things.
-    const float half_beam = std::clamp(s.light_cone, 10.0f, 180.0f) * 0.5f * lens::pi / 180.0f;
-    const float cos_outer = s.light_cone >= 179.5f ? -0.01f : std::cos(half_beam);
-    const float cos_inner = std::max(cos_outer + 0.002f, std::cos(half_beam * (1.0f - 0.9f * std::clamp(s.light_soft, 0.0f, 1.0f))));
-    const float w = std::clamp(s.light_warmth, -1.0f, 1.0f);
-    std::array<float, 3> colour = w >= 0 ? std::array<float, 3>{1.0f, 1.0f - 0.18f * w, 1.0f - 0.42f * w}
-                                         : std::array<float, 3>{1.0f + 0.12f * w, 1.0f + 0.05f * w, 1.0f};
-    const float colour_y = 0.2126f * colour[0] + 0.7152f * colour[1] + 0.0722f * colour[2];
-    for (auto& v : colour) v /= colour_y;
+    // (P7, P8, P9 and P21.z, .w: none. They were the camera light drawn over the picture from the game's depth, gone in
+    // 1.3.2; the slots stay so the rest keep their places.)
     std::array<std::uint32_t, constant_count> c{
         bits(lens_on ? 2.0f : 0.0f), bits(finish.fit), bits(tg[0]), bits(tg[1]),
         bits(f.view_aspect), bits(win[0]), bits(win[1]), bits(half),
@@ -889,11 +990,9 @@ std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& pi
         bits(std::exp2(s.exposure)), bits(s.contrast), bits(s.saturation), bits(s.black),
         bits(wb[0]), bits(wb[1]), bits(wb[2]), bits(s.vignette),
         bits(passthrough ? 1.0f : 0.0f), bits(f.curve), bits(f.scale), bits(glass.fringe),
-        bits(depth_ready ? s.light_power : 0.0f), bits(std::max(s.light_range, 0.5f)), bits(cos_outer), bits(cos_inner),
-        bits(colour[0]), bits(colour[1]), bits(colour[2]), bits(std::max(picture.near_plane, 0.001f)),
-        bits(std::max(picture.far_plane, 10.0f)), bits(depth_ready ? 1.0f : 0.0f),
-        bits(depth_copy.width ? 1.0f / static_cast<float>(depth_copy.width) : 0.0f),
-        bits(depth_copy.height ? 1.0f / static_cast<float>(depth_copy.height) : 0.0f),
+        0, 0, 0, 0,  // P7 (none)
+        0, 0, 0, 0,  // P8 (none)
+        0, 0, 0, 0,  // P9 (none)
         bits(glass.shade), bits(glass.soft), bits(f.squeeze), bits(lens_on ? f.ease : 0.0f),
         bits(gr.camera ? 1.0f : 0.0f), bits(lens_on ? glass.glare : 0.0f), bits(std::max(lens::hood_extent(f)[1], 1e-3f)),
         bits(lens::camera_toe_slope(gr.camera_gamma)),
@@ -907,10 +1006,6 @@ std::array<std::uint32_t, constant_count> pass_constants(const link::Picture& pi
         bits(gr.camera_gamma), bits(gr.camera_knee), bits(gr.camera_knee_slope), bits(gr.camera_black),
         bits(gr.camera_clip), bits(gr.camera_colour), bits(lens_on ? std::clamp(s.sharpen, 0.0f, 1.0f) : 0.0f),
         bits(std::max(lens::hood_extent(f)[0], 1e-3f))};
-    // P21.z, .w: the camera light's facing, smoothed over so many metres of the surface (replay_plus.hlsl
-    // smooth_facing; 0 each triangle's own), and how much it counts.
-    c[86] = bits(std::clamp(link::light_facing_metres().load(std::memory_order_relaxed), 0.0f, 2.0f));
-    c[87] = bits(std::clamp(link::light_facing_weight().load(std::memory_order_relaxed), 0.0f, 1.0f));
     return c;
 }
 
@@ -943,8 +1038,9 @@ Exporter& exporter() {
     return *value;
 }
 constexpr DXGI_FORMAT export_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-constexpr unsigned export_slot_source = 0, export_slot_chain = 1, export_slot_depth = 2, export_slot_hood = 3, export_slot_mips = 4,
-                   export_slot_count = export_slot_mips + most_mips;
+// (Exports never read the display mapping's tables, t4 and t5: two empty views, as the root signature has them.)
+constexpr unsigned export_slot_source = 0, export_slot_chain = 1, export_slot_depth = 2, export_slot_hood = 3, export_slot_display = 4,
+                   export_slot_mips = 6, export_slot_count = export_slot_mips + most_mips;
 constexpr unsigned export_target_output = most_mips, export_target_count = most_mips + 1;
 D3D12_CPU_DESCRIPTOR_HANDLE export_cpu(Exporter& e, unsigned slot) {
     auto h = e.views->GetCPUDescriptorHandleForHeapStart();
@@ -1028,6 +1124,8 @@ bool export_setup(Exporter& e, ID3D12Device* device) {
     if (!e.event || FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&e.views))) || FAILED(device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&e.targets))))
         return false;
     for (unsigned slot = 0; slot < export_slot_count; ++slot) export_null_view(e, slot);
+    null_volume(device, export_cpu(e, export_slot_display));
+    null_volume(device, export_cpu(e, export_slot_display + 1));
     e.constants = export_buffer(device, D3D12_HEAP_TYPE_UPLOAD, constant_slot_bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped{};
     const D3D12_RANGE none{};
@@ -1183,16 +1281,13 @@ bool record(const Target& t) noexcept {
             return false;
         }
         const auto& s = picture->settings;
-        // (Not when the camera light is a light of the game's, replay_plus_light.h, nor while its keys have it off.)
-        const bool light_on = s.light && s.light_power > 0 && link::light_on_now().load(std::memory_order_acquire) &&
-                              !link::game_light().load(std::memory_order_acquire);
         // Under the game's UI whenever its picture before the UI is found, a video being filmed too: the game
-        // films its frame after its last pass, so the video gets the pass as the screen does, the camera light
-        // and Sharp middle's finer picture with it, at the GPU's speed. (Finishing exported frames on the CPU,
-        // replay_plus_lens.cpp, took about 0.4 s a 1920x1440 frame and could not light them: it is only for
-        // frames the pass did not draw under the UI.)
+        // films its frame after its last pass, so the video gets the pass as the screen does, and Sharp middle's
+        // finer picture with it, at the GPU's speed. (Finishing exported frames on the CPU, replay_plus_lens.cpp,
+        // took about 0.4 s a 1920x1440 frame: it is only for frames the pass did not draw under the UI.) The camera
+        // light is a light of the game's (replay_plus_light.h): the game draws it, nothing of it is drawn here.
         const bool under_ui = true;
-        depth::begin_frame(light_on || autofocus, under_ui, ui_wanted, static_cast<std::uint32_t>(desc.Width), desc.Height);
+        depth::begin_frame(autofocus, under_ui, ui_wanted, static_cast<std::uint32_t>(desc.Width), desc.Height);
         if (autofocus) read_focus(t, *picture);
         // Under the game's UI: the game's picture before its UI, copied this frame (replay_plus_depth.h Scene),
         // drawn through the passes into Replay Plus's own, which goes in for the game's next frame; at its own
@@ -1214,22 +1309,9 @@ bool record(const Target& t) noexcept {
         // The overlay's picture: on the GPU, and its see-through middle, which the lens is fitted to.
         const auto hood_image = link::hood();
         ensure_hood(t, hood_image);
-        // The depth's view, whenever the depth module made its copy anew.
-        const auto depth_copy = depth::current();
-        if (depth_copy.serial != g.depth_serial) {
-            g.depth_serial = depth_copy.serial;
-            if (depth_copy.texture) {
-                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-                view.Format = DXGI_FORMAT_R32_FLOAT;
-                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                view.Texture2D.MipLevels = 1;
-                t.device->CreateShaderResourceView(depth_copy.texture, &view, cpu_view(slot_depth));
-            } else {
-                null_view(slot_depth);
-            }
-        }
-        const bool depth_ready = light_on && depth_copy.texture && depth_copy.fresh && depth_copy.width && depth_copy.height;
+        ensure_display(t);
+        // (slot_depth, t2, stays the empty view ensure_heaps made: the pass reads no depth since the camera light drawn
+        // over the picture went, 1.3.2.)
 
         // The pass works at the chain's size (the game's picture's, under its UI); the picture's shape is the screen's.
         const float width = static_cast<float>(work_w), height = static_cast<float>(work_h);
@@ -1237,7 +1319,7 @@ bool record(const Target& t) noexcept {
         const auto finish = lens::finish_for(s, aspect, fov_for(*picture, 1000), hood_image ? &hood_image->hole : nullptr);
         const bool lens_on = finish.frame.fisheye;
         const float white = t.transfer == 1 ? t.white_nits / 80.0f : t.transfer == 2 ? t.white_nits : 1.0f;
-        const auto constants = pass_constants(*picture, finish, {width, height, t.transfer, white, g.mips, g.hood_ready, depth_copy, depth_ready, g.frames});
+        const auto constants = pass_constants(*picture, finish, {width, height, t.transfer, white, g.mips, g.hood_ready, g.frames});
 
         if (into_scene && scene.serial != g.scene_serial) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
@@ -1313,6 +1395,10 @@ bool record(const Target& t) noexcept {
             drawn[83] = bits(mapping.x0);
             drawn[84] = bits(mapping.w);
             drawn[85] = bits(std::log2(std::max(scene_white, 1e-3f))); // the scale it takes the picture at
+            if (const int probe = link::display_probe().load(std::memory_order_relaxed); probe > 0) {
+                drawn[86] = bits(static_cast<float>(probe));     // (research: the probe's set)
+                drawn[87] = bits(static_cast<float>(desc.Width)); // and the screen's width, which the blocks are counted on
+            }
         } else if (into_scene) {
             drawn[10] = bits(1.0f);        // transfer: linear, as it is
             drawn[11] = bits(scene_white); // white: the picture's value the screen shows as its white
@@ -1338,6 +1424,7 @@ bool record(const Target& t) noexcept {
         t.commands->SetGraphicsRootDescriptorTable(2, gpu_view(slot_chain));
         t.commands->SetGraphicsRootDescriptorTable(3, gpu_view(slot_depth));
         t.commands->SetGraphicsRootDescriptorTable(4, gpu_view(slot_hood));
+        t.commands->SetGraphicsRootDescriptorTable(5, gpu_view(slot_display));
         t.commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const auto viewport = [&](std::uint32_t w, std::uint32_t h) {
             const D3D12_VIEWPORT v{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f};
@@ -1451,10 +1538,8 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
         const auto& s = picture->settings;
         const auto hood_image = link::hood();
         const auto finish = lens::finish_for(s, static_cast<float>(w) / static_cast<float>(h), fov_for(*picture, 2000), hood_image ? &hood_image->hole : nullptr);
-        // (Not when the camera light is a light of the game's, replay_plus_light.h, nor while its keys have it off.)
-        const bool light_on = s.light && s.light_power > 0 && link::light_on_now().load(std::memory_order_acquire) &&
-                              !link::game_light().load(std::memory_order_acquire);
-        if (!lens::changes(finish) && !light_on) return true; // nothing to change in it
+        // (The camera light is a light of the game's, replay_plus_light.h: the game drew it into the frame already.)
+        if (!lens::changes(finish)) return true; // nothing to change in it
         if (!export_setup(e, g.device) || !export_targets(e, w, h)) {
             e.failed = true;
             logging::write(logging::Level::warning, logging::Channel::graphics,
@@ -1462,7 +1547,7 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
             return false;
         }
         auto* device = e.device.Get();
-        // The hood's picture and the game's depth (the camera light), as the screen's pass has them.
+        // The hood's picture, as the screen's pass has it.
         if (g.hood && g.hood_ready) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
             view.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
@@ -1474,24 +1559,10 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
         } else {
             export_null_view(e, export_slot_hood);
         }
-        // The depth of the frame this one was drawn in (it comes read back a few frames later), for the light.
-        // (Test builds can light them from the latest instead, as before, to compare: link::export_depth_latest.)
-        const auto kept = light_on ? depth::for_export(pixels, w, h, pitch) : depth::Copy{};
-        const auto depth_copy = light_on && !link::export_depth_latest().load(std::memory_order_relaxed) ? kept : depth::current();
-        ComPtr<ID3D12Resource> depth_held = depth_copy.texture; // held while the GPU reads it
-        const bool depth_ready = light_on && depth_copy.texture && depth_copy.width && depth_copy.height;
-        if (depth_ready) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-            view.Format = DXGI_FORMAT_R32_FLOAT;
-            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            view.Texture2D.MipLevels = 1;
-            device->CreateShaderResourceView(depth_copy.texture, &view, export_cpu(e, export_slot_depth));
-        } else {
-            export_null_view(e, export_slot_depth);
-        }
+        // (No depth: t2 stays empty, as the screen's pass has it since the light drawn over the picture went, 1.3.2.)
+        export_null_view(e, export_slot_depth);
         const auto constants = pass_constants(*picture, finish, {static_cast<float>(w), static_cast<float>(h), 0, 1.0f, e.mips, g.hood_ready,
-                                                                 depth_copy, depth_ready, e.frames++});
+                                                                 e.frames++});
         std::memcpy(e.constants_cpu, constants.data(), sizeof(std::uint32_t) * constant_count);
         if (!copy_rows(e.upload_cpu, e.row, pixels, pitch, std::size_t{w} * 4, h)) {
             e.failed = true;
@@ -1518,6 +1589,7 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
         list->SetGraphicsRootDescriptorTable(2, export_gpu(e, export_slot_chain));
         list->SetGraphicsRootDescriptorTable(3, export_gpu(e, export_slot_depth));
         list->SetGraphicsRootDescriptorTable(4, export_gpu(e, export_slot_hood));
+        list->SetGraphicsRootDescriptorTable(5, export_gpu(e, export_slot_display));
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const auto viewport = [&](std::uint32_t vw, std::uint32_t vh) {
             const D3D12_VIEWPORT v{0.0f, 0.0f, static_cast<float>(vw), static_cast<float>(vh), 0.0f, 1.0f};
@@ -1525,7 +1597,7 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
             list->RSSetViewports(1, &v);
             list->RSSetScissorRects(1, &r);
         };
-        // 1. The frame in linear light (and the camera light), 2. its mips where the fisheye squeezes.
+        // 1. The frame in linear light, 2. its mips where the fisheye squeezes.
         auto mip0 = export_rtv(e, 0);
         list->OMSetRenderTargets(1, &mip0, FALSE, nullptr);
         viewport(w, h);
@@ -1586,8 +1658,7 @@ bool finish_export(std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::
         if (!e.said) {
             e.said = true;
             logging::write(logging::Level::info, logging::Channel::graphics,
-                           std::format("Replay Plus export: its frames ({}x{}) are finished on the GPU, the camera light {}.", w, h,
-                                       depth_ready ? "with them" : light_on ? "waiting for the game's depth" : "off"));
+                           std::format("Replay Plus export: its frames ({}x{}) are finished on the GPU.", w, h));
         }
         return true;
     } catch (...) {
@@ -1614,7 +1685,6 @@ void release() noexcept {
     export_release();
     g.queue.Reset();
     depth::release();
-    g.depth_serial = ~std::uint64_t{0};
     g.focus_readback.Reset();
     g.focus_written = {};
     g.copy.Reset();
@@ -1623,6 +1693,9 @@ void release() noexcept {
     g.hood_upload.Reset();
     g.hood_serial = ~std::uint64_t{0};
     g.hood_ready = false;
+    g.display_forward.Reset();
+    g.display_inverse.Reset();
+    g.display_upload.Reset();
     g.shot.Reset();
     g.shot_pending = false;
     g.white_readback.Reset();

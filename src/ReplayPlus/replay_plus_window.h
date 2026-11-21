@@ -17,8 +17,13 @@ struct Size {
 };
 Size fitted(float aspect, Size monitor) noexcept;
 
-// The size of the monitor the game's window is on (0, 0: not known; the window is link::game_window()).
+// The size of the monitor the game's window is on (0, 0: not known; the window is link::game_window()), as the
+// calling thread sees it: in Windows' scaled units when the screen is scaled and the thread is not DPI aware (the
+// game's are not: a 2560x1440 screen at 200% is 1280x720 to them).
 Size monitor_size() noexcept;
+// The same monitor in its own pixels, asked with the thread made per-monitor DPI aware for the moment (and put back
+// as it was). As monitor_size() where that cannot be done (Windows before 10 1607).
+Size monitor_pixels() noexcept;
 
 // Game thread, every tick: the window `size` in the middle of its monitor with the backdrop behind it,
 // or (0, 0) as it was. Says what it did, once, when it changes (empty: nothing to say).

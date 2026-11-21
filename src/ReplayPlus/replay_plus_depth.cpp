@@ -15,12 +15,14 @@
 #include <mutex>
 #include <vector>
 
-// The game's depth for the camera light. ReSkate hooks ID3D12GraphicsCommandList::ResourceBarrier once
+// The game's depth for the autofocus. ReSkate hooks ID3D12GraphicsCommandList::ResourceBarrier once
 // (Extension/UI/Overlay/depth_tap.cpp, its depth tap for screen captures) and hands Replay Plus every
-// barrier the game records, before passing it on. While the light is on, the game's main depth (the
+// barrier the game records, before passing it on. While the autofocus wants it, the game's main depth (the
 // first depth target each frame that goes from being written to being read, a picture's shape: as the
 // tap takes it) is copied into a texture of Replay Plus's own, on the game's own command list, where
-// the depth is finished. The picture's pass then reads that copy, later on the same queue.
+// the depth is finished; the autofocus reads it later on the same queue. (The camera light drawn over the
+// picture read it too, and each exported frame's own, until 1.3.2: the light is a real light of the game's now,
+// replay_plus_light.h.)
 namespace dingosdk::replay_plus::depth {
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -43,26 +45,6 @@ struct Shared {
     // The game has a half-size depth of the same view too (1280x720 beside 2560x1440, recorded first on
     // some frames): the largest one seen lately is the main view's, and only it is taken.
     std::uint64_t largest{}, largest_epoch{};
-    // Exports (for_export in replay_plus_depth.h): the depth of the frame each video frame was drawn in,
-    // copied from the depth copy as the game's video frame goes to be copied out, in a ring, oldest
-    // first; let go a few seconds after the last export frame.
-    struct Kept {
-        ComPtr<ID3D12Resource> texture;
-        std::uint32_t width{}, height{};
-        std::uint64_t epoch{};
-        bool own_frame{}; // the game's depth went by earlier in the same frame
-        // A few rows of the video frame drawn in that frame, read back: which frame the encoder is given.
-        ComPtr<ID3D12Resource> print;
-        const std::uint8_t* print_cpu{};
-        std::uint32_t print_width{}, print_height{};
-    };
-    // Six: the game reads its video frames back four frames on, and draws one or two at an export's start that
-    // it never encodes (2026-11-17); a frame's own may be kept before or after the encoder takes one. Those
-    // never encoded are the ones let go when it is full.
-    std::array<Kept, 6> kept{};
-    std::uint64_t kept_pushed{}, kept_popped{}, kept_epoch{}, kept_taken{}, kept_dropped{}, kept_skipped{}, kept_unfound{}, kept_exact{};
-    bool kept_fallback_said{}, kept_late_said{}, kept_drop_said{}, kept_unfound_said{};
-    int kept_inexact_said{};
     // Which of the game's depths the light's copy comes from (logged when it changes, a few times).
     ID3D12Resource* depth_source{};
     std::uint64_t depth_source_copies{};
@@ -494,117 +476,6 @@ void frame_taps(Shared& s, ID3D12GraphicsCommandList* list, UINT count, const D3
         }
     }
 }
-// ---- Exports: the depth of each video frame's own frame ----------------------------------------------
-// The rows of a video frame kept to know it again: six, evenly down it; each 512-byte aligned in the readback.
-constexpr std::uint32_t print_rows = 6;
-std::uint32_t print_stride(std::uint32_t width) { return (width * 4u + 511u) & ~511u; }
-std::uint32_t print_row(std::uint32_t height, std::uint32_t i) { return height * (2u * i + 1u) / (2u * print_rows); }
-void retire_kept(Shared& s, Shared::Kept& k) {
-    if (k.texture) s.retired.push_back({std::move(k.texture), s.epoch});
-    if (k.print) {
-        k.print->Unmap(0, nullptr);
-        s.retired.push_back({std::move(k.print), s.epoch});
-    }
-    k.print_cpu = nullptr;
-    k.print_width = k.print_height = 0;
-}
-void keep_for_export(Shared& s, ID3D12GraphicsCommandList* list, const D3D12_RESOURCE_BARRIER& b, BarrierFn original) {
-    // A new export (no video frame for a second or so): nothing kept is for it.
-    if (s.kept_epoch + 60 < s.epoch) {
-        s.kept_popped = s.kept_pushed;
-        s.kept_taken = s.kept_dropped = s.kept_skipped = s.kept_unfound = s.kept_exact = 0;
-        s.kept_fallback_said = s.kept_late_said = s.kept_drop_said = s.kept_unfound_said = false;
-        s.kept_inexact_said = 0;
-    }
-    s.kept_epoch = s.epoch;
-    auto& k = s.kept[s.kept_pushed % s.kept.size()];
-    if (!k.texture || k.width != s.width || k.height != s.height) {
-        ComPtr<ID3D12Device> device;
-        if (FAILED(s.texture->GetDevice(IID_PPV_ARGS(&device)))) return;
-        if (k.texture) s.retired.push_back({std::move(k.texture), s.epoch});
-        auto t = s.texture->GetDesc();
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                                                   IID_PPV_ARGS(&k.texture)))) {
-            k.texture.Reset();
-            return;
-        }
-        k.texture->SetName(L"Replay Plus depth kept for an exported frame");
-        k.width = s.width;
-        k.height = s.height;
-    }
-    auto* video = b.Transition.pResource;
-    const auto vd = video->GetDesc();
-    const auto vw = static_cast<std::uint32_t>(vd.Width), vh = vd.Height;
-    if (!k.print || k.print_width != vw || k.print_height != vh) {
-        ComPtr<ID3D12Device> device;
-        if (FAILED(video->GetDevice(IID_PPV_ARGS(&device)))) return;
-        if (k.print) {
-            k.print->Unmap(0, nullptr);
-            s.retired.push_back({std::move(k.print), s.epoch});
-        }
-        k.print_cpu = nullptr;
-        D3D12_RESOURCE_DESC t{};
-        t.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        t.Width = std::uint64_t{print_stride(vw)} * print_rows;
-        t.Height = 1;
-        t.DepthOrArraySize = 1;
-        t.MipLevels = 1;
-        t.SampleDesc.Count = 1;
-        t.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        void* mapped{};
-        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &t, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&k.print))) ||
-            FAILED(k.print->Map(0, nullptr, &mapped)) || !mapped) {
-            k.print.Reset();
-            return;
-        }
-        k.print->SetName(L"Replay Plus rows of an exported frame");
-        k.print_cpu = static_cast<const std::uint8_t*>(mapped);
-        k.print_width = vw;
-        k.print_height = vh;
-    }
-    if (s.kept_pushed - s.kept_popped >= s.kept.size()) {
-        // Full: the oldest was never taken (the encoder fell behind, or frames were drawn and never encoded).
-        ++s.kept_popped;
-        ++s.kept_dropped;
-        if (!s.kept_drop_said) {
-            s.kept_drop_said = true;
-            logging::write(logging::Level::info, logging::Channel::graphics,
-                           std::format("Replay Plus export: the depth kept for a video frame was let go unused ({} kept, {} taken).", s.kept_pushed,
-                                       s.kept_taken));
-        }
-    }
-    // In the game's list, before its own barrier: the frame's depth copy (in a shader's state between
-    // copies) into the slot.
-    transition(list, original, s.texture.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transition(list, original, k.texture.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyResource(k.texture.Get(), s.texture.Get());
-    transition(list, original, k.texture.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    transition(list, original, s.texture.Get(), 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    // The video frame's rows, as the game has finished drawing it (its own barrier, passed on after this,
-    // takes it on to be copied out for the encoder).
-    transition(list, original, video, b.Transition.Subresource, b.Transition.StateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    for (std::uint32_t i = 0; i < print_rows; ++i) {
-        D3D12_TEXTURE_COPY_LOCATION to{}, from{};
-        to.pResource = k.print.Get();
-        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        to.PlacedFootprint.Offset = std::uint64_t{print_stride(vw)} * i;
-        to.PlacedFootprint.Footprint = {vd.Format, vw, 1, 1, print_stride(vw)};
-        from.pResource = video;
-        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        from.SubresourceIndex = 0;
-        const auto row = print_row(vh, i);
-        const D3D12_BOX box{0, row, 0, vw, row + 1, 1};
-        list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
-    }
-    transition(list, original, video, b.Transition.Subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, b.Transition.StateBefore);
-    k.epoch = s.epoch;
-    k.own_frame = s.copied_epoch == s.epoch;
-    ++s.kept_pushed;
-}
 // The game's video frames going to be copied out for its encoder, whatever their size (a trace of an export,
 // 2026-11-17: B8G8R8A8 at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame): their size is
 // what an exported frame is finished at (link::export_frame_size), MP4 or WebM, light or none.
@@ -622,25 +493,6 @@ void note_video_frames(const Shared& s, UINT count, const D3D12_RESOURCE_BARRIER
         link::note_video_frame(static_cast<std::uint32_t>(d.Width), d.Height);
     }
 }
-// The game's video frame as it goes from being drawn to being copied out for its encoder (a trace of an
-// export, 2026-11-17: B8G8R8A8 at the video's size, RENDER_TARGET -> shader read -> COPY_SOURCE, each frame).
-void export_taps(Shared& s, ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers, BarrierFn original) {
-    const auto video = replay_shake::export_frames::size();
-    for (UINT i = 0; i < count; ++i) {
-        const auto& b = barriers[i];
-        if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource || (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY))
-            continue;
-        if (b.Transition.StateAfter != D3D12_RESOURCE_STATE_COPY_SOURCE || b.Transition.StateBefore == D3D12_RESOURCE_STATE_COPY_SOURCE) continue;
-        const auto d = b.Transition.pResource->GetDesc();
-        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Format != DXGI_FORMAT_B8G8R8A8_UNORM || d.DepthOrArraySize != 1 || d.Width < 640)
-            continue;
-        const bool video_size = video.width > 0 ? d.Width == static_cast<UINT64>(video.width) && d.Height == static_cast<UINT>(video.height)
-                                                : picture_shaped(s, d.Width, d.Height);
-        if (!video_size || swap_buffer(s, b.Transition.pResource) || d.MipLevels != 1) continue;
-        keep_for_export(s, list, b, original);
-        return;
-    }
-}
 } // namespace
 
 void barriers(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers, BarrierFn original) noexcept {
@@ -652,7 +504,6 @@ void barriers(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_
         if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
         if (list != s.own_list) note_video_frames(s, count, barriers);
         if (s.scene_wanted || s.ui_wanted) frame_taps(s, list, count, barriers, original);
-        if (s.wanted && s.texture && list != s.own_list) export_taps(s, list, count, barriers, original);
         if (!s.wanted || s.copied_epoch == s.epoch) return;
         constexpr auto read = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         for (UINT i = 0; i < count; ++i) {
@@ -704,14 +555,8 @@ void begin_frame(bool wanted, bool scene_wanted, bool ui_wanted, std::uint32_t s
     ++s.epoch;
     // Textures replaced a few frames ago are done with on the GPU.
     std::erase_if(s.retired, [&](const Retired& r) { return s.epoch > r.epoch + 6; });
-    // What was kept for an export goes a few seconds after its last frame.
-    if (s.kept_epoch && s.kept_epoch + 300 < s.epoch) {
-        for (auto& k : s.kept) retire_kept(s, k);
-        s.kept_popped = s.kept_pushed;
-        s.kept_epoch = 0;
-    }
     if (!wanted && s.texture && s.copied_epoch + 600 < s.epoch) {
-        // Ten seconds or so without the light: the copy goes too (kept a few frames for the GPU).
+        // Ten seconds or so without the autofocus: the copy goes too (kept a few frames for the GPU).
         s.retired.push_back({std::move(s.texture), s.epoch});
         s.width = s.height = 0;
         ++s.serial;
@@ -774,119 +619,6 @@ void ignore_list(ID3D12GraphicsCommandList* list) noexcept {
     s.own_list = list;
 }
 
-Copy for_export(const std::uint8_t* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch, bool* matched) noexcept {
-    auto& s = shared();
-    std::lock_guard lock(s.mutex);
-    if (matched) *matched = false;
-    Copy c;
-    if (s.kept_popped < s.kept_pushed) {
-        // Which kept frame this is, by its rows: the colour's differences summed, the oldest of the closest;
-        // taken only when clearly the closest (frames drawn and never encoded, before it, are passed over); else
-        // in order. (The encoder's frame is rarely the drawn one to the byte: about 5% of its colour bytes differ,
-        // by up to 80, the next frame's some 5 to 25 times as much; its alpha never does. 2026-11-17)
-        std::uint64_t found = s.kept_pushed;
-        std::uint64_t best_sad = ~std::uint64_t{0}, next_sad = ~std::uint64_t{0};
-        std::uint32_t best_alpha = 0, best_bytes = 0;
-        int best_max = 0;
-        if (pixels && width && height && pitch >= width * 4u) {
-            for (std::uint64_t j = s.kept_popped; j < s.kept_pushed; ++j) {
-                const auto& k = s.kept[j % s.kept.size()];
-                if (!k.texture || !k.print_cpu || k.print_width != width || k.print_height != height) continue;
-                std::uint64_t sad = 0;
-                std::uint32_t alpha = 0, bytes = 0;
-                int most = 0;
-                for (std::uint32_t i = 0; i < print_rows; ++i) {
-                    const auto* a = k.print_cpu + std::size_t{print_stride(width)} * i;
-                    const auto* p = pixels + std::size_t{print_row(height, i)} * pitch;
-                    for (std::uint32_t x = 0; x < width * 4u; x += 4) {
-                        for (std::uint32_t ch = 0; ch < 3; ++ch) {
-                            const int d = std::abs(static_cast<int>(a[x + ch]) - static_cast<int>(p[x + ch]));
-                            sad += static_cast<std::uint64_t>(d);
-                            bytes += d != 0;
-                            most = std::max(most, d);
-                        }
-                        alpha += a[x + 3] != p[x + 3];
-                    }
-                }
-                if (sad < best_sad) {
-                    next_sad = best_sad;
-                    best_sad = sad;
-                    best_alpha = alpha;
-                    best_bytes = bytes;
-                    best_max = most;
-                    found = j;
-                } else if (sad < next_sad) {
-                    next_sad = sad;
-                }
-            }
-            // Clearly the closest: none of the others within two and a half times its difference (when there are others).
-            if (found != s.kept_pushed && best_sad != 0 && next_sad != ~std::uint64_t{0} && best_sad * 5 > next_sad * 2) found = s.kept_pushed;
-        }
-        const bool by_pixels = found != s.kept_pushed;
-        if (by_pixels && best_sad == 0) ++s.kept_exact;
-        if (by_pixels && best_sad != 0 && s.kept_inexact_said < 1) {
-            ++s.kept_inexact_said;
-            logging::write(logging::Level::info, logging::Channel::graphics,
-                           std::format("Replay Plus export: frame {} found by its pixels, not exactly: {} of {} colour bytes differ (by up to {}, {:.3f} "
-                                       "a byte), {} of {} alphas; the next closest {:.3f} a byte.",
-                                       s.kept_taken + 1, best_bytes, print_rows * width * 3u, best_max,
-                                       static_cast<double>(best_sad) / (print_rows * width * 3.0), best_alpha, print_rows * width,
-                                       next_sad == ~std::uint64_t{0} ? -1.0 : static_cast<double>(next_sad) / (print_rows * width * 3.0)));
-        }
-        if (!by_pixels) {
-            found = s.kept_popped;
-            ++s.kept_unfound;
-            if (!s.kept_unfound_said) {
-                s.kept_unfound_said = true;
-                logging::write(logging::Level::info, logging::Channel::graphics,
-                               std::format("Replay Plus export: frame {} was not found by its pixels among the {} kept (closest {:.3f} a byte, next "
-                                           "{:.3f}); it is lit from the oldest.",
-                                           s.kept_taken + 1, s.kept_pushed - s.kept_popped,
-                                           best_sad == ~std::uint64_t{0} ? -1.0 : static_cast<double>(best_sad) / (print_rows * width * 3.0),
-                                           next_sad == ~std::uint64_t{0} ? -1.0 : static_cast<double>(next_sad) / (print_rows * width * 3.0)));
-            }
-        }
-        const std::uint64_t skipped = found - s.kept_popped;
-        s.kept_skipped += skipped;
-        const auto& k = s.kept[found % s.kept.size()];
-        s.kept_popped = found + 1;
-        if (k.texture) {
-            ++s.kept_taken;
-            c.texture = k.texture.Get();
-            c.width = k.width;
-            c.height = k.height;
-            c.serial = s.serial;
-            c.fresh = true;
-            c.copies = s.copies;
-            if (matched) *matched = true;
-            if (s.kept_taken <= 2 || s.kept_taken % 600 == 0 || skipped)
-                logging::write(logging::Level::info, logging::Channel::graphics,
-                               std::format("Replay Plus export: frame {} is lit from the depth of the frame it was drawn in ({}{} frame(s) back, {} passed "
-                                           "over, {} more waiting; {} passed over, {} exact, {} not found by pixels, {} let go in all).",
-                                           s.kept_taken, by_pixels ? "found by its pixels, " : "in order, ", s.epoch - k.epoch, skipped,
-                                           s.kept_pushed - s.kept_popped, s.kept_skipped, s.kept_exact, s.kept_unfound, s.kept_dropped));
-            if (!k.own_frame && !s.kept_late_said) {
-                s.kept_late_said = true;
-                logging::write(logging::Level::info, logging::Channel::graphics,
-                               "Replay Plus export: a video frame was finished before the game's depth went by in its frame; it is lit from the frame before.");
-            }
-            return c;
-        }
-    }
-    if (!s.kept_fallback_said) {
-        s.kept_fallback_said = true;
-        logging::write(logging::Level::info, logging::Channel::graphics,
-                       "Replay Plus export: no depth was kept for a video frame; it is lit from the latest.");
-    }
-    c.texture = s.texture.Get();
-    c.width = s.width;
-    c.height = s.height;
-    c.serial = s.serial;
-    c.fresh = s.texture && s.copied_epoch + 2 >= s.epoch;
-    c.copies = s.copies;
-    return c;
-}
-
 void trim() noexcept {
     auto& s = shared();
     std::lock_guard lock(s.mutex);
@@ -910,16 +642,11 @@ void trim() noexcept {
         s.ui_written = {};
         s.ui_shown = -1;
     }
-    for (auto& k : s.kept) retire_kept(s, k);
-    s.kept_popped = s.kept_pushed;
-    s.kept_epoch = 0;
 }
 bool holding() noexcept {
     auto& s = shared();
     std::lock_guard lock(s.mutex);
-    bool kept = false;
-    for (const auto& k : s.kept) kept = kept || k.texture;
-    return s.texture || s.scene_in || s.scene_out || s.ui_readback || kept || !s.retired.empty();
+    return s.texture || s.scene_in || s.scene_out || s.ui_readback || !s.retired.empty();
 }
 void release() noexcept {
     auto& s = shared();
@@ -938,14 +665,5 @@ void release() noexcept {
     s.ui_shown = -1;
     s.swap = {};
     s.composite_list = nullptr;
-    for (auto& k : s.kept) {
-        k.texture.Reset();
-        if (k.print) k.print->Unmap(0, nullptr);
-        k.print.Reset();
-        k.print_cpu = nullptr;
-        k.print_width = k.print_height = 0;
-    }
-    s.kept_popped = s.kept_pushed;
-    s.kept_epoch = 0;
 }
 } // namespace dingosdk::replay_plus::depth

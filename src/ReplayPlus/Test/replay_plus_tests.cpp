@@ -2,6 +2,7 @@
 // before the lens was settings only), presets and their names, the lens (against its reference
 // numbers) and its edge compression, the overlay's picture, the grade, and an exported frame
 // finished on the CPU.
+#include "Extension/ReplayPlus/replay_plus_display_table.h"
 #include "Extension/ReplayPlus/replay_plus_lens.h"
 #include "Extension/ReplayPlus/replay_plus_link.h"
 #include "Extension/ReplayPlus/replay_plus_settings.h"
@@ -279,6 +280,22 @@ void preset_tests() {
             const float v = f.get(built.settings), steps = (v - f.low) / f.step;
             check(std::abs(steps - std::round(steps)) < 0.01f, std::format("built-in preset {}: {} ({}) is on its slider's steps", built.name, f.key, v));
         }
+        if (!lens_on(built.settings)) {
+            // The plain one: nothing of Replay Plus's drawn, read or held, the editor's own picture shape, and the shake off.
+            check(!wants_picture(built.settings) && !wants_views(built.settings) && !wants_game_settings(built.settings) &&
+                      built.settings.replay_aspect == Aspect::screen && !built.settings.resolution && !built.settings.sharp_middle &&
+                      built.settings.sharpen == 0.0f && built.settings.hood == Hood::none && !built.settings.light,
+                  "built-in preset " + built.name + ": nothing on");
+            check(built.shake.is_object() && built.shake.contains("enabled") && built.shake.at("enabled").is_boolean() &&
+                      !built.shake.at("enabled").get<bool>() && read.shake.dump() == built.shake.dump(),
+                  "built-in preset " + built.name + ": the shake off, and read back so");
+            // With the camera light switched on as well, still no pass of Replay Plus's: the light is a light of the game's,
+            // which the game draws (since 1.3.2); only the camera's view is read, for where to put it.
+            auto lit = built.settings;
+            lit.light = true;
+            check(!wants_picture(lit) && wants_views(lit), "built-in preset " + built.name + " with the light on: no pass, the camera's view read");
+            continue;
+        }
         // The lens is what its settings say: at its field of view the game's picture feeds all of it (nothing fitted in
         // for it), on the screen it is made for.
         const float screen = built.settings.replay_aspect == Aspect::four_three ? 4.0f / 3.0f : 16.0f / 9.0f;
@@ -290,7 +307,9 @@ void preset_tests() {
               "built-in preset " + built.name + ": a plain lens (no overlay, glass or camera curve)");
         fit_is_tight(f, "built-in preset " + built.name);
     }
-    check(built_in_presets().size() == 2, "two built-in presets");
+    std::vector<std::string> built_names;
+    for (const auto& built : built_in_presets()) built_names.push_back(built.name);
+    check(built_names == std::vector<std::string>{"Fisheye 16-9", "Fisheye 4-3", "Plain"}, "three built-in presets: two fisheyes and Plain");
     const auto older = older_built_in_names(), retired = retired_built_in_names();
     for (const auto& name : retired) {
         check(std::find(older.begin(), older.end(), name) != older.end(), name + ": a retired built-in was one");
@@ -1376,6 +1395,29 @@ void white_tests() {
         check(found.ok && near(found.scale, scale, 0.015 * scale), std::format("the scale {} is found: {}", scale, found.detail));
     }
 
+    // The game's display mapping as measured (2026-11-21), the table the shader reads: greys as the curve has them,
+    // within a few percent; a bright saturated red lifted toward white (what the curve, on each channel, missed);
+    // and the inverse table's greys where the curve's are.
+    namespace table = replay_plus::display_table;
+    const auto forward_at = [&](int r, int g, int b, int c) {
+        return lens::srgb_to_linear(table::forward[((static_cast<std::size_t>(b) * table::forward_size + g) * table::forward_size + r) * 4 + c] / 65535.0f);
+    };
+    for (int k = 0; k < table::forward_size; ++k) {
+        const float p = std::exp2(table::forward_from + table::forward_step * static_cast<float>(k));
+        if (p < 0.06f || p > 20.0f) continue;
+        check(std::abs(forward_at(k, k, k, 1) / lens::display_mapped(mapping, p) - 1.0f) < (p < 0.1f ? 0.08f : 0.05f),
+              std::format("the measured mapping shows grey {} as {} (the curve {})", p, forward_at(k, k, k, 1), lens::display_mapped(mapping, p)));
+    }
+    check(forward_at(24, 0, 0, 0) > 0.99f && forward_at(24, 0, 0, 1) > 0.6f, std::format("a bright red is lifted toward white ({})", forward_at(24, 0, 0, 1)));
+    for (int k = 4; k < table::inverse_size - 4; ++k) {
+        const float x = table::inverse_from + (table::inverse_to - table::inverse_from) * static_cast<float>(k) / static_cast<float>(table::inverse_size - 1);
+        const std::size_t at = ((static_cast<std::size_t>(k) * table::inverse_size + k) * table::inverse_size + k) * 4;
+        for (int c = 0; c < 3; ++c) {
+            const float found = table::inverse[at + c] / 65535.0f * table::inverse_range - table::inverse_offset;
+            check(std::abs(found - x) < 0.3f, std::format("the inverse finds grey {} at {}", x, found));
+        }
+    }
+
     lens::WhiteTrack track;
     check(track.add(2.16f) && near(track.white, 2.16f), "the first measurement is used at once");
     check(!track.add(2.17f) && near(track.white, 2.16f), "one within 1% leaves it");
@@ -1518,13 +1560,51 @@ void export_size_tests() {
     check(many.size() == 4 && std::none_of(many.begin(), many.end(), [](const VideoFrameSeen& v) { return v.width == 640 || v.width == 704; }),
           "four sizes kept, the oldest let go");
 }
+// The picture shape's size in pixels (link::shape_pixels): the window is sized as the game's threads see the screen,
+// in Windows' scaled units on a scaled screen, but the game renders in pixels. (A 200% laptop screen's 4:3 picture was
+// rendered 960x720 and stretched to 1920x1440, 2026-11-20.)
+void shape_pixel_tests() {
+    using P = link::PixelSize;
+    const auto pixels = [](P window, P seen, P monitor) { return link::shape_pixels(window, seen, monitor); };
+    check(pixels({1920, 1440}, {2560, 1440}, {2560, 1440}) == P{1920, 1440}, "an unscaled screen: the window's size");
+    check(pixels({960, 720}, {1280, 720}, {2560, 1440}) == P{1920, 1440}, "200% (the laptop that sent the log): twice the window");
+    check(pixels({1280, 960}, {1707, 960}, {2560, 1440}) == P{1920, 1440}, "150%");
+    check(pixels({1536, 1152}, {2048, 1152}, {2560, 1440}) == P{1920, 1440}, "125%");
+    const auto odd = pixels({1096, 822}, {1463, 823}, {2560, 1440});
+    check(odd.width % 2 == 0 && odd.height % 2 == 0 && std::abs(odd.width - 1918) <= 2 && std::abs(odd.height - 1438) <= 2,
+          std::format("175%: even numbers, about 1918x1438 (got {}x{})", odd.width, odd.height));
+    check(pixels({1440, 1080}, {1440, 1080}, {2880, 2160}) == P{2880, 2160}, "a 1080p-sized screen at 200% on a 4K one");
+    check(pixels({1280, 536}, {1280, 720}, {2560, 1440}) == P{2560, 1072}, "2.39 bars' shape: both sides scaled");
+    check(pixels({1280, 720}, {1280, 720}, {2560, 1440}) == P{2560, 1440}, "the whole screen: at most the monitor's pixels");
+    check(pixels({960, 720}, {1280, 720}, {0, 0}) == P{960, 720}, "the pixels not known: the window's size");
+    check(pixels({960, 720}, {0, 0}, {2560, 1440}) == P{960, 720}, "the screen as seen not known: the window's size");
+    check(pixels({0, 0}, {1280, 720}, {2560, 1440}) == P{0, 0}, "no shape: none");
+    check(pixels({1600, 1200}, {2560, 1440}, {1920, 1080}) == P{1200, 900}, "a screen seen larger than its pixels: scaled down too");
+}
+// The render scale's room in memory (link::scale_ceiling, memory_margin, commit_room): smaller cards get a lower ceiling
+// and a wider margin, and the PC's commit left counts. (A 12 GB laptop card went 2.5 GB past its budget leaving the
+// editor, the PC within 0.3 GB of its commit limit, 2026-11-19.)
+void memory_room_tests() {
+    constexpr std::uint64_t gb = 1073741824ull;
+    check(link::scale_ceiling(15 * gb) == 2.0f && link::scale_ceiling(0) == 2.0f, "a 16 GB card (and one not known): up to 200%");
+    check(link::scale_ceiling(10 * gb + gb * 94 / 100) == 1.5f, "the laptop's 10.94 GB budget: up to 150%");
+    check(link::scale_ceiling(7 * gb) == 1.25f && link::scale_ceiling(8 * gb) == 1.25f, "8 GB cards: up to 125%");
+    check(std::abs(link::memory_margin(15 * gb) - 1.8 * gb) < 1e6, "a 15 GB budget keeps 12% (1.8 GB) free");
+    check(std::abs(link::memory_margin(10 * gb) - 2.5 * gb) < 1e6, "a 10 GB budget keeps 2.5 GB free");
+    check(std::abs(link::memory_margin(12 * gb) - 2.5 * gb) < 1e6 && link::memory_margin(12 * gb) > 0.2 * 12 * gb - 1e6,
+          "a 12 GB budget keeps 2.5 GB (a fifth is 2.4)");
+    check(link::commit_room(0) == link::CommitRoom::plenty, "the PC's commit not known: as if plenty");
+    check(link::commit_room(8 * gb) == link::CommitRoom::plenty && link::commit_room(5 * gb) == link::CommitRoom::plenty, "5 GB or more: plenty");
+    check(link::commit_room(4 * gb + gb / 2) == link::CommitRoom::no_raise, "4.5 GB left (as the laptop had): not raised");
+    check(link::commit_room(2 * gb) == link::CommitRoom::none && link::commit_room(gb / 3) == link::CommitRoom::none, "under 3 GB: the game's own scale");
+}
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> suites{
         {"fields", field_tests}, {"commands", command_tests}, {"json", json_tests}, {"presets", preset_tests},
         {"lens", lens_tests}, {"grade", grade_tests}, {"finish", finish_tests}, {"focus", focus_tests},
         {"shake keys", shake_key_tests}, {"light keys", light_key_tests}, {"view", view_tests}, {"edge compression", compression_tests}, {"overlay", hood_tests},
         {"colour tools", colour_tool_tests}, {"keep", keep_tests}, {"white", white_tests}, {"controls", bind_tests},
-        {"export size", export_size_tests}};
+        {"export size", export_size_tests}, {"shape pixels", shape_pixel_tests}, {"memory room", memory_room_tests}};
     try {
         for (const auto& [name, suite] : suites) {
             suite();

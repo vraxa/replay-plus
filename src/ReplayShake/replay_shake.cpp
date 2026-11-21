@@ -2513,6 +2513,8 @@ bool start(std::uintptr_t base) noexcept {
     build_callbacks.built = &view_built;
     build_callbacks.overridden = &view_overridden;
     const bool built = game_view::start(base, build_callbacks);
+    // And the replay's time as the game plays its camera keyframes, which exports are timed by (slow motion and all).
+    const bool played = export_frames::start_played_clock(base);
     try {
         std::lock_guard lock(s.mutex);
         s.base = base;
@@ -2543,11 +2545,12 @@ bool start(std::uintptr_t base) noexcept {
         }
         s.ready.store(true, std::memory_order_release);
         logging::log(logging::Level::info, logging::Channel::graphics,
-            "Replay Shake ready ({}): default {}, {} keyframe shake(s), {} replay camera(s), editor mapping {}; it shakes {}.",
+            "Replay Shake ready ({}): default {}, {} keyframe shake(s), {} replay camera(s), editor mapping {}; it shakes {}; exports are timed {}.",
             s.settings.enabled ? "on" : "off", describe(s.settings.fallback), s.settings.keys.size(),
             replay_cameras(s.settings).size(), s.settings.mapping.root ? "set" : "not set",
             built ? "the view the game builds the picture from"
-                  : camera ? "the camera itself, as the game works it out" : "the views drawn");
+                  : camera ? "the camera itself, as the game works it out" : "the views drawn",
+            played ? "by the replay's time as its keyframes play (slow motion followed)" : "by their frames");
         publish_view(s);
     } catch (...) {
         return false;

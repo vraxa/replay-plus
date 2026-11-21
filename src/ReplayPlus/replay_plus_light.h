@@ -6,8 +6,8 @@
 // The camera light as a real light of the game's: a spot light made through the game's own light renderer, as the
 // game makes the spot lights of its levels (the PbrSpotLight entity's way, replay_plus_light.cpp), on the replay
 // camera and pointing where it looks. The game lights the world with it as with its own lights (every surface, its
-// shading and shadows, in exported videos as on the screen), where the light drawn over the picture
-// (replay_plus.hlsl camera_light) can only brighten what the picture shows.
+// shading and shadows, in exported videos as on the screen). (Until 1.3.2 it could be drawn over the picture instead,
+// from the game's depth, which could only brighten what the picture showed: that light is gone.)
 namespace dingosdk::replay_plus::light {
 struct Wanted {
     bool on{};

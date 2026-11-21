@@ -21,9 +21,9 @@ cbuffer ReplayPlusPass : register(b0)
     float4 P4; // exposure gain, contrast, saturation, faded blacks
     float4 P5; // white balance gains r, g, b, vignette
     float4 P6; // pass the game's pixels through as they are (no lens, no grade), the lens's curve, its scale (K), colour fringe
-    float4 P7; // camera light: power (0 none), reach (m), cos of half its beam, cos of half its bright core
-    float4 P8; // camera light: colour r, g, b; the game's near plane (m)
-    float4 P9; // the game's far plane (m), the depth is there (1), one depth texel across, up (uv)
+    float4 P7; // (none: the camera light drawn over the picture, gone in 1.3.2; kept so the rest keep their places)
+    float4 P8; // (none, likewise)
+    float4 P9; // (none, likewise)
     float4 P10; // the lens's corner shade (stops), edge softness, squeeze (across, before the lens), its edge compression's ease (per radian; 0 none)
     float4 P11; // the camera curve (1 on), the lens's veiling glare (light added before the grade), the picture overlay's half-height (q), the camera's toe slope
     float4 P12; // the colour matrix's first row (hue and saturation), lift
@@ -35,12 +35,14 @@ cbuffer ReplayPlusPass : register(b0)
     float4 P18; // the camera curve: gamma, knee, knee slope, black level
     float4 P19; // the camera curve: white clip, colour level; the enlarged middle's sharpening (0 none, 1 the most); the picture overlay's half-width (q)
     float4 P20; // the game's display mapping (transfer 3): t0, its toe's slope s1, its shoulder's slope s2, the bend x0
-    float4 P21; // the bend's width w, log2 of the scale the picture is taken at; the camera light's facing smoothed over (m, 0 none), how much it counts
+    float4 P21; // the bend's width w, log2 of the scale the picture is taken at; (research, test builds: the display probe's set, the screen's width)
 };
 Texture2D source : register(t0); // ps_decode: the frame's copy; ps_down: the mip above
 Texture2D linear_chain : register(t1); // ps_main: the frame in linear light, with its mips
-Texture2D depth : register(t2); // the game's depth, for the camera light (R32, reversed)
 Texture2D hood : register(t3);  // the hood's picture (sRGB colour, straight alpha)
+// The game's display mapping as measured, and its inverse (replay_plus_display_table.h; dm_shown, dm_encode).
+Texture3D display_forward : register(t4);
+Texture3D display_inverse : register(t5);
 SamplerState linear_clamp : register(s0);
 SamplerState point_clamp : register(s1);
 
@@ -64,10 +66,12 @@ Interpolated vs_main(uint id : SV_VertexID)
 // the game's picture before its UI is not to be had, as while a video is filmed) the picture came out
 // one flat grey: its white written back as 1 nit (2026-11-17). In exports P2.w is 1.
 // Under the game's UI the picture is the game's own before its last pass, which shows it through its display
-// mapping, a filmic curve on each channel (replay_plus_lens.h DisplayMapping). Taken as linear light with 1 as
-// white, the camera curve's white showed at 181 of 255 and the picture's bright half went flat and grey
-// (2026-11-18). In SDR (transfer 3) that curve is applied to read the picture and undone to write it back, so
-// the grade sees what an exported frame shows; in HDR (transfer 1) P2.w is the picture's white, measured.
+// mapping. Taken as linear light with 1 as white, the camera curve's white showed at 181 of 255 and the picture's
+// bright half went flat and grey (2026-11-18). In SDR (transfer 3) that mapping is applied to read the picture and
+// undone to write it back, so the grade sees what an exported frame shows; in HDR (transfer 1) P2.w is the
+// picture's white, measured. Undone as a filmic curve on each channel (replay_plus_lens.h DisplayMapping), bright
+// saturated colours came out pale (sky 137,166,239 for the video's 69,140,242, 2026-11-20): the game's mapping mixes
+// the channels. It is measured now, as a table (dm_shown).
 float3 srgb_to_linear(float3 c)
 {
     c = max(c, 0.0);
@@ -102,14 +106,45 @@ float3 dm_slope(float3 x)
     float w = max(P21.x, 0.05);
     return P20.y + (P20.z - P20.y) / (1.0 + exp2(-(x - P20.w) / w));
 }
-// The picture's value -> the screen's linear light (1 its white).
+float dm_curve(float x)
+{
+    return 1.0 / (1.0 + exp2(-dm_t(float3(x, x, x)).x));
+}
+// The curve is per channel; the game's mapping is not (it lifts the other channels of a bright, saturated colour
+// toward white, and pushes them down in the mids). So the screen's colour for a picture value is read from what it
+// was measured to be (replay_plus_display_table.h): x = log2 of the value (at the scale it goes in at) -> the
+// screen's linear light (1 its white). Below the table (1/64) a channel's own part goes on down as the curve's
+// does, at the slope of the table's first half stop; what the others lift it by stays.
+float3 dm_shown(float3 x)
+{
+    float3 f = clamp((x + 6.0) * 2.0, 0.0, 26.0);
+    float3 shown = srgb_to_linear(display_forward.SampleLevel(linear_clamp, (f + 0.5) / 27.0, 0).rgb);
+    [branch] if (any(x < -6.0))
+    {
+        float at = dm_curve(-6.0);
+        float step = dm_curve(-5.5) - at;
+        [unroll] for (int c = 0; c < 3; ++c)
+        {
+            if (x[c] < -6.0)
+            {
+                float3 g = f;
+                g[c] = 1.0;
+                float up = srgb_to_linear(display_forward.SampleLevel(linear_clamp, (g + 0.5) / 27.0, 0).rgb)[c];
+                shown[c] = max(shown[c] - (up - shown[c]) / step * (at - dm_curve(x[c])), 0.0);
+            }
+        }
+    }
+    return shown;
+}
+// The picture's value -> the screen's linear light.
 float3 dm_decode(float3 p)
 {
-    float3 t = dm_t(log2(max(p, 1e-12)) + P21.y);
-    return p > 0.0 ? 1.0 / (1.0 + exp2(-t)) : 0.0;
+    return dm_shown(log2(max(p, 1e-12)) + P21.y);
 }
-// The screen's linear light -> the picture's value that shows it. The curve lies under both its lines: Newton
-// from the larger of their inverses starts below the root and, the curve being concave, closes in from there.
+// The screen's linear light -> the picture's value that shows it, or the nearest colour the mapping can show (in
+// sRGB). The per-channel curve's answer first (it lies under both its lines: Newton from the larger of their
+// inverses starts below the root and, the curve being concave, closes in from there); that picks the place in the
+// inverse table, and two Gauss-Newton steps on the measured mapping finish it (a step kept only when it comes closer).
 float3 dm_encode(float3 d)
 {
     float3 shown = clamp(d, 1e-7, 0.99995);
@@ -117,6 +152,39 @@ float3 dm_encode(float3 d)
     float3 x = max((t - P20.x) / P20.y, (t - P20.x - (P20.y - P20.z) * P20.w) / P20.z);
     [unroll] for (int i = 0; i < 5; ++i)
         x -= (dm_t(x) - t) / dm_slope(x);
+    float3 f = (clamp(x, -9.0, 7.5) + 9.0) / 16.5 * 32.0;
+    x = display_inverse.SampleLevel(linear_clamp, (f + 0.5) / 33.0, 0).rgb * 32.0 - 16.0;
+    float3 want = linear_to_srgb(max(d, 0.0));
+    float3 now = linear_to_srgb(dm_shown(x));
+    [unroll] for (int k = 0; k < 2; ++k)
+    {
+        float3 e = now - want;
+        float3x3 J; // J[i][j]: what sRGB channel i does as x's channel j moves
+        [unroll] for (int j = 0; j < 3; ++j)
+        {
+            float3 moved = x;
+            moved[j] += 0.05;
+            float3 column = (linear_to_srgb(dm_shown(moved)) - now) / 0.05;
+            J[0][j] = column.x;
+            J[1][j] = column.y;
+            J[2][j] = column.z;
+        }
+        float3x3 A = mul(transpose(J), J) + float3x3(1e-4, 0, 0, 0, 1e-4, 0, 0, 0, 1e-4);
+        float3 b = -mul(transpose(J), e);
+        float det = determinant(A);
+        if (abs(det) > 1e-20)
+        {
+            float3 c0 = A[0], c1 = A[1], c2 = A[2]; // A is symmetric: its rows are its columns
+            float3 delta = float3(dot(b, cross(c1, c2)), dot(c0, cross(b, c2)), dot(c0, cross(c1, b))) / det;
+            float3 next = clamp(x + clamp(delta, -2.0, 2.0), -14.0, 7.0);
+            float3 then = linear_to_srgb(dm_shown(next));
+            if (dot(then - want, then - want) < dot(e, e))
+            {
+                x = next;
+                now = then;
+            }
+        }
+    }
     return d > 0.0 ? exp2(x - P21.y) : 0.0;
 }
 float3 decode(float3 c)
@@ -171,135 +239,10 @@ float3 overlay_colour(float3 v)
     return result;
 }
 
-// ---- the camera light ----------------------------------------------------------------------
-// A light at the camera, pointing where it looks, worked out from the game's depth (reversed: 1 at
-// the near plane, 0 at the far): each pixel's place in front of the camera, a beam with a soft edge, and the
-// light falling off with the square of the distance, to nothing at its reach. The game's picture is already
-// lit (its own shading, smooth and with its materials' detail): the light brightens what it shows by its own
-// colour, and lifts the darkest a little with their own hue, as a lamp does to a scene at night.
-//
-// Which way each surface faces is not taken into it (P21.w 0, as it comes): in the game's depth its meshes are
-// flat triangles, and lit by their facing every triangle showed on its own ("at night it really likes to
-// highlight all the triangles on the meshes with the light on", a player, 2026-11-18); smoothed over a patch of
-// the surface (smooth_facing) a thin thing, a leg, still showed them, and the picture went flat. A light on the
-// camera lights mostly what faces it anyway. `replayplus lightfacing` brings the facing back, to compare.
-float3 view_at(float2 uv)
-{
-    float d = depth.SampleLevel(point_clamp, uv, 0.0).r;
-    float n = P8.w, f = P9.x;
-    float z = n * f / max(d * (f - n) + n, 1e-6);
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    return float3(ndc * P0.zw * z, z);
-}
-// Two rings of eight points about the pixel, P21.z metres out on the surface (and half that): the facing of the
-// patch they span (Newell's method: each fan triangle's normal by its area). Each point counts as fully as it
-// lies near the plane of the pixel's own triangle (fully within about 25 degrees, nothing past 55: not round a
-// corner) and near the pixel (fully within twice the patch's reach, nothing past four times: not on something
-// nearer or further away); and the patch's facing takes over from the triangle's as fully as the points count.
-// All of it eases, nothing switches: a point that came or went at once made the facing jump from one pixel to
-// the next (patches and steps on a shirt, 2026-11-18).
-float3 smooth_facing(float2 uv, float3 p, float3 n0, float3 to_light)
-{
-    // The patch's reach on the screen at the pixel's distance (at most a quarter of the picture's height).
-    float2 reach_uv = P21.z / (2.0 * max(p.z, 0.05) * max(P0.zw, 1e-3));
-    reach_uv *= min(1.0, 0.25 / max(reach_uv.y, 1e-6));
-    float3 sum = 0.0;
-    float weight = 0.0;
-    [unroll] for (int ring = 0; ring < 2; ++ring)
-    {
-        float scale = ring == 0 ? 1.0 : 0.5;
-        float turn = ring == 0 ? 0.0 : 0.39269908;
-        float metres = P21.z * scale;
-        float3 first = 0.0, previous = 0.0;
-        float first_w = 0.0, previous_w = 0.0;
-        [unroll] for (int k = 0; k < 8; ++k)
-        {
-            float a = turn + 0.78539816 * k;
-            float3 v = view_at(uv + float2(cos(a), sin(a)) * reach_uv * scale) - p;
-            float len = max(length(v), 1e-6);
-            float w = saturate((0.82 - abs(dot(v, n0)) / len) / 0.4) * saturate((4.0 * metres - len) / (2.0 * metres));
-            if (k == 0)
-            {
-                first = v;
-                first_w = w;
-            }
-            else
-            {
-                sum += cross(previous, v) * (w * previous_w);
-                weight += w * previous_w;
-            }
-            previous = v;
-            previous_w = w;
-        }
-        sum += cross(previous, first) * (previous_w * first_w);
-        weight += previous_w * first_w;
-    }
-    float3 n = n0;
-    if (dot(sum, sum) > 1e-24)
-    {
-        float3 patch = normalize(sum);
-        if (dot(patch, to_light) < 0.0) patch = -patch;
-        n = normalize(lerp(n0, patch, saturate(weight / 8.0)));
-    }
-    return n;
-}
-// The light's strength at a place in front of the camera: its beam, its reach, the square of the distance.
-float light_at(float3 q)
-{
-    float d = max(length(q), 1e-4);
-    float beam = smoothstep(P7.z, P7.w, q.z / d);
-    float window = saturate(1.0 - pow(d / P7.y, 4.0));
-    return q.z > 0.0 ? P7.x * beam * window * window / max(d * d, 0.25) : 0.0;
-}
-float3 camera_light(float2 uv, float3 c)
-{
-    float3 p = view_at(uv);
-    float2 texel = P9.zw;
-    float3 l = view_at(uv - float2(texel.x, 0.0)), r = view_at(uv + float2(texel.x, 0.0));
-    float3 u = view_at(uv - float2(0.0, texel.y)), b = view_at(uv + float2(0.0, texel.y));
-    // Its strength here as a tent over the pixel and its eight neighbours: the game's depth is not antialiased as its
-    // picture is, and taken per pixel the light's edge round anything nearer than what is behind it came out jagged.
-    float3 lu = view_at(uv + float2(-texel.x, -texel.y)), ru = view_at(uv + float2(texel.x, -texel.y));
-    float3 lb = view_at(uv + float2(-texel.x, texel.y)), rb = view_at(uv + float2(texel.x, texel.y));
-    float e = (4.0 * light_at(p) + 2.0 * (light_at(l) + light_at(r) + light_at(u) + light_at(b)) + light_at(lu) + light_at(ru) + light_at(lb) +
-               light_at(rb)) / 16.0;
-    if (e <= 0.0)
-        return c;
-    if (P21.w > 0.0)
-    {
-        // The surface's facing, when asked for (replayplus lightfacing): smoothed over P21.z metres of it, counting P21.w.
-        float dist = max(length(p), 1e-4);
-        float3 dx = abs(r.z - p.z) < abs(p.z - l.z) ? r - p : p - l;
-        float3 dy = abs(b.z - p.z) < abs(p.z - u.z) ? b - p : p - u;
-        float3 n = normalize(cross(dy, dx));
-        float3 to_light = -p / dist;
-        if (dot(n, to_light) < 0.0) n = -n;
-        if (P21.z > 0.0)
-            n = smooth_facing(uv, p, n, to_light);
-        e *= lerp(1.0, saturate(dot(n, to_light)), saturate(P21.w));
-    }
-    float y = dot(c, float3(0.2126, 0.7152, 0.0722));
-    float3 hue = min(c / max(y, 1e-3), 2.0);
-    // More light on the same surfaces: the picture brightened by it, so its textures keep their contrast. Only what is
-    // very bright already (above 0.5: a lamp, a light dropped in with the object dropper, its glow, a lit sign) takes
-    // less of it, or the light flared other lights ("the camera light also affects lights placed with the object
-    // dropper", 2026-11-18; a cap at 0.25 for everything washed the textures out). And the lift for what is black in
-    // the picture, its own hue at most 0.05, so close up it does not grey the darks.
-    float keep = 1.0 / (1.0 + 4.0 * max(y - 0.5, 0.0));
-    float3 added = c * 4.0 * e * P8.rgb * keep + min(0.02 * e, 0.05) * P8.rgb * hue;
-    // And it rolls off into white as film does instead of clipping: what it adds fills at most the room left below
-    // white, nearing it smoothly. Close up, a calf lit past white clipped in blocks wherever its skin's texture
-    // crossed the clip (2026-11-18).
-    float3 room = max(1.0 - c, 0.0);
-    return c + room * (1.0 - exp(-added / max(room, 1e-4)));
-}
-
 // ---- pass 1: the frame in linear light ------------------------------------------------------
 float4 ps_decode(Interpolated i) : SV_Target
 {
     float3 c = decode(source.Load(int3(int2(i.position.xy), 0)).rgb);
-    if (P7.x > 0.0 && P9.y > 0.5)
-        c = camera_light(i.uv, c);
     return float4(c, 1.0);
 }
 
@@ -568,8 +511,34 @@ float grain_noise(float2 pixel, float size, float seed)
     return (v - 0.5) * (1.0 + 0.7 * saturate(cell - 1.0));
 }
 
+// (Research, test builds: `replayplus dmprobe <set>`, under the game's UI. Known picture values written as they are
+// into the white measurement's blocks (16 of the screen's pixels across, from a twentieth of its width in, along the
+// strips at 32%, 47% and 62% of its height: render.cpp white_strips), so `replayplus white dump` gives the game's
+// display mapping, picture value against screen. Sets 1 to 61: every red, green and blue of 27 levels, 1/64 to 128
+// in half stops (324 a set); 900 to 999: one grey everywhere, 2^((set - 950) / 4).)
+float3 probe_value(float2 pixel)
+{
+    float set = P21.z;
+    float3 result = exp2((set - 950.0) / 4.0);
+    if (set < 899.5)
+    {
+        float screen_w = max(P21.w, 64.0);
+        float u = pixel.x / P2.x * screen_w, v = pixel.y / P2.y;
+        float margin = floor(screen_w / 20.0);
+        float blocks = floor((screen_w - 2.0 * margin) / 16.0);
+        float bx = floor((u - margin) / 16.0);
+        float band = v < 0.395 ? 0.0 : (v < 0.545 ? 1.0 : 2.0);
+        float g = (set - 1.0) * 3.0 * blocks + band * blocks + bx;
+        float3 k = float3(fmod(g, 27.0), fmod(floor(g / 27.0), 27.0), floor(g / 729.0));
+        result = bx >= 0.0 && bx < blocks && g < 19683.0 ? exp2((k - 12.0) * 0.5) : 0.18;
+    }
+    return result;
+}
+
 float4 ps_main(Interpolated i) : SV_Target
 {
+    [branch] if (P21.z > 0.5)
+        return float4(probe_value(i.position.xy), 1.0);
     float va = P1.x;
     float2 win = P1.yz;
     float2 w = (i.uv - 0.5) / win + 0.5;

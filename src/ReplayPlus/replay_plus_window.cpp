@@ -164,6 +164,24 @@ Size monitor_size() noexcept {
     return {static_cast<int>(info.rcMonitor.right - info.rcMonitor.left), static_cast<int>(info.rcMonitor.bottom - info.rcMonitor.top)};
 }
 
+Size monitor_pixels() noexcept {
+    using SetAwareness = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    static const SetAwareness set_awareness = [] {
+        const auto user32 = GetModuleHandleW(L"user32.dll");
+#pragma warning(push)
+#pragma warning(disable : 4191)
+        return user32 ? reinterpret_cast<SetAwareness>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")) : nullptr;
+#pragma warning(pop)
+    }();
+    if (!set_awareness) return monitor_size();
+    // Only this thread, and only for these two calls: what it was is put back at once.
+    const auto was = set_awareness(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (!was) return monitor_size();
+    const auto pixels = monitor_size();
+    set_awareness(was);
+    return pixels;
+}
+
 bool shaped() noexcept { return shape().shaped; }
 void test_backdrop(bool show) noexcept {
     const HWND self = backdrop_window();

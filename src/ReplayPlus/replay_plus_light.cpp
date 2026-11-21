@@ -187,7 +187,7 @@ bool check(std::uintptr_t base) noexcept {
     s.checked = ok ? 1 : -1;
     if (!ok)
         logging::log(logging::Level::warning, logging::Channel::graphics,
-                     "Replay Plus: this game build's light renderer is not the one known ({} differs): the camera light is drawn over the picture instead.",
+                     "Replay Plus: this game build's light renderer is not the one known ({} differs): there is no camera light.",
                      why);
     return ok;
 }
@@ -389,7 +389,7 @@ void watch_makes(std::uintptr_t base) noexcept {
 std::string status() {
     auto& s = state();
     std::lock_guard lock(s.mutex);
-    if (s.checked < 0) return "the game's light renderer is not the one known (drawn over the picture)";
+    if (s.checked < 0) return "the game's light renderer is not the one known (no camera light)";
     if (!s.id) return s.last.empty() ? std::string("none") : s.last;
     return std::format("a light of the game's (0x{:08x}), {:.0f}, {:.1f} m, beam {:.0f} / {:.0f} deg{}", s.id, s.made.lumens, s.made.range, s.made.outer,
                        s.made.inner, s.made.shadows ? ", shadows" : "");

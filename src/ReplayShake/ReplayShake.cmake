@@ -162,6 +162,7 @@ inline constexpr std::uintptr_t screen_in_menu = @replay_shake_screen_in_menu@, 
 
 # The shake, its timeline and its commands: no game access, shared by the runtime and the menu.
 add_library(dingosdk_replay_shake_model STATIC
+    Extension/ReplayShake/replay_shake_clock.cpp
     Extension/ReplayShake/replay_shake_frames.cpp
     Extension/ReplayShake/replay_shake_model.cpp
     Extension/ReplayShake/replay_shake_settings.cpp)

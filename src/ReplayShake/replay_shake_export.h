@@ -31,6 +31,22 @@ Size setup_of_this_export() noexcept;
 // A video being exported, or set up to be (its H.264 setup in the last few seconds): the game's render size and
 // window are not to change under it.
 bool busy() noexcept;
+// The replay's time as the game plays its camera keyframes: each frame the replay's camera plays its keyframe segment at
+// the replay's time (Skate.exe's segment_eval, Engine/Game/Build/<build>/replay_keyframes.h, hooked here), and that time
+// goes as the keys' Playback Speed has it, slow motion and all, in exports too. Only with keyframes: with none, nothing
+// is played. start_played_clock hooks it (false where it is not the one known); played() is the last time played.
+bool start_played_clock(std::uintptr_t base) noexcept;
+struct Played {
+    double time{};
+    std::uint64_t at{};    // when (GetTickCount64; 0: never)
+    std::uint64_t calls{}; // every play so far
+    int streak{};          // the plays in a row that ran on (next_streak)
+    std::uint32_t thread{};
+    bool hooked{};
+};
+Played played() noexcept;
+// Research: every play said in the log for this long.
+void trace_played(std::uint32_t milliseconds) noexcept;
 // How far into the replay the export has got: its frames encoded so far, at its frame rate (60 until the encoder's
 // is known); 0 while none runs. While a video is exported the replay's clock (replay_activity's playhead) stands where
 // the export began, so its time is that plus this (2026-11-17: focus and shake keys did not play through videos).
@@ -62,4 +78,11 @@ void set_timeline(Timeline timeline) noexcept;
 double replay_time(double clock) noexcept;
 // The time on the replay's clock a share (0..1) of the whole replay is at, through its chunks (there must be some).
 double clock_at_share(const Timeline& timeline, double share) noexcept;
+// The run of the camera keys' plays so far, one more: each no earlier than the one before and less than half a second on
+// (as an export's frames are, slow motion or not), else a new run (0). An export's first play can be off its clip (11.3 s
+// into a clip that began at 45.1, 2026-11-20), and after the export the editor's playhead comes back: neither is a run.
+int next_streak(int streak, double last, double now) noexcept;
+// The time an export has reached by its frames alone, `along` seconds of them in: from the trim's start, through the
+// chunks; with no timeline known, on from the editor's clock.
+double time_by_frames(const Timeline& timeline, double clock, double along) noexcept;
 } // namespace dingosdk::replay_shake::export_frames

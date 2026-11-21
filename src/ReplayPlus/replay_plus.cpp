@@ -6,6 +6,7 @@
 #include "replay_plus_native.h"
 #include "replay_plus_settings.h"
 #include "replay_plus_window.h"
+#include "Extension/Localization/text_overrides.h"
 #include "Extension/ReplayKeyframes/replay_keyframes.h"
 #include "Extension/ReplayShake/game_view_hook.h"
 #include "Extension/ReplayShake/replay_shake.h"
@@ -153,9 +154,10 @@ struct State {
     float fov_auto{150};
     std::uint64_t fov_auto_revision{}, fov_auto_hood{};
     float fov_auto_aspect{};
-    // The replay editor's picture shape: the game's render size and window as Replay Plus holds them, and
-    // what is wrong when it cannot (the game not in borderless full screen).
-    window::Size shape;
+    // The replay editor's picture shape: the game's render size (pixels) and its window (as the game's threads see
+    // the screen: the same on an unscaled screen, link::shape_pixels) as Replay Plus holds them, and what is wrong when
+    // it cannot (the game not in borderless full screen).
+    window::Size shape, shape_window;
     std::string shape_problem;
     bool resolution_checked{};
     // Sharp middle's render scale (0: none), and since when a lower one would do.
@@ -245,6 +247,17 @@ struct State {
     bool exporting_seen{};
     fs::file_time_type export_began{};
     std::atomic<bool> picking_folder{};
+    // The export watch (watch_exports): each step of an export said in the log as it comes, and where one stops.
+    struct ExportWatch {
+        bool filming{};                       // the game is drawing a video's frames (link::video_frames_seen)
+        std::uint64_t since{}, last_drawn{};  // link::now_ms
+        std::uint64_t session{}, frames{};    // export_frames' session and frames as it began: its encoder taking a frame moves one
+        std::uint64_t encoded_at{}, progress_at{};
+        bool said_stuck{};
+        std::uint32_t width{}, height{};
+        fs::file_time_type began{};           // on the files' clock
+    } watch;
+    bool title_set{}; // the replay editor's title is Replay Plus's (keep_title)
     // Exports.
     std::atomic<bool> export_on{};
     std::vector<std::uint8_t> export_scratch;
@@ -701,6 +714,113 @@ void follow_exports(State& s) {
     if (exporting && !s.exporting_seen) s.export_began = fs::file_time_type::clock::now() - std::chrono::seconds(5);
     if (!exporting && s.exporting_seen && !s.settings.video_folder.empty()) move_videos(s, utf8_path(s.settings.video_folder), s.export_began);
     s.exporting_seen = exporting;
+}
+// The newest video written since `since` in the game's Videos folders or the player's own (where follow_exports moves
+// it): its name and size, for the log; empty when there is none.
+std::string newest_video(const State& s, fs::file_time_type since) {
+    std::error_code error;
+    auto folders = game_video_folders();
+    if (!s.settings.video_folder.empty()) folders.push_back(utf8_path(s.settings.video_folder));
+    fs::path best;
+    fs::file_time_type best_at{};
+    std::uintmax_t bytes{};
+    for (const auto& folder : folders) {
+        for (fs::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
+            if (!it->is_regular_file(error)) continue;
+            const auto at = it->last_write_time(error);
+            if (error || at < since || (!best.empty() && at <= best_at)) continue;
+            best = it->path();
+            best_at = at;
+            bytes = it->file_size(error);
+        }
+        error.clear();
+    }
+    return best.empty() ? std::string() : std::format("{} ({:.1f} MB)", path_text(best), static_cast<double>(bytes) / 1048576.0);
+}
+// Every tick: an export's steps said in the log as they come, and where one stops (a player's exports never got going,
+// three times, and the log said nothing of where, 2026-11-20). The game filming a video (its video frames drawn, each
+// frame: link::video_frames_seen), its encoder taking the first frame and how soon, how fast it goes, and the export
+// done (its frames, its seconds, the video written); or where it stopped: filming 4 s with no frame encoded, or
+// filming over before any was. (Ten video frames drawn first: a photo copies one or two the same way.)
+void watch_exports(State& s) {
+    auto& w = s.watch;
+    const auto now = link::now_ms();
+    std::uint64_t drawn = 0;
+    std::uint32_t width = 0, height = 0;
+    for (const auto& v : link::video_frames_seen())
+        if (v.times >= (w.filming ? 1u : 10u) && v.last_ms > drawn) drawn = v.last_ms, width = v.width, height = v.height;
+    const bool drawing = drawn && now >= drawn && now - drawn < 1000;
+    const auto running = replay_shake::export_frames::capture();
+    if (!w.filming) {
+        if (!drawing) return;
+        w = {};
+        w.filming = true;
+        w.since = now;
+        w.last_drawn = drawn;
+        w.session = running.session;
+        w.frames = running.frames;
+        w.width = width;
+        w.height = height;
+        w.began = fs::file_time_type::clock::now() - std::chrono::seconds(2);
+#if defined(REPLAY_PLUS_TEST_INBOX)
+        // (Test builds: the camera keys' plays in an export's first seconds, to the log.)
+        replay_shake::export_frames::trace_played(8000);
+#endif
+        // An MP4's H.264 setup runs just before its first frame is drawn; a WebM has none.
+        const auto setup_at = replay_shake::export_frames::configured_ms();
+        const auto setup = replay_shake::export_frames::size();
+        const bool mp4 = setup_at && GetTickCount64() - setup_at < 10000;
+        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus export: the game is filming a video, its frames {}x{}{}.", width,
+                     height, mp4 ? std::format(" (an MP4: its H.264 setup ran for {}x{} at {:.0f} fps)", setup.width, setup.height, setup.fps)
+                                 : std::string(" (no H.264 setup lately: a WebM)"));
+        return;
+    }
+    if (drawing) w.last_drawn = drawn;
+    // Its encoder took this export's first frame: a new session, or (one right after another export) more frames.
+    const bool encoding = running.session != w.session || (running.running && running.frames > w.frames);
+    if (encoding && !w.encoded_at) {
+        w.encoded_at = w.progress_at = now;
+        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus export: its encoder is taking the frames ({} ms after the filming was seen).",
+                     now - w.since);
+    }
+    // (Not once its encoder has taken frames: when it finishes, `encoding` goes false while the game still shows the
+    // last frames, and this said "stuck" after every export, 2026-11-20.)
+    if (!w.encoded_at && !encoding && !w.said_stuck && now - w.since > 4000) {
+        w.said_stuck = true;
+        logging::log(logging::Level::warning, logging::Channel::graphics,
+                     "Replay Plus export: the game has been filming for 4 s ({}x{} frames) and its encoder has taken no frame yet: the export is stuck "
+                     "before it encodes.",
+                     w.width, w.height);
+    }
+    if (encoding && running.running && now - w.progress_at >= 10000) {
+        w.progress_at = now;
+        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus export: {} frames encoded so far ({:.1f} a second).", running.frames,
+                     static_cast<double>(running.frames) * 1000.0 / static_cast<double>(std::max<std::uint64_t>(now - w.encoded_at, 1)));
+    }
+    if (drawing || now - w.last_drawn <= 3000 || running.running) return;
+    // Filming is over.
+    if (w.encoded_at) {
+        const double seconds = static_cast<double>(w.last_drawn - w.encoded_at) / 1000.0;
+        const auto video = newest_video(s, w.began);
+        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus export: done: {} frames encoded in {:.1f} s ({:.1f} a second); {}.",
+                     running.frames, seconds, seconds > 0 ? static_cast<double>(running.frames) / seconds : 0.0,
+                     video.empty() ? "no new video found in the Videos folder" : "the video: " + video);
+    } else {
+        logging::log(logging::Level::warning, logging::Channel::graphics,
+                     "Replay Plus export: the game stopped filming after {:.1f} s and its encoder never took a frame: no video was made.",
+                     static_cast<double>(w.last_drawn - w.since) / 1000.0);
+    }
+    w = {};
+}
+// The replay editor's title is Replay Plus's: the game's "INSTANT REPLAY" (its text ID_REPLAY_INSTANTREPLAY, found in a
+// dump of the editor's UI, 2026-11-20), through ReSkate's text overrides as a plugin's text goes in, once. (Left so
+// while Replay Plus is switched off too: the store has no removal, and putting the game's words back would mean
+// English ones over every other language's.)
+void keep_title(State& s) {
+    if (s.title_set) return;
+    s.title_set = true;
+    if (const auto why = text_overrides::set("Replay Plus", {{"ID_REPLAY_INSTANTREPLAY", "REPLAY PLUS"}}); !why.empty())
+        logging::log(logging::Level::info, logging::Channel::graphics, "Replay Plus: the replay editor's title stays the game's: {}.", why);
 }
 // The Windows folder picker (its own thread, with its own message loop); the folder chosen comes back to the game
 // thread as a console line. The game's window is given the front again after.
@@ -1199,12 +1319,33 @@ void keep_memory_guard(State& s) {
         m.lowered = false;
         return;
     }
+    // The PC's own memory left (its commit limit: RAM and page file), which the game spills into past the card's: with
+    // too little, the game's own scale (link::commit_room).
+    MEMORYSTATUSEX pc{};
+    pc.dwLength = sizeof(pc);
+    const std::uint64_t commit_left = GlobalMemoryStatusEx(&pc) ? pc.ullAvailPageFile : 0;
+    const auto room = link::commit_room(commit_left);
+    if (room == link::CommitRoom::none) {
+        if (m.asked != 0) {
+            m.asked = 0;
+            m.lowered = true;
+            m.changed_at = now;
+            m.raise_since = 0;
+            m.learning = false;
+            ++s.revision;
+            logging::log(logging::Level::info, logging::Channel::graphics,
+                         "Replay Plus: render scale back to the game's own: the PC has only {:.1f} GB of its memory left (RAM and page file), "
+                         "which the game's larger targets would spill into.",
+                         static_cast<double>(commit_left) / 1073741824.0);
+        }
+        return;
+    }
     const auto memory = video_memory(m);
     const double base = static_cast<double>(sizes.screen_width) * sizes.screen_height; // the picture's pixels at 100%
     if (!memory) {
-        // The driver tells no budget: as wanted.
+        // The driver tells no budget: as wanted (not raised while the PC's memory is short).
         m.limit = 0;
-        set(wanted, 0, 0, "the card's memory not known");
+        if (room == link::CommitRoom::plenty || wanted < m.asked) set(wanted, 0, 0, "the card's memory not known");
         return;
     }
     m.usage = memory->first;
@@ -1236,14 +1377,19 @@ void keep_memory_guard(State& s) {
         const double square = now_scale * now_scale + (budget - margin - usage) / (m.bytes_per_pixel * base);
         return square > 1.0 ? std::max(1.0f, static_cast<float>(std::floor(std::sqrt(square) * 4.0 + 1e-6) / 4.0)) : 1.0f;
     };
-    // The margin: 1.5 GB or 12% of the budget. Leaving the editor (Exit Replay) the game itself takes 1 to
-    // 2.5 GB more for a moment, more at a higher scale (measured at 150%, 2026-11-17).
-    const double margin = std::max(1.5 * 1073741824.0, 0.12 * budget);
-    const float down = std::min(wanted, most_for(margin)), up = std::min(wanted, most_for(margin + 0.05 * budget));
-    m.limit = most_for(margin);
+    // The margin: 1.5 GB or 12% of the budget, on cards of 12.5 GB or less 2.5 GB or a fifth (link::memory_margin).
+    // Leaving the editor (Exit Replay) the game itself takes 1 to 2.5 GB more for a moment, more at a higher scale
+    // (measured at 150%, 2026-11-17), and 4.5 GB on a 12 GB laptop card putting back the 4:3 window (2026-11-19). And
+    // no higher than the card's ceiling (link::scale_ceiling: 150% on such a card).
+    const double margin = link::memory_margin(m.budget);
+    const float ceiling = link::scale_ceiling(m.budget);
+    const float capped = std::min(wanted, ceiling);
+    const float down = std::min(capped, most_for(margin)), up = std::min(capped, most_for(margin + 0.05 * budget));
+    m.limit = std::min(ceiling, most_for(margin));
     const double pixels_now = base * now_scale * now_scale;
     if (m.asked == 0) {
-        set(down, m.usage, pixels_now, "first");
+        // (Not raised while the PC's memory is short, nor again in a visit it was lowered in.)
+        if (room == link::CommitRoom::plenty && !m.lowered) set(down, m.usage, pixels_now, "first");
         return;
     }
     if (down < m.asked) {
@@ -1251,7 +1397,7 @@ void keep_memory_guard(State& s) {
         m.lowered = true;
         return;
     }
-    if (up > m.asked && !m.lowered) {
+    if (up > m.asked && !m.lowered && room == link::CommitRoom::plenty) {
         // Higher only once it has done for three seconds: each change has the game remake its targets. And not
         // again once lowered in this visit: the budget Windows gives the game moves with what else is on the screen,
         // and the game was raised and lowered by turns every few seconds, remaking its targets each time, a flash
@@ -1270,7 +1416,13 @@ void keep_memory_guard(State& s) {
 // settings while the shape is held, so a game that closes meanwhile (or stops) gets its own back when
 // Replay Plus next starts.
 fs::path resolution_record(const State& s) { return s.folder / L"game resolution while shaped.txt"; }
-window::Size wanted_shape(State& s) {
+// The picture shape wanted now: its window, as the game's threads see the screen, and the picture's size in pixels
+// (the two differ only on a screen Windows scales: link::shape_pixels). Both 0 x 0: none.
+struct Shaped {
+    window::Size window, pixels;
+    int scale_percent{100}; // the screen's scaling, as worked out from its two sizes
+};
+Shaped wanted_shape(State& s) {
     s.shape_problem.clear();
     const auto& v = s.settings;
     // Only once the replay editor's own timeline shows (its UI read): the camera it goes by also shows for
@@ -1283,24 +1435,36 @@ window::Size wanted_shape(State& s) {
         s.shape_problem = "The picture shape needs the game in borderless full screen (its own display setting).";
         return {};
     }
-    const auto monitor = window::monitor_size();
-    return window::fitted(aspect_ratios[static_cast<std::size_t>(v.replay_aspect)], monitor);
+    const auto seen = window::monitor_size(), pixels = window::monitor_pixels();
+    Shaped shaped;
+    shaped.window = window::fitted(aspect_ratios[static_cast<std::size_t>(v.replay_aspect)], seen);
+    const auto in_pixels = link::shape_pixels({shaped.window.width, shaped.window.height}, {seen.width, seen.height}, {pixels.width, pixels.height});
+    shaped.pixels = {in_pixels.width, in_pixels.height};
+    if (seen.height > 0 && pixels.height > 0) shaped.scale_percent = static_cast<int>(std::lround(100.0 * pixels.height / seen.height));
+    return shaped;
 }
 void keep_shape(State& s) {
     // (Not while a video is exported: the game would remake its swap chain under the encoder.)
     if (replay_shake::export_frames::busy()) return;
-    const auto shape = wanted_shape(s);
+    const auto shaped = wanted_shape(s);
+    const auto& shape = shaped.pixels;
     std::error_code error;
     const auto record = resolution_record(s);
     if (shape.width > 0 && !fs::exists(record, error)) {
         const auto w = named_setting_value("RenderDevice.FullscreenWidth"), h = named_setting_value("RenderDevice.FullscreenHeight");
         if (w && h) write_text(record, *w + " " + *h + "\n");
     }
-    if (!(shape == s.shape)) {
+    if (!(shape == s.shape) || !(shaped.window == s.shape_window)) {
         s.shape = shape;
+        s.shape_window = shaped.window;
         ++s.revision;
     }
-    if (const auto said = window::keep(shape); !said.empty()) logging::log(logging::Level::info, logging::Channel::graphics, "{}", said);
+    if (auto said = window::keep(shaped.window); !said.empty()) {
+        if (shaped.window.width > 0 && !(shaped.pixels == shaped.window))
+            said += std::format(" Its picture is {}x{} pixels: Windows scales this screen {}%.", shaped.pixels.width, shaped.pixels.height,
+                                shaped.scale_percent);
+        logging::log(logging::Level::info, logging::Channel::graphics, "{}", said);
+    }
     // Given back (the settings let go by hold_settings): the record goes.
     if (shape.width == 0 && !window::shaped() && !s.held.contains("RenderDevice.FullscreenWidth")) fs::remove(record, error);
 }
@@ -2424,7 +2588,7 @@ void probe_skater(State& s); // (research, below)
 // The camera light as a light of the game's (replay_plus_light.h): on the replay camera (a little above its lens, as a
 // light on a camera sits), pointing where it looks, as bright, wide and warm as the LIGHT tab says. Only in the replay
 // editor (exports too), and while the camera's pose is fresh; else taken away. When the game's light renderer is not
-// the one known, the light is drawn over the picture instead (link::game_light stays false).
+// the one known there is no light (it was drawn over the picture then, until 1.3.2: that light is gone).
 void keep_light(State& s) {
     const auto& v = s.settings;
     light::Wanted w;
@@ -2445,7 +2609,7 @@ void keep_light(State& s) {
         s.light_on_here = at.on;
         ++s.revision;
     }
-    w.on = where && v.enabled && at.on && v.light_real && at.power > 0 && fresh;
+    w.on = where && v.enabled && at.on && at.power > 0 && fresh;
     if (w.on) {
         std::array<float, 16> c{};
         for (std::size_t i = 0; i < c.size(); ++i) c[i] = s.camera[i].load(std::memory_order_relaxed);
@@ -2475,8 +2639,6 @@ void keep_light(State& s) {
         s.game_light_made = made;
         ++s.revision;
     }
-    link::light_on_now().store(at.on && at.power > 0, std::memory_order_release);
-    link::game_light().store(made, std::memory_order_release);
 }
 void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noexcept {
     auto& s = state();
@@ -2531,6 +2693,8 @@ void tick(std::uintptr_t base, std::uint32_t client_state, bool editor_open) noe
         }
         keep_camera_keys(s);
         follow_exports(s);
+        watch_exports(s);
+        keep_title(s);
         keep_fov_auto(s);
         if (!s.texture_pool_checked) {
             s.texture_pool_checked = true;
@@ -2732,7 +2896,7 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
             return "replayplus status | on | off | set <key> <value> | get <key> | step <key> <n> | reset [all|tab|key] | list [tab] | "
                    "panel [open|close] | preset list|load|save|new|rename|export|delete|open | focus list|key|delete|clear | shake list|key|clear | "
                    "light list|key|off|switch|delete|clear | bind <0x..>|default | shot <name> [clean] | probe | white [auto|<value>] | "
-                   "lightfacing [none|smooth|triangles] | gamelight [lumens <at 100%>] [above <m>]";
+                   "gamelight [lumens <at 100%>] [above <m>]";
         }
         if (name == "status") {
             const auto report = link::render_report();
@@ -2811,32 +2975,6 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
             return std::format("Camera light (real): axes {}, {:.2f} m above the lens, {:.0f} lm at 100%; {}.", s.light_axes, s.light_above, s.light_lumens,
                                light::status());
         }
-        if (name == "lightfacing") {
-            // The camera light's facing: not taken into it (none, as it comes), smoothed over 25 cm counting 80%
-            // (smooth, as tried), each triangle's own (triangles, as 1.1 drew it), or values of one's own.
-            const auto what = words.empty() ? std::string() : lower(words[0]);
-            if (what == "none" || what == "off") {
-                link::light_facing_metres().store(link::light_facing_metres_default);
-                link::light_facing_weight().store(link::light_facing_weight_default);
-            } else if (what == "smooth") {
-                link::light_facing_metres().store(0.25f);
-                link::light_facing_weight().store(0.8f);
-            } else if (what == "triangles") {
-                link::light_facing_metres().store(0.0f);
-                link::light_facing_weight().store(1.0f);
-            } else if (!what.empty()) {
-                const float metres = std::strtof(what.c_str(), nullptr);
-                const float weight = words.size() > 1 ? std::strtof(words[1].c_str(), nullptr) : link::light_facing_weight().load();
-                if (!(metres >= 0.0f && metres <= 2.0f) || !(weight >= 0.0f && weight <= 1.0f))
-                    return "lightfacing [none | smooth | triangles | <metres 0-2> [<how much it counts 0-1>]]";
-                link::light_facing_metres().store(metres);
-                link::light_facing_weight().store(weight);
-            }
-            const float metres = link::light_facing_metres().load(), weight = link::light_facing_weight().load();
-            if (weight <= 0.0f) return "The camera light's facing is not taken into it (as it comes): it lights what is in its beam by its distance alone.";
-            return metres > 0.0f ? std::format("The camera light's facing: smoothed over {:.0f} cm of the surface, counting {:.0f}%.", metres * 100, weight * 100)
-                                 : std::format("The camera light's facing: each triangle's own, counting {:.0f}%.", weight * 100);
-        }
         if (name == "white") {
             // The white of the game's picture under its UI (the editor's picture is drawn into it), measured from the
             // screen; `white <value>` fixes it instead (to compare), `white auto` measures again.
@@ -2881,10 +3019,12 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
         }
         if (name == "native") return native_verb(s, words);
 #if defined(REPLAY_PLUS_TEST_INBOX)
-        if (name == "exportdepth") {
-            if (!words.empty()) link::export_depth_latest().store(lower(words[0]) == "latest");
-            return link::export_depth_latest().load() ? "Exported frames are lit from the latest depth (the old way)."
-                                                      : "Exported frames are lit from the depth of the frame each was drawn in.";
+        if (name == "dmprobe") {
+            // Research: known picture values in the white measurement's blocks (replay_plus.hlsl probe_value), to
+            // measure the game's display mapping with `white dump`. Set 1 and on; off.
+            const int set = words.empty() || lower(words[0]) == "off" ? 0 : std::clamp(std::atoi(words[0].c_str()), 0, 1000);
+            link::display_probe().store(set);
+            return set ? std::format("The probe's set {} goes under the game's UI.", set) : std::string("The probe is off.");
         }
         if (name == "window") return window_verb(words);
         if (name == "skaterprobe") {
@@ -2895,6 +3035,65 @@ std::string run_command(std::string_view verb, const std::vector<std::string>& w
         }
         if (name == "gamekeys") {
             const auto text = game_keys_text(s.base, !words.empty() && lower(words[0]) == "values");
+            logging::write(logging::Level::info, logging::Channel::graphics, text);
+            return text;
+        }
+        if (name == "playedtrace") {
+            // Research: every play of the camera's keyframes (the replay's time) to the log for some seconds.
+            const int seconds = words.empty() ? 5 : std::clamp(std::atoi(words[0].c_str()), 1, 120);
+            replay_shake::export_frames::trace_played(static_cast<std::uint32_t>(seconds) * 1000);
+            const auto p = replay_shake::export_frames::played();
+            return std::format("Each play of the camera keys goes to the log for {} s (hooked {}, {} plays so far, the last {:.4f}, {} ms ago).", seconds,
+                               p.hooked, p.calls, p.time, p.at ? GetTickCount64() - p.at : 0);
+        }
+        if (name == "testlight") {
+            // Research: testlight <clock on> [<clock off>]: light keys at those times on the replay's clock (off a second
+            // before, on at the first, off at the second), the light at its brightest, wide and far, to see where they land.
+            if (words.empty()) return "testlight <clock on> [<clock off>]";
+            const double on = std::atof(words[0].c_str()), off = words.size() > 1 ? std::atof(words[1].c_str()) : 0.0;
+            s.settings.light_keys.clear();
+            const LightAt dark{false, 8.0f, 50.0f, 120.0f, 0.0f}, lit{true, 8.0f, 50.0f, 120.0f, 0.0f};
+            set_light_key(s.settings, on - 1.0, dark);
+            set_light_key(s.settings, on, lit);
+            if (off > on) set_light_key(s.settings, off, dark);
+            s.settings.light = true;
+            s.settings.light_keyed = true;
+            changed(s);
+            return std::format("Light keys: off at {:.3f}, on at {:.3f}{} ({} keys).", on - 1.0, on, off > on ? std::format(", off at {:.3f}", off) : "",
+                               s.settings.light_keys.size());
+        }
+        if (name == "slowkeys") {
+            // Research: slowkeys <speed> [from] [gap]: three camera keys (Orbit, the body) into the editor's first session, at the
+            // editor's start + from (1x), + from + gap (<speed>) and + from + 3 gaps (1x).
+            const auto manager = keyframe_manager(s);
+            std::vector<CameraKey> keys;
+            if (!manager || !read_camera_keys(manager, keys)) return "No keyframe session (open Advanced Edit first).";
+            const auto anchor = manager + kf::manager_sessions;
+            const auto first = peek_pointer(anchor + 8);
+            std::int32_t session{};
+            if (!first || first == anchor || !memory::peek(first + 0x20, session)) return "No keyframe session (open Advanced Edit first).";
+            const float speed = words.empty() ? 0.25f : static_cast<float>(std::clamp(std::atof(words[0].c_str()), 0.05, 4.0));
+            const double from = words.size() > 1 ? std::atof(words[1].c_str()) : 0.5, gap = words.size() > 2 ? std::atof(words[2].c_str()) : 1.0;
+            double start{}, lands{};
+            const auto at = s.base + key_time.rva;
+            if (!call_key_time(at, manager, -1.0e7, start)) return "The editor's range is not up yet.";
+            const auto add = s.base + add_framing_key.rva;
+            std::string made;
+            const double times[3]{start + from, start + from + gap, start + from + 3 * gap};
+            const float speeds[3]{1.0f, speed, 1.0f};
+            for (int i = 0; i < 3; ++i) {
+                const bool ok = call_add(add, manager, session, times[i], 0, 65.0f, speeds[i]) && call_key_time(at, manager, times[i], lands);
+                made += std::format("{}{:.3f} at {:.2f}x{}", i ? ", " : "", lands, speeds[i], ok ? "" : " (failed)");
+            }
+            (void)call_rebuild(s.base + kf::session_rebuild.rva, manager, session);
+            (void)read_camera_keys(manager, keys);
+            std::string now;
+            for (const auto& k : keys) {
+                float v{};
+                std::memcpy(&v, k.value.data() + value_speed, sizeof(v));
+                now += std::format(" [{} {:.3f} {:.2f}x]", k.session, k.time, v);
+            }
+            const auto text = std::format("Session {}: keys {}; the editor starts at {:.3f}. Its keys now:{}", session, made, start, now);
             logging::write(logging::Level::info, logging::Channel::graphics, text);
             return text;
         }

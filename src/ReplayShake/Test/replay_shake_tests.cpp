@@ -1,5 +1,6 @@
 // Replay Shake's shake, timeline and commands, with no game: the noise, how keyframes blend, how a
 // shake moves a camera, and what each `replayshake` verb does to the settings.
+#include "Extension/ReplayShake/replay_shake_export.h"
 #include "Extension/ReplayShake/replay_shake_frames.h"
 #include "Extension/ReplayShake/replay_shake_model.h"
 #include "Extension/ReplayShake/replay_shake_settings.h"
@@ -434,7 +435,59 @@ bool all_same(const std::vector<Matrix>& cameras) {
     return true;
 }
 
-void frame_tests() {
+// The export's clock (replay_shake_export.h): the run of the camera keys' plays an export is timed by, and the time by
+// its frames alone where they play none.
+void clock_tests() {
+    namespace ef = export_frames;
+    // The plays of a 2026-11-20 export: an odd first one (11.33), then the clip from 45.112 at 1x, then a quarter speed.
+    int run = 0;
+    double last = 46.6159; // the editor's, before
+    const double plays[]{11.32863, 45.11196, 45.12863, 45.14529, 45.16196, 45.16613, 45.17029};
+    std::vector<int> runs;
+    for (const double p : plays) {
+        run = ef::next_streak(run, last, p);
+        last = p;
+        runs.push_back(run);
+    }
+    check(runs == std::vector<int>{0, 0, 1, 2, 3, 4, 5}, "the odd first play and the jump to the clip start new runs; 1x and a quarter speed run on");
+    check(ef::next_streak(7, 53.77863, 53.77863) == 8, "held still (paused, or the clip's end) runs on");
+    check(ef::next_streak(7, 53.77863, 46.74113) == 0, "back to the editor's playhead after the export: a new run");
+    check(ef::next_streak(7, 30.0, 31.0) == 0, "a jump of a second (the next chunk): a new run");
+    check(ef::next_streak(7, 30.0, std::nan("")) == 0 && ef::next_streak(7, std::nan(""), 30.0) == 0, "not a time: a new run");
+    check(ef::next_streak(1000000, 1.0, 1.01) == 1000000, "a long run stays counted");
+    // By the frames: one stretch, as the 2026-11-20 test had it (the editor showing the last 8.68 s from 45.112).
+    ef::Timeline one;
+    one.known = true;
+    one.start = 45.112;
+    one.length = 8.68;
+    one.bar_from = one.trim_from = 0.7774f;
+    one.bar_to = one.trim_to = 1.0f;
+    check(std::abs(ef::time_by_frames(one, 46.758, 0.0) - 45.112) < 1e-3 && std::abs(ef::time_by_frames(one, 46.758, 2.5) - 47.612) < 1e-3,
+          "by the frames: from the clip's start at 1x");
+    // Trimmed inside what the timeline shows: from the trim's start.
+    ef::Timeline trimmed = one;
+    trimmed.start = 100.0;
+    trimmed.length = 10.0;
+    trimmed.bar_from = 0.0f;
+    trimmed.bar_to = 1.0f;
+    trimmed.trim_from = 0.25f;
+    trimmed.trim_to = 0.75f;
+    check(std::abs(ef::time_by_frames(trimmed, 0.0, 1.0) - 103.5) < 1e-4, "by the frames: from the trim's start");
+    // Chunks: footage 10..14 and 20..26 filling the shares 0..0.4 and 0.4..1, trimmed from 0.2.
+    ef::Timeline chunked;
+    chunked.known = true;
+    chunked.start = 10.0;
+    chunked.length = 10.0;
+    chunked.chunks = {{10.0, 14.0, 0.0f, 0.4f}, {20.0, 26.0, 0.4f, 1.0f}};
+    chunked.trim_from = 0.2f;
+    chunked.trim_to = 0.7f;
+    check(std::abs(ef::clock_at_share(chunked, 0.2) - 12.0) < 1e-4 && std::abs(ef::clock_at_share(chunked, 0.7) - 23.0) < 1e-4,
+          "shares through the chunks");
+    check(std::abs(ef::time_by_frames(chunked, 0.0, 1.0) - 13.0) < 1e-4 && std::abs(ef::time_by_frames(chunked, 0.0, 3.0) - 21.0) < 1e-4,
+          "by the frames: on through the chunks");
+    const ef::Timeline unknown;
+    check(std::abs(ef::time_by_frames(unknown, 46.0, 1.5) - 47.5) < 1e-9, "no timeline: on from the editor's clock");
+}void frame_tests() {
     for (const bool moving : {true, false}) {
         const std::string how = moving ? " (moving camera)" : " (still camera)";
         // skate.: one view, set up four times a frame; the game sets it up afresh each frame.
@@ -599,7 +652,7 @@ void frame_tests() {
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> suites{
         {"noise", noise_tests}, {"sample", sample_tests}, {"camera", camera_tests},
-        {"timeline", timeline_tests}, {"commands", command_tests}, {"text", text_tests}, {"frames", frame_tests}};
+        {"timeline", timeline_tests}, {"commands", command_tests}, {"text", text_tests}, {"frames", frame_tests}, {"clock", clock_tests}};
     try {
         for (const auto& [name, suite] : suites) {
             suite();

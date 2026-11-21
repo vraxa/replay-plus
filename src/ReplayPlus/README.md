@@ -100,8 +100,7 @@ if another shortcut already has that button or key, the two swap.
   behind the focus too
 - light: a real light on the camera. the game lights everything with it like its own lights, shadows too, and it
   shows up in exported videos. light keys let you switch it on and off and change how bright, wide and warm it is
-  along the replay (between keys it eases from one to the next). turn real light off for the old one drawn over the
-  picture
+  along the replay (between keys it eases from one to the next)
 - game: the game's own effects held where you put them (motion blur, bloom, lens flares, fog, exposure and so on)
 - video: sharpen middle (crisper textures where the fisheye blows the picture up, costs nothing), sharp middle (renders
   finer so a wide fisheye doesn't go soft in the middle, costs frame rate), the editor's picture shape
@@ -128,7 +127,8 @@ rename, export or delete (delete asks twice and it goes to the recycle bin).
 export puts a copy in the export folder, that's the file you send people. presets people send you go in the import
 folder and get added on their own after a few seconds.
 
-there are two to start from, Fisheye 16-9 and Fisheye 4-3. if you delete them they stay deleted.
+there are three to start from: Fisheye 16-9, Fisheye 4-3, and Plain, which has nothing on (no lens, frame, colour,
+light or shake: the game's own picture). if you delete them they stay deleted.
 
 ## where stuff is
 
@@ -145,11 +145,15 @@ there are two to start from, Fisheye 16-9 and Fisheye 4-3. if you delete them th
 
 - everything shows up in exported videos too (mp4 or webm), not just on screen, keys included, wherever the playhead
   is when you hit export
+- focus, shake and light keys follow slow motion in exports: where a camera keyframe's playback speed slows the clip
+  down they stay on the moment you keyed them
 - the camera light gets weaker the further away things are, like a real one, so a close-up can blow out at the same
   power that looks right from a few metres. turn it down for close-ups, or key it
 - an overlay made for another shape (a square one while you film in 4:3) stays the shape it is, with black past its
   edges
 - for sharper exports turn up Export quality in Insert > SETTINGS > REPLAYS
+- sharp middle goes as high as your graphics card's memory allows: up to 200%, 150% on cards with 12 GB or less, 125%
+  on 8 GB ones, and it holds back while the pc itself is low on memory
 - with your own video folder set, each export gets moved there a second or two after it's done. the game's own
   "exported" popup still says your AppData folder, just ignore that
 - the 4:3 picture shape needs the game in borderless fullscreen (that's the default)

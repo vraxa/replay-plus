@@ -246,12 +246,11 @@ struct Settings {
     // visit starts with none.
     bool keep_keys = true;
 
-    // LIGHT (a light on the camera)
+    // LIGHT (a light on the camera): a real light of the game's (replay_plus_light.h: it lights the world as the game's
+    // own lights do, every surface, with shadows, in videos too). (Until 1.3.2 "light.real" off drew it over the picture
+    // from the game's depth instead, the light before 1.3: gone, and a saved "light.real" is left unread.)
     bool light = false;
-    // A real light of the game's (replay_plus_light.h: it lights the world as the game's own lights do, every surface,
-    // with shadows, in videos too); off, the light is drawn over the picture from the game's depth (as before 1.3).
-    bool light_real = true;
-    bool light_shadows = true; // the real light casts shadows
+    bool light_shadows = true; // it casts shadows
     // Keyed: the light follows its keys along the replay (switched on and off, its brightness, reach, beam and colour,
     // each key set at the playhead). Like the focus keys they belong to the replay in hand, not to presets.
     bool light_keyed = false;
@@ -369,7 +368,7 @@ bool same_preset_file(std::string_view a, std::string_view b);
 Settings apply_preset(const Settings& current, const Preset& preset);
 // The presets Replay Plus writes into its presets folder (replay_plus.cpp set_up_folders: once, and
 // again when they are newer), and the names its earlier versions wrote.
-inline constexpr int built_in_presets_version = 6;
+inline constexpr int built_in_presets_version = 7; // 7: Plain (nothing on) added
 std::vector<Preset> built_in_presets();
 std::vector<std::string> older_built_in_names();
 std::vector<std::string> retired_built_in_names();

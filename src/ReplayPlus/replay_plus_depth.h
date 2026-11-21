@@ -2,15 +2,15 @@
 #include <d3d12.h>
 #include <cstdint>
 
-// The game's depth, copied for Replay Plus's camera light (replay_plus_depth.cpp).
+// The game's depth, copied for Replay Plus's autofocus (replay_plus_depth.cpp).
 namespace dingosdk::replay_plus::depth {
 using BarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 // From ReSkate's ResourceBarrier hook (Extension/UI/Overlay/depth_tap.cpp), on whichever thread the game
 // records on, before the barriers are passed on: the frame's main depth is copied while wanted.
 void barriers(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers, BarrierFn original) noexcept;
-// Render thread, once a presented frame: whether the light wants the depth, and the screen's size
+// Render thread, once a presented frame: whether the autofocus wants the depth, and the screen's size
 // (the main depth has its shape).
-// Present, each frame Replay Plus draws: whether the depth is wanted (the camera light, autofocus), the
+// Present, each frame Replay Plus draws: whether the depth is wanted (the autofocus), the
 // game's picture before its UI (the pass draws under the game's UI), and how much of that UI shows.
 void begin_frame(bool depth_wanted, bool scene_wanted, bool ui_wanted, std::uint32_t screen_width, std::uint32_t screen_height) noexcept;
 struct Copy {
@@ -21,14 +21,6 @@ struct Copy {
     std::uint64_t copies{};
 };
 Copy current() noexcept;
-// Exports: the game draws each frame of a video into a target of its own and reads it back for its
-// encoder five or six frames later, so current() is then that far on from the frame being finished, and
-// the light's edges stood off the characters' (ghosting, 2026-11-17). As the game finishes drawing each
-// video frame, its frame's depth is kept with a few rows of the frame itself; this finds, among those
-// kept, the one whose rows are the encoder's frame's (`pixels`, BGRA8 rows `pitch` bytes apart): the
-// frames the game draws but never encodes (a sixth at the start of some exports) are passed over. In
-// order when none matches; as current() when none was kept (`matched` false).
-Copy for_export(const std::uint8_t* pixels, std::uint32_t width, std::uint32_t height, std::uint32_t pitch, bool* matched = nullptr) noexcept;
 // Replay Plus's own list for exported frames: its barriers are not the game's (its finished frame is the
 // video's format and size too, and names cannot be read back from resources in the game).
 void ignore_list(ID3D12GraphicsCommandList* list) noexcept;

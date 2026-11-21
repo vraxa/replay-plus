@@ -245,20 +245,17 @@ const Field all_fields[]{
      no_choices, no_choices, +[](const Settings& s) { return s.keep_keys ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.keep_keys = v >= 0.5f; },
      nullptr},
     // LIGHT
-    {"light.on", "Camera light", "A light on the camera, lighting what it points at", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
+    {"light.on", "Camera light", "A real light on the camera, in the game's world: it lights every surface it points at as the game's own lights "
+     "do, with shadows, in videos too", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
      +[](const Settings& s) { return s.light ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light = v >= 0.5f; }, nullptr},
-    {"light.real", "Real light", "On: a real light in the game's world, lighting every surface as the game's own lights do, with shadows, in videos "
-     "too. Off: drawn over the picture (the light of earlier versions)", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
-     +[](const Settings& s) { return s.light_real ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light_real = v >= 0.5f; },
-     +[](const Settings& s) { return s.light; }},
     {"light.shadows", "Shadows", "The light casts shadows, from just above the lens: behind and under what it lights", t_light, k_toggle, 0, 1, 1, 1, "",
      no_choices, no_choices, +[](const Settings& s) { return s.light_shadows ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light_shadows = v >= 0.5f; },
-     +[](const Settings& s) { return s.light && s.light_real; }},
+     +[](const Settings& s) { return s.light; }},
     {"light.keyed", "Light keys", "The light follows its keys along the replay: switched on and off, brighter or dimmer, wider or narrower, set at "
      "the playhead. R3 + D-pad right switches it there", t_light, k_toggle, 0, 1, 1, 1, "", no_choices, no_choices,
      +[](const Settings& s) { return s.light_keyed ? 1.0f : 0.0f; }, +[](Settings& s, float v) { s.light_keyed = v >= 0.5f; },
      +[](const Settings& s) { return s.light; }},
-    {"light.power", "Brightness", "100% lights a skater a few metres away clearly. A real light is brighter close up and dimmer further away",
+    {"light.power", "Brightness", "100% lights a skater a few metres away clearly. Like any real light it is brighter close up and dimmer further away",
      t_light, k_number, 0, 8, 0.05f, 100, "%", no_choices, no_choices,
      +[](const Settings& s) { return s.light_power; }, +[](Settings& s, float v) { s.light_power = v; }, +[](const Settings& s) { return s.light; }},
     {"light.range", "Reach", "How far it lights", t_light, k_number, 1, 50, 0.5f, 1, " m", no_choices, no_choices,
@@ -1129,9 +1126,23 @@ std::vector<Preset> built_in_presets() {
         p.settings.replay_aspect = Aspect::four_three;
         list.push_back(p);
     }
+    {
+        // Nothing on: the game's own picture, as the replay editor shows it without Replay Plus, to start a look from or
+        // to go back to. Every value as it comes (no lens, the editor's own field of view, no bars, overlay, shape, grade
+        // or light, the game's own effects left to it), the video tab's sharpening off too, and the shake off. (The focus
+        // and its keys are the shot's, as with every preset.)
+        Preset p;
+        p.name = "Plain";
+        p.notes = "Nothing on: the game's own picture. No lens, frame, colour, light or shake.";
+        p.settings.sharp_middle = false;
+        p.settings.sharpen = 0.0f;
+        p.shake = Json::parse(R"({"enabled":false})");
+        list.push_back(p);
+    }
     return list;
 }
-// Every name a released version wrote, so one deleted stays deleted.
+// Every name a released version wrote, so one deleted stays deleted. ("Plain" goes in here too once a version that
+// writes it has been released: until then everyone who updates is given it once.)
 std::vector<std::string> older_built_in_names() { return {"Fisheye 16-9", "Fisheye 4-3"}; }
 // Built-ins earlier versions wrote that this one has not; set_up_folders moves the ones still as written into "Older
 // built-ins" (one saved over, or made anew, is the player's own and stays).
@@ -1253,9 +1264,9 @@ Reply command(Settings& settings, std::string_view verb, std::span<const std::st
 
 // ---- Helpers ----------------------------------------------------------------------------------
 bool wants_picture(const Settings& s) noexcept {
+    // (The camera light is not drawn by the pass: it is a light of the game's, replay_plus_light.h, since 1.3.2.)
     if (!s.enabled) return false;
-    return lens_on(s) || !lens::grade_for(s).identity() || s.bars != Bars::none || (s.hood != Hood::none && s.hood_opacity > 0) ||
-           (s.light && s.light_power > 0);
+    return lens_on(s) || !lens::grade_for(s).identity() || s.bars != Bars::none || (s.hood != Hood::none && s.hood_opacity > 0);
 }
 bool wants_views(const Settings& s) noexcept {
     // The field of view is read for the lens's fit and the light's reach, and set when fixed; the camera, for how far

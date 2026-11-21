@@ -78,10 +78,6 @@ std::atomic<int>& trace_frames() noexcept {
     static std::atomic<int> value{0};
     return value;
 }
-std::atomic<bool>& export_depth_latest() noexcept {
-    static std::atomic<bool> value{false};
-    return value;
-}
 namespace {
 std::atomic<std::uint64_t> pad_hidden_until{0};
 }
@@ -199,6 +195,37 @@ ExportSize export_frame_size(std::uintptr_t pitch, const std::vector<VideoFrameS
     } catch (...) {
         return {0, 0, "nothing"};
     }
+}
+
+namespace {
+constexpr double gigabyte = 1073741824.0;
+} // namespace
+float scale_ceiling(std::uint64_t budget) noexcept {
+    const double gb = static_cast<double>(budget) / gigabyte;
+    if (budget == 0 || gb > 12.5) return 2.0f;
+    return gb > 8.5 ? 1.5f : 1.25f;
+}
+double memory_margin(std::uint64_t budget) noexcept {
+    const double bytes = static_cast<double>(budget);
+    if (budget == 0 || bytes / gigabyte > 12.5) return std::max(1.5 * gigabyte, 0.12 * bytes);
+    return std::max(2.5 * gigabyte, 0.2 * bytes);
+}
+CommitRoom commit_room(std::uint64_t available) noexcept {
+    if (available == 0) return CommitRoom::plenty; // not known
+    const double gb = static_cast<double>(available) / gigabyte;
+    return gb >= 5.0 ? CommitRoom::plenty : gb >= 3.0 ? CommitRoom::no_raise : CommitRoom::none;
+}
+
+PixelSize shape_pixels(PixelSize window, PixelSize seen, PixelSize pixels) noexcept {
+    if (window.width <= 0 || window.height <= 0 || seen.width <= 0 || seen.height <= 0 || pixels.width < 2 || pixels.height < 2 ||
+        seen == pixels)
+        return window;
+    // Each side by its own share (Windows rounds the scaled monitor's sides apart), to even numbers, within the monitor.
+    const auto scaled = [](int side, int seen_side, int pixel_side) {
+        const double exact = static_cast<double>(side) * static_cast<double>(pixel_side) / static_cast<double>(seen_side);
+        return std::clamp(static_cast<int>(std::lround(exact * 0.5)) * 2, 2, pixel_side & ~1);
+    };
+    return {scaled(window.width, seen.width, pixels.width), scaled(window.height, seen.height, pixels.height)};
 }
 
 namespace {
@@ -458,27 +485,15 @@ void ask_white_dump(std::string path) noexcept {
         s.white_asked = true;
     } catch (...) {}
 }
-std::atomic<float>& light_facing_metres() noexcept {
-    static std::atomic<float> value{light_facing_metres_default};
-    return value;
-}
-std::atomic<bool>& game_light() noexcept {
-    static std::atomic<bool> value{false};
-    return value;
-}
-std::atomic<bool>& light_on_now() noexcept {
-    static std::atomic<bool> value{true};
-    return value;
-}
-std::atomic<float>& light_facing_weight() noexcept {
-    static std::atomic<float> value{light_facing_weight_default};
-    return value;
-}
 std::string take_white_dump() noexcept {
     try {
         auto& s = shared();
         std::lock_guard lock(s.mutex);
         return std::exchange(s.white_dump, std::string());
     } catch (...) { return {}; }
+}
+std::atomic<int>& display_probe() noexcept {
+    static std::atomic<int> value{0};
+    return value;
 }
 } // namespace dingosdk::replay_plus::link

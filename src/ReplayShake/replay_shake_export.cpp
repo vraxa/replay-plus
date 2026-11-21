@@ -1,11 +1,15 @@
 #include "replay_shake_export.h"
 #include "Extension/ReplayPlus/replay_plus.h"
 #include "hook_interpose.h"
+#include "Engine/Core/Hooks/hooks.h"
+#include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
+#include "Engine/Game/Build/20260929/replay_keyframes.h"
 #include "replay_shake_build.h"
 #include <Windows.h>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <mutex>
 
 namespace dingosdk::replay_shake::export_frames {
@@ -77,7 +81,70 @@ bool is_submit(void* target) noexcept {
     std::array<unsigned char, native::submit_frame_prefix.size()> bytes{};
     return at > native::submit_frame && memory::read_bytes(at, bytes.data(), bytes.size()) && bytes == native::submit_frame_prefix;
 }
+
+// ---- The replay's time as the game plays its camera keyframes (played()) ----
+namespace kf = game::build::v20260929::replay_keyframes;
+using SegmentEval = bool (*)(std::uintptr_t camera, double time, std::uintptr_t segment, std::uintptr_t out);
+std::atomic<SegmentEval> segment_original{};
+std::atomic<bool> played_hooked{};
+std::atomic<double> played_time{};
+std::atomic<std::uint64_t> played_at{}, played_calls{}, played_thread{};
+std::atomic<int> played_streak{};
+std::atomic<std::uint64_t> trace_until{}; // research: each call to the log until then (GetTickCount64)
+bool segment_eval(std::uintptr_t camera, double time, std::uintptr_t segment, std::uintptr_t out) {
+    const auto now = GetTickCount64();
+    if (std::isfinite(time)) {
+        // (One play a frame, each frame's on one job thread or another, one after the other.)
+        played_streak.store(next_streak(played_streak.load(std::memory_order_relaxed), played_time.load(std::memory_order_relaxed), time),
+                            std::memory_order_relaxed);
+        played_time.store(time, std::memory_order_relaxed);
+        played_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        played_at.store(now, std::memory_order_release);
+    }
+    const auto calls = played_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (now < trace_until.load(std::memory_order_relaxed)) {
+        try {
+            logging::log(logging::Level::info, logging::Channel::graphics,
+                         "Replay Shake played: {:.5f} (call {}, camera {:x}, segment {:x}, thread {}, {} ms; export {} frame {}).", time, calls, camera,
+                         segment, GetCurrentThreadId(), now, session.load(std::memory_order_relaxed), frames.load(std::memory_order_relaxed));
+        } catch (...) {}
+    }
+    return segment_original.load(std::memory_order_acquire)(camera, time, segment, out);
+}
 } // namespace
+
+bool start_played_clock(std::uintptr_t base) noexcept {
+    if (played_hooked.load(std::memory_order_acquire)) return true;
+    std::array<unsigned char, 32> bytes{};
+    if (!memory::peek(base + kf::segment_eval.rva, bytes) || bytes != kf::segment_eval.bytes) {
+        logging::write(logging::Level::info, logging::Channel::graphics,
+                       "Replay Shake: the game's keyframe player is not the one known: exports are timed by their frames (slow motion not followed).");
+        return false;
+    }
+    auto* const target = reinterpret_cast<void*>(base + kf::segment_eval.rva);
+    void* relay{};
+    if (dingosdk::hook_prepare(target, reinterpret_cast<void*>(&segment_eval), &relay) != HookOk || !relay) return false;
+    segment_original.store(reinterpret_cast<SegmentEval>(relay), std::memory_order_release);
+    if (const auto status = dingosdk::hook_enable(target); status != HookOk) {
+        logging::log(logging::Level::warning, logging::Channel::graphics, "Replay Shake: the keyframe player's hook did not go in ({}).",
+                     hook_status_string(status));
+        dingosdk::hook_remove(target);
+        return false;
+    }
+    played_hooked.store(true, std::memory_order_release);
+    return true;
+}
+Played played() noexcept {
+    Played result;
+    result.at = played_at.load(std::memory_order_acquire);
+    result.time = played_time.load(std::memory_order_relaxed);
+    result.calls = played_calls.load(std::memory_order_relaxed);
+    result.streak = played_streak.load(std::memory_order_relaxed);
+    result.thread = static_cast<std::uint32_t>(played_thread.load(std::memory_order_relaxed));
+    result.hooked = played_hooked.load(std::memory_order_relaxed);
+    return result;
+}
+void trace_played(std::uint32_t milliseconds) noexcept { trace_until.store(GetTickCount64() + milliseconds, std::memory_order_relaxed); }
 
 std::uint64_t configured_ms() noexcept { return configured_at.load(std::memory_order_acquire); }
 Size setup_of_this_export() noexcept {
@@ -110,6 +177,8 @@ struct Timing {
     std::uint64_t session{};        // the export timed below
     Timeline exported;              // the timeline when it began
     double clock{};                 // the clock when it began
+    bool played{};                  // timed by the camera keys' plays (played()) since they played in it
+    double held{};                  // the last of them
 };
 Timing& timing() {
     static Timing value;
@@ -125,22 +194,6 @@ void set_timeline(Timeline timeline) noexcept {
     } catch (...) {}
 }
 
-double clock_at_share(const Timeline& timeline, double share) noexcept {
-    if (timeline.chunks.empty()) return timeline.start + share * timeline.length;
-    // Through its chunk; before the first, its start; past the last, its end.
-    const Timeline::Chunk* last = &timeline.chunks.front();
-    for (const auto& c : timeline.chunks) {
-        if (share < c.from) return c.clock_from;
-        if (share <= c.to) {
-            const double span = static_cast<double>(c.to) - c.from;
-            const double along = span > 1e-9 ? (share - c.from) / span : 0.0;
-            return c.clock_from + along * (c.clock_to - c.clock_from);
-        }
-        last = &c;
-    }
-    return last->clock_to;
-}
-
 double replay_time(double clock) noexcept {
     const auto running = capture();
     if (!running.running) return clock;
@@ -154,23 +207,23 @@ double replay_time(double clock) noexcept {
             t.session = running.session;
             t.exported = t.shown;
             t.clock = clock;
+            t.played = false;
         }
-        const double along = static_cast<double>(running.frames) * step;
-        const auto& e = t.exported;
-        if (!e.known || e.length <= 1e-3) return t.clock + along;
-        if (!e.chunks.empty()) {
-            // The whole replay's seconds per share (its chunks' footage over the shares they fill), from the trim's start.
-            double footage = 0, shares = 0;
-            for (const auto& c : e.chunks) {
-                footage += c.clock_to - c.clock_from;
-                shares += static_cast<double>(c.to) - c.from;
-            }
-            if (footage > 1e-3 && shares > 1e-6) return clock_at_share(e, static_cast<double>(e.trim_from) + along * shares / footage);
+        // The replay's time as the game plays the camera's keyframes in this export (played()): the time of the frame it
+        // draws now, slow motion and all. The frames encoded go by the clip at 1x and run behind the frames drawn, after
+        // the few the export holds first (2026-11-20: a key at a quarter speed had the clip's 1.5 s take 6 s of the video,
+        // 797 frames, and the frames encoded ran 2 behind the time played at its start). Taken once the plays run on
+        // (next_streak: not the export's odd first one), whatever the editor's clock says (it can be another clip's start:
+        // 23.29 for one that began at 199.6, 2026-11-20); once taken in this export, the last held through a stall or jump.
+        const auto p = played();
+        if (p.hooked && p.at && p.at >= export_began_ms.load(std::memory_order_relaxed) && GetTickCount64() - p.at < 1000 && p.streak >= 2) {
+            t.played = true;
+            t.held = p.time;
+            return p.time;
         }
-        // One stretch: the timeline's start, the trim's start on it, and on from there.
-        const double shown = static_cast<double>(e.bar_to) - e.bar_from;
-        const double trim_at = shown > 1e-6 ? (static_cast<double>(e.trim_from) - e.bar_from) / shown : 0.0;
-        return e.start + trim_at * e.length + along;
+        if (t.played) return t.held;
+        // Without keyframes the camera plays none: the clip at 1x, by the frames encoded.
+        return time_by_frames(t.exported, t.clock, static_cast<double>(running.frames) * step);
     } catch (...) {
         return clock;
     }
